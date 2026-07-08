@@ -1,0 +1,12 @@
+build/
+build-*/
+out/
+.cache/
+*.user
+compile_commands.json
+.DS_Store
+tests/fixtures/*.onnx
+tests/fixtures/*.tflite
+tests/fixtures/*.safetensors
+tests/fixtures/*.gguf
+tests/fixtures/*.pt
