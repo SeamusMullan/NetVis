@@ -20,9 +20,13 @@ namespace netvis {
 
 namespace {
 
-// File format constants. Bump kVersion on any layout struct change.
+// File format + algorithm version. BUMP kVersion on ANY change to the layout
+// struct OR the layout ALGORITHM — otherwise a stale cached layout is loaded and
+// the new algorithm never runs (a changed layout would appear "identical").
+//   v1: initial layered layout.
+//   v2: constants/initializers pulled down next to their consumers.
 constexpr uint32_t kMagic = 0x4C56454Eu;  // "NEVL" little-endian
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
 // On-disk header. POD, written/read verbatim. All fields little-endian on the
 // platforms we target (x86-64 / arm64); the cache is machine-local so we do not
