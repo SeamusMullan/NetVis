@@ -213,16 +213,18 @@ if(NETVIS_BUILD_APP)
   # --- Install rules (consumed by CPack) -------------------------------------
   # Windows/Linux install the bare executable; macOS installs the .app bundle.
   if(APPLE)
-    # productbuild idiom: install the .app to a RELATIVE destination and let
-    # CPACK_PACKAGING_INSTALL_PREFIX (set below) place it at /Applications. CPack
-    # stages installs under a component root, so an absolute DESTINATION escapes
-    # that root and yields an empty payload.
-    install(TARGETS netvis BUNDLE DESTINATION .)
+    # productbuild: install the .app to an ABSOLUTE /Applications and DON'T set
+    # CPACK_PACKAGING_INSTALL_PREFIX (see below). With a relative destination +
+    # prefix the productbuild generator staged an empty payload; an absolute
+    # bundle destination reliably lands NetVis.app in the package.
+    install(TARGETS netvis BUNDLE DESTINATION /Applications)
+    install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/DECISIONS.md
+            DESTINATION /Applications/NetVis-docs OPTIONAL)
   else()
     install(TARGETS netvis RUNTIME DESTINATION bin)
+    install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/DECISIONS.md
+            DESTINATION share/netvis OPTIONAL)
   endif()
-  install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/DECISIONS.md
-          DESTINATION share/netvis OPTIONAL)
 endif()
 
 # =============================================================================
@@ -297,10 +299,9 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_DELETE_ICONS_EXTRA
         "Delete '$SMPROGRAMS\\\\NetVis\\\\NetVis.lnk'")
   elseif(APPLE)
-    # productbuild -> a .pkg dropping NetVis.app into /Applications. The bundle is
-    # installed to a relative "." destination; this prefix relocates it.
+    # productbuild -> a .pkg dropping NetVis.app into /Applications. The install
+    # rules use absolute destinations, so no CPACK_PACKAGING_INSTALL_PREFIX.
     set(CPACK_GENERATOR "productbuild")
-    set(CPACK_PACKAGING_INSTALL_PREFIX "/Applications")
   else()
     # Linux: a portable .zip (spec-requested). TGZ also produced as a courtesy.
     set(CPACK_GENERATOR "ZIP")
