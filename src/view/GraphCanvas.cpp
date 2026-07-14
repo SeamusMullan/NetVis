@@ -316,22 +316,30 @@ void draw_graph_canvas(App& app) {
                           ImDrawFlags_RoundCornersTop);
         dl->AddRect(smin, smax, col_border, rounding, 0, 1.0f);
 
-        // Text. High LOD draws both lines; mid LOD op_type only.
+        // Text. High LOD draws both lines; mid LOD op_type only. Label sizes
+        // scale WITH zoom so text tracks the node box — the world-space node
+        // grows by `zoom`, so the glyphs must too. (A previous cap of
+        // min(zoom,1.0) froze text at its baked pixel size, making it shrink to
+        // an invisible speck relative to a zoomed-in node.) Clamp the upper size
+        // so the font atlas doesn't blur badly at extreme zoom.
+        auto text_px = [zoom](float base) {
+          return std::clamp(base * zoom, base * 0.5f, base * 3.0f);
+        };
         dl->PushClipRect(smin, smax, true);
         if (zoom > kZoomFull) {
           if (fonts.bold != nullptr)
-            dl->AddText(fonts.bold, 16.0f * std::min(zoom, 1.0f),
-                        ImVec2(smin.x + 6.0f, smin.y + 2.0f), col_text,
-                        lab.primary.c_str());
+            dl->AddText(fonts.bold, text_px(16.0f),
+                        ImVec2(smin.x + 6.0f * zoom, smin.y + 2.0f * zoom),
+                        col_text, lab.primary.c_str());
           if (fonts.small != nullptr && !lab.secondary.empty())
-            dl->AddText(fonts.small, 12.0f * std::min(zoom, 1.0f),
-                        ImVec2(smin.x + 6.0f, smin.y + header_h + 2.0f),
+            dl->AddText(fonts.small, text_px(12.0f),
+                        ImVec2(smin.x + 6.0f * zoom, smin.y + header_h + 2.0f),
                         col_text_muted, lab.secondary.c_str());
         } else {
           if (fonts.body != nullptr)
-            dl->AddText(fonts.body, 14.0f * std::min(zoom, 1.0f),
-                        ImVec2(smin.x + 6.0f, smin.y + 2.0f), col_text,
-                        lab.primary.c_str());
+            dl->AddText(fonts.body, text_px(14.0f),
+                        ImVec2(smin.x + 6.0f * zoom, smin.y + 2.0f * zoom),
+                        col_text, lab.primary.c_str());
         }
         dl->PopClipRect();
       }

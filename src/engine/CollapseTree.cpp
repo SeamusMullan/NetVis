@@ -349,8 +349,11 @@ void CollapseTree::build(const ir::Model& model, uint32_t graph_index) {
     }
   }
 
-  // Default: everything collapsed.
-  expanded_.assign(groups_.size(), false);
+  // Default: everything EXPANDED, so the initial view shows every node (parity
+  // with Netron). Repeated-block groups are still detected and can be collapsed
+  // on demand (double-click), but we never hide nodes by default — a prior
+  // default-collapsed view made large models look like they were missing nodes.
+  expanded_.assign(groups_.size(), true);
   rebuild_display(g);
 }
 
@@ -384,8 +387,9 @@ void CollapseTree::rebuild_display(const ir::Graph& g) {
     if (group_emitted[gi]) continue;
     group_emitted[gi] = true;
     if (expanded_[gi]) {
-      // Emit only the representative instance's leaves.
-      for (uint32_t ni : groups_[gi].representative_nodes) {
+      // Expanded: emit ALL member nodes as leaves (every instance), so nothing
+      // is hidden. (Members are stored in node-index order.)
+      for (uint32_t ni : groups_[gi].member_nodes) {
         DisplayNode d;
         d.is_group = false;
         d.ir_node = ni;

@@ -21,10 +21,16 @@ jobs:
         include:
           - os: ubuntu-latest
             gen: ZIP
+            ext: zip
+            label: Linux-x86_64
           - os: macos-latest
             gen: productbuild
+            ext: pkg
+            label: macOS-arm64
           - os: windows-latest
             gen: NSIS
+            ext: exe
+            label: Windows-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -64,17 +70,25 @@ jobs:
         working-directory: build
         run: cpack -G ${{ matrix.gen }}
 
-      # Collect whatever CPack produced (.zip / .pkg / .exe) into dist/.
+      # Collect the CPack output and rename it to a CANONICAL name. CPack's NSIS
+      # generator ignores CPACK_PACKAGE_FILE_NAME and names the .exe using only
+      # the major version (e.g. "NetVis-0-..."), so we rename by extension here
+      # rather than trusting the generator's filename.
       - name: Collect artifact
         shell: bash
         working-directory: build
         run: |
+          set -euo pipefail
           mkdir -p dist
           shopt -s nullglob
-          for f in NetVis-*.zip NetVis-*.pkg NetVis-*.exe; do
-            cp "$f" dist/
-          done
-          echo "Packaged:"; ls -la dist
+          src=(NetVis-*.${{ matrix.ext }})
+          if [ ${#src[@]} -ne 1 ]; then
+            echo "::error::expected exactly one .${{ matrix.ext }}, found: ${src[*]:-none}"
+            exit 1
+          fi
+          dest="NetVis-${{ inputs.version }}-${{ matrix.label }}.${{ matrix.ext }}"
+          cp "${src[0]}" "dist/$dest"
+          echo "Packaged: $dest"; ls -la dist
 
       # Validate the artifact so a broken/empty package FAILS the job instead of
       # being silently published. Guards against past bugs: an empty macOS .pkg

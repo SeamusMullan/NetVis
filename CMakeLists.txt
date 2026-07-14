@@ -213,10 +213,11 @@ if(NETVIS_BUILD_APP)
   # --- Install rules (consumed by CPack) -------------------------------------
   # Windows/Linux install the bare executable; macOS installs the .app bundle.
   if(APPLE)
-    # Install the .app straight to /Applications. The productbuild generator does
-    # NOT use CPACK_PACKAGING_INSTALL_PREFIX for this, so give an absolute BUNDLE
-    # DESTINATION here — a relative "." produced an empty payload.
-    install(TARGETS netvis BUNDLE DESTINATION /Applications)
+    # productbuild idiom: install the .app to a RELATIVE destination and let
+    # CPACK_PACKAGING_INSTALL_PREFIX (set below) place it at /Applications. CPack
+    # stages installs under a component root, so an absolute DESTINATION escapes
+    # that root and yields an empty payload.
+    install(TARGETS netvis BUNDLE DESTINATION .)
   else()
     install(TARGETS netvis RUNTIME DESTINATION bin)
   endif()
@@ -270,6 +271,11 @@ if(NETVIS_BUILD_APP)
   set(CPACK_PACKAGE_VERSION_PATCH "${PROJECT_VERSION_PATCH}")
   set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Speed-first neural network model viewer")
   set(CPACK_PACKAGE_INSTALL_DIRECTORY "NetVis")
+  # Monolithic (non-component) install: package everything from our install()
+  # rules as one payload. Without this, component-aware generators (productbuild)
+  # can stage an EMPTY payload when no components are declared — which produced a
+  # ~1 KB macOS .pkg with no app inside.
+  set(CPACK_MONOLITHIC_INSTALL ON)
   set(CPACK_PACKAGE_EXECUTABLES "netvis" "NetVis")
   # Per-arch, per-os artifact file name, e.g. NetVis-1.2.0-Linux-x86_64.
   set(CPACK_PACKAGE_FILE_NAME
@@ -291,9 +297,10 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_DELETE_ICONS_EXTRA
         "Delete '$SMPROGRAMS\\\\NetVis\\\\NetVis.lnk'")
   elseif(APPLE)
-    # productbuild -> a .pkg dropping NetVis.app into /Applications (the install
-    # rule above uses an absolute DESTINATION, so no INSTALL_PREFIX is set).
+    # productbuild -> a .pkg dropping NetVis.app into /Applications. The bundle is
+    # installed to a relative "." destination; this prefix relocates it.
     set(CPACK_GENERATOR "productbuild")
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/Applications")
   else()
     # Linux: a portable .zip (spec-requested). TGZ also produced as a courtesy.
     set(CPACK_GENERATOR "ZIP")
