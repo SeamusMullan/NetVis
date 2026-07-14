@@ -213,7 +213,10 @@ if(NETVIS_BUILD_APP)
   # --- Install rules (consumed by CPack) -------------------------------------
   # Windows/Linux install the bare executable; macOS installs the .app bundle.
   if(APPLE)
-    install(TARGETS netvis BUNDLE DESTINATION .)
+    # Install the .app straight to /Applications. The productbuild generator does
+    # NOT use CPACK_PACKAGING_INSTALL_PREFIX for this, so give an absolute BUNDLE
+    # DESTINATION here — a relative "." produced an empty payload.
+    install(TARGETS netvis BUNDLE DESTINATION /Applications)
   else()
     install(TARGETS netvis RUNTIME DESTINATION bin)
   endif()
@@ -260,6 +263,11 @@ if(NETVIS_BUILD_APP)
   set(CPACK_PACKAGE_NAME "NetVis")
   set(CPACK_PACKAGE_VENDOR "Seamus Mullan")
   set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+  # NSIS derives its installer name/version from the split components; set them
+  # explicitly so the packaged filename carries the full X.Y.Z (not just "0").
+  set(CPACK_PACKAGE_VERSION_MAJOR "${PROJECT_VERSION_MAJOR}")
+  set(CPACK_PACKAGE_VERSION_MINOR "${PROJECT_VERSION_MINOR}")
+  set(CPACK_PACKAGE_VERSION_PATCH "${PROJECT_VERSION_PATCH}")
   set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Speed-first neural network model viewer")
   set(CPACK_PACKAGE_INSTALL_DIRECTORY "NetVis")
   set(CPACK_PACKAGE_EXECUTABLES "netvis" "NetVis")
@@ -283,9 +291,9 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_DELETE_ICONS_EXTRA
         "Delete '$SMPROGRAMS\\\\NetVis\\\\NetVis.lnk'")
   elseif(APPLE)
-    # productbuild -> a signed-installable .pkg dropping NetVis.app into /Applications.
+    # productbuild -> a .pkg dropping NetVis.app into /Applications (the install
+    # rule above uses an absolute DESTINATION, so no INSTALL_PREFIX is set).
     set(CPACK_GENERATOR "productbuild")
-    set(CPACK_PACKAGING_INSTALL_PREFIX "/Applications")
   else()
     # Linux: a portable .zip (spec-requested). TGZ also produced as a courtesy.
     set(CPACK_GENERATOR "ZIP")
