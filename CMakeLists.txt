@@ -167,6 +167,21 @@ if(NETVIS_BUILD_TESTS)
     add_executable(netvis_tests ${NETVIS_TEST_SRC})
     target_link_libraries(netvis_tests PRIVATE netvis_core doctest::doctest)
     target_include_directories(netvis_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    add_test(NAME netvis_tests COMMAND netvis_tests)
+
+    # Generate the tiny fixture models at build time (Python 3 stdlib only, no
+    # pip) so `ctest` always has them, and run tests from the source root so the
+    # relative "tests/fixtures/..." paths resolve regardless of the build dir.
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      add_custom_command(TARGET netvis_tests PRE_BUILD
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/tools/gen_fixtures.py
+                ${CMAKE_SOURCE_DIR}/tests/fixtures
+        COMMENT "Generating test fixtures"
+        VERBATIM)
+    endif()
+
+    add_test(NAME netvis_tests COMMAND netvis_tests
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endif()
 endif()
