@@ -50,6 +50,9 @@
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Wtype-limits"
+// macOS/clang flags stb's use of sprintf(3) as a deprecated-declaration error
+// under -Werror; silence it just for this header (we do not call sprintf).
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 #pragma GCC diagnostic pop

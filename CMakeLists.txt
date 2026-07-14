@@ -36,6 +36,10 @@ endif()
 add_library(netvis_warnings INTERFACE)
 if(MSVC)
   target_compile_options(netvis_warnings INTERFACE /W4 /WX /permissive-)
+  # MSVC flags standard C funcs (getenv/fopen/...) as "unsafe" C4996 under /WX.
+  # They are used correctly and portably; silence the CRT deprecation so /WX
+  # still catches real warnings.
+  target_compile_definitions(netvis_warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
 else()
   target_compile_options(netvis_warnings INTERFACE
     -Wall -Wextra -Wpedantic -Werror
