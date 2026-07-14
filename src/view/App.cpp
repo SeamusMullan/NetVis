@@ -38,6 +38,15 @@
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl.h>
 #elif defined(_WIN32)
+// <GL/gl.h> needs WINGDIAPI/APIENTRY from <windows.h>. Trim it (LEAN_AND_MEAN)
+// and suppress the min/max macros so they don't collide with std::min/std::max.
+// GLFW's header already defined APIENTRY; undef it so <windows.h> redefining it
+// is not a C4005 macro-redefinition (which /WX turns into an error).
+#ifdef APIENTRY
+#undef APIENTRY
+#endif
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <GL/gl.h>
 #else
@@ -45,7 +54,13 @@
 #endif
 
 // stb_image_write is header-only; its implementation is compiled EXACTLY once,
-// here (spec §8.7). Wrap it so its internal style does not trip -Werror.
+// here (spec §8.7). Wrap it so its internal style does not trip -Werror. The
+// pragmas are compiler-specific: GCC/Clang understand `#pragma GCC diagnostic`;
+// MSVC would warn C4068 (unknown pragma) on those under /WX, so it uses
+// `#pragma warning` instead (and C4996 sprintf is handled by the CRT define).
+#if defined(_MSC_VER)
+#pragma warning(push, 0)
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #pragma GCC diagnostic ignored "-Wsign-compare"
@@ -56,9 +71,14 @@
 // macOS/clang flags stb's use of sprintf(3) as a deprecated-declaration error
 // under -Werror; silence it just for this header (we do not call sprintf).
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
 
 #include <nlohmann/json.hpp>
 
