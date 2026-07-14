@@ -300,6 +300,11 @@ if(NETVIS_BUILD_APP)
     # payload under /Applications.
     set(CPACK_GENERATOR "productbuild")
     set(CPACK_PACKAGING_INSTALL_PREFIX "/Applications")
+    # CRITICAL: the pkg identifier MUST be a space-free reverse-DNS string. CMake
+    # otherwise derives it from CPACK_PACKAGE_VENDOR ("Seamus Mullan"), and the
+    # space in "com.Seamus Mullan.NetVis" makes pkgbuild emit a ~1 KB EMPTY pkg.
+    set(CPACK_PRODUCTBUILD_IDENTIFIER "com.seamusmullan.netvis")
+    set(CPACK_PACKAGE_VENDOR "seamusmullan")
   else()
     # Linux: a portable .zip (spec-requested). TGZ also produced as a courtesy.
     set(CPACK_GENERATOR "ZIP")
