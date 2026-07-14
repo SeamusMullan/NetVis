@@ -90,3 +90,69 @@ TEST_CASE("layout is deterministic and boxes match display nodes") {
   CHECK(a.structure_hash == b.structure_hash);
   CHECK(a.collapse_hash == b.collapse_hash);
 }
+
+TEST_CASE("constants are placed next to their consumer, not pinned to layer 0") {
+  // A chain op_0 -> op_1 -> ... -> op_(N-1); each op_i also consumes a dedicated
+  // Constant source c_i. Longest-path layering would pin every constant at
+  // layer 0, spraying long edges across the whole graph (the hairball). The
+  // constant-placement pass must instead put each constant just above its
+  // consumer, so every constant->consumer edge spans a single layer.
+  const int N = 20;
+  ir::Model m;
+  m.has_graph = true;
+  m.format_name = m.intern("TEST");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  std::vector<uint32_t> cval(N), oval(N);
+  auto add_val = [&](const std::string& nm, int32_t prod) {
+    ir::ValueInfo v;
+    v.name = m.intern(nm);
+    v.producer = prod;
+    g.values.push_back(v);
+    return static_cast<uint32_t>(g.values.size() - 1);
+  };
+  for (int i = 0; i < N; ++i) cval[i] = add_val("c" + std::to_string(i), i);
+  for (int i = 0; i < N; ++i) oval[i] = add_val("o" + std::to_string(i), N + i);
+
+  for (int i = 0; i < N; ++i) {  // constant source nodes (in-degree 0)
+    ir::Node n;
+    n.op_type = m.intern("Constant");
+    n.name = m.intern("const_" + std::to_string(i));
+    n.outputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    g.edge_refs.push_back(cval[i]);
+    n.outputs.count = 1;
+    g.nodes.push_back(n);
+  }
+  for (int i = 0; i < N; ++i) {  // chain ops consuming prev op + own constant
+    ir::Node n;
+    n.op_type = m.intern("Add");
+    n.name = m.intern("op_" + std::to_string(i));
+    n.inputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    if (i > 0) g.edge_refs.push_back(oval[i - 1]);
+    g.edge_refs.push_back(cval[i]);
+    n.inputs.count = (i > 0) ? 2 : 1;
+    n.outputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    g.edge_refs.push_back(oval[i]);
+    n.outputs.count = 1;
+    g.nodes.push_back(n);
+  }
+
+  CollapseTree collapse;
+  collapse.build(m, 0);
+  LayoutResult r = compute_layout(m, 0, collapse, headless_size, {}, nullptr);
+
+  // Every edge should span roughly one layer (constants adjacent to consumers).
+  // If any constant were pinned to layer 0, an edge to op_(N-1) would span ~N
+  // layers. Assert the max vertical edge span stays small (a few rank gaps).
+  REQUIRE(!r.edges.empty());
+  float max_span = 0.0f;
+  for (const EdgeCurve& e : r.edges) {
+    float s = e.p3.y - e.p0.y;
+    if (s < 0) s = -s;
+    if (s > max_span) max_span = s;
+  }
+  // One layer gap = node height (40) + rank_sep (default 60) = 100. Allow a
+  // couple of layers of slack; a pinned-constant hairball would be ~N*100.
+  CHECK(max_span < 100.0f * 3.0f);
+}

@@ -201,6 +201,35 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     // Cycle remnants (shouldn't happen after reversal): leave layer as-is.
   }
 
+  // -- 3b) Pull "constant-like" source nodes DOWN next to their consumers.
+  // Longest-path layering pins every source (in-degree 0) to layer 0. In real
+  // models most sources are constants/initializers/weights that feed a node deep
+  // in the graph, so they all pile onto the top row and their edges spray across
+  // the entire canvas (the classic hairball). Instead, place each source just
+  // above its NEAREST consumer: layer = min(consumer layer) - 1. This keeps a
+  // constant adjacent to where it is used and collapses those long edges.
+  // Only sources are moved (they have no predecessors, so lowering them can
+  // never violate an edge from above); non-sources keep their longest-path rank.
+  {
+    // Effective in/out degree + successor layers.
+    std::vector<uint32_t> indeg(V, 0);
+    std::vector<std::vector<uint32_t>> eff_out(V);
+    for (const DEdge& e : edges) {
+      eff_out[eff_from(e)].push_back(eff_to(e));
+      ++indeg[eff_to(e)];
+    }
+    for (uint32_t v = 0; v < V; ++v) {
+      if (indeg[v] != 0) continue;      // only sources
+      if (eff_out[v].empty()) continue; // isolated node: leave at 0
+      int32_t min_consumer = std::numeric_limits<int32_t>::max();
+      for (uint32_t w : eff_out[v])
+        min_consumer = std::min(min_consumer, layer[w]);
+      // Sit one layer above the nearest consumer (never below 0).
+      if (min_consumer != std::numeric_limits<int32_t>::max())
+        layer[v] = std::max(0, min_consumer - 1);
+    }
+  }
+
   int32_t max_layer = 0;
   for (uint32_t v = 0; v < V; ++v) max_layer = std::max(max_layer, layer[v]);
   const size_t L = static_cast<size_t>(max_layer) + 1;
