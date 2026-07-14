@@ -118,6 +118,42 @@ python3 tools/gen_fixtures.py tests/fixtures
 ctest --preset core-only
 ```
 
+### Sanitizers
+
+The test suite runs clean under AddressSanitizer (+UBSan) and ThreadSanitizer:
+
+```sh
+cmake --preset asan  && cmake --build --preset asan  && ctest --preset asan
+cmake --preset ubsan && cmake --build --preset ubsan && ctest --preset ubsan
+cmake --preset tsan  && cmake --build --preset tsan  && ctest --preset tsan
+```
+
+## CI & releases
+
+`.github/workflows/ci.yml` runs on every push/PR: the ASan+UBSan and TSan
+sanitizer suites plus a headless `core-only` build + `ctest`.
+
+Pushing a `vX.Y.Z` tag additionally builds the per-OS installers and publishes a
+GitHub Release with them attached:
+
+- **Windows** — NSIS installer (`.exe`)
+- **macOS** — `.pkg` (installs `NetVis.app` into `/Applications`)
+- **Linux** — portable `.zip`
+
+```sh
+git tag v1.2.0 && git push origin v1.2.0
+```
+
+To cut a release without a tag push (e.g. re-cutting a broken one), run the
+**release-override** workflow from the Actions tab with an explicit version.
+Packaging is driven by CPack; build one locally with:
+
+```sh
+cmake -B build -DNETVIS_VERSION=1.2.0 -DNETVIS_BUILD_TESTS=OFF
+cmake --build build
+cd build && cpack        # generator auto-selected per OS
+```
+
 ## Non-goals (v1)
 
 No model editing, no inference/execution, no dequantization of GGUF quant blocks,

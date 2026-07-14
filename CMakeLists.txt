@@ -1,7 +1,13 @@
 # NetVis — speed-first neural network model viewer.
 # Single CMake codebase for Windows / Linux / macOS (spec §1, §9).
 cmake_minimum_required(VERSION 3.24)
-project(netvis LANGUAGES C CXX)
+
+# Version drives CPack/installer metadata. CI passes -DNETVIS_VERSION=X.Y.Z
+# extracted from the release tag; the fallback keeps local builds working.
+if(NOT DEFINED NETVIS_VERSION)
+  set(NETVIS_VERSION "0.0.0")
+endif()
+project(netvis VERSION ${NETVIS_VERSION} LANGUAGES C CXX)
 
 # --- Global standards --------------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
@@ -47,6 +53,32 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 # --- Options -----------------------------------------------------------------
 option(NETVIS_BUILD_TESTS "Build unit tests" ON)
 option(NETVIS_BUILD_APP "Build the GUI app (needs OpenGL/GLFW)" ON)
+
+# Sanitizers (CI correctness gate). One of: OFF, address, undefined, thread.
+# Applied to our OWN code via netvis_warnings so third_party is not instrumented
+# for -Werror purposes, but the flags must also reach the linker — so they go on
+# a dedicated INTERFACE target linked by every NetVis target.
+set(NETVIS_SANITIZER "OFF" CACHE STRING "Sanitizer: OFF|address|undefined|thread")
+set_property(CACHE NETVIS_SANITIZER PROPERTY STRINGS OFF address undefined thread)
+add_library(netvis_sanitize INTERFACE)
+if(NOT NETVIS_SANITIZER STREQUAL "OFF")
+  if(MSVC)
+    # MSVC only ships /fsanitize=address; UBSan/TSan are no-ops there.
+    if(NETVIS_SANITIZER STREQUAL "address")
+      target_compile_options(netvis_sanitize INTERFACE /fsanitize=address)
+    endif()
+  else()
+    # address+undefined can combine; thread must run alone (incompatible).
+    if(NETVIS_SANITIZER STREQUAL "address")
+      set(_san "address,undefined")
+    else()
+      set(_san "${NETVIS_SANITIZER}")
+    endif()
+    target_compile_options(netvis_sanitize INTERFACE
+      -fsanitize=${_san} -fno-omit-frame-pointer -g)
+    target_link_options(netvis_sanitize INTERFACE -fsanitize=${_san})
+  endif()
+endif()
 
 # =============================================================================
 #  Dependencies (FetchContent, pinned — spec §2.6, §9)
@@ -95,7 +127,7 @@ file(GLOB_RECURSE NETVIS_CORE_SRC CONFIGURE_DEPENDS
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
 target_include_directories(netvis_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(netvis_core
-  PUBLIC nlohmann_json::nlohmann_json
+  PUBLIC nlohmann_json::nlohmann_json netvis_sanitize
   PRIVATE netvis_warnings)
 # miniz target name varies by version; link if present.
 if(TARGET miniz)
@@ -154,6 +186,26 @@ if(NETVIS_BUILD_APP)
   target_link_libraries(netvis
     PRIVATE netvis_core imgui glfw tinyfiledialogs stb OpenGL::GL netvis_warnings)
   target_include_directories(netvis PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+  # macOS: build a .app bundle so the .pkg installs a normal double-clickable app.
+  if(APPLE)
+    set_target_properties(netvis PROPERTIES
+      MACOSX_BUNDLE TRUE
+      MACOSX_BUNDLE_BUNDLE_NAME "NetVis"
+      MACOSX_BUNDLE_GUI_IDENTIFIER "com.seamusmullan.netvis"
+      MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+      MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
+  endif()
+
+  # --- Install rules (consumed by CPack) -------------------------------------
+  # Windows/Linux install the bare executable; macOS installs the .app bundle.
+  if(APPLE)
+    install(TARGETS netvis BUNDLE DESTINATION .)
+  else()
+    install(TARGETS netvis RUNTIME DESTINATION bin)
+  endif()
+  install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/DECISIONS.md
+          DESTINATION share/netvis OPTIONAL)
 endif()
 
 # =============================================================================
@@ -184,4 +236,48 @@ if(NETVIS_BUILD_TESTS)
     add_test(NAME netvis_tests COMMAND netvis_tests
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endif()
+endif()
+
+# =============================================================================
+#  Packaging (CPack): NSIS installer on Windows, .pkg on macOS, .zip on Linux.
+#  CI runs `cpack -G <gen>` after the install; the resulting artifact is what
+#  gets attached to a GitHub Release on a vX.Y.Z tag.
+# =============================================================================
+if(NETVIS_BUILD_APP)
+  set(CPACK_PACKAGE_NAME "NetVis")
+  set(CPACK_PACKAGE_VENDOR "Seamus Mullan")
+  set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Speed-first neural network model viewer")
+  set(CPACK_PACKAGE_INSTALL_DIRECTORY "NetVis")
+  set(CPACK_PACKAGE_EXECUTABLES "netvis" "NetVis")
+  # Per-arch, per-os artifact file name, e.g. NetVis-1.2.0-Linux-x86_64.
+  set(CPACK_PACKAGE_FILE_NAME
+      "NetVis-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+  if(EXISTS ${CMAKE_SOURCE_DIR}/README.md)
+    set(CPACK_RESOURCE_FILE_README "${CMAKE_SOURCE_DIR}/README.md")
+  endif()
+
+  if(WIN32)
+    # NSIS: a standard Start-menu + uninstall installer. `makensis` must be on
+    # PATH in CI (choco install nsis).
+    set(CPACK_GENERATOR "NSIS")
+    set(CPACK_NSIS_PACKAGE_NAME "NetVis")
+    set(CPACK_NSIS_DISPLAY_NAME "NetVis")
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+    set(CPACK_NSIS_MODIFY_PATH OFF)
+    # Start-menu shortcut -> bin/netvis.exe
+    set(CPACK_NSIS_CREATE_ICONS_EXTRA
+        "CreateShortCut '$SMPROGRAMS\\\\NetVis\\\\NetVis.lnk' '$INSTDIR\\\\bin\\\\netvis.exe'")
+    set(CPACK_NSIS_DELETE_ICONS_EXTRA
+        "Delete '$SMPROGRAMS\\\\NetVis\\\\NetVis.lnk'")
+  elseif(APPLE)
+    # productbuild -> a signed-installable .pkg dropping NetVis.app into /Applications.
+    set(CPACK_GENERATOR "productbuild")
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/Applications")
+  else()
+    # Linux: a portable .zip (spec-requested). TGZ also produced as a courtesy.
+    set(CPACK_GENERATOR "ZIP")
+  endif()
+
+  include(CPack)
 endif()

@@ -1,0 +1,84 @@
+# Reusable build+package workflow: builds NetVis Release on all three OSes and
+# produces the platform installer (NSIS .exe on Windows, .pkg on macOS, .zip on
+# Linux). Called by ci.yml (on a vX.Y.Z tag) and release.yml (manual override).
+# Uploads each artifact so the caller can attach them to a GitHub Release.
+name: package
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string X.Y.Z stamped into the package metadata"
+        required: true
+        type: string
+
+jobs:
+  package:
+    name: package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            gen: ZIP
+          - os: macos-latest
+            gen: productbuild
+          - os: windows-latest
+            gen: NSIS
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      # Linux GUI build needs OpenGL + X11 dev headers for GLFW.
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev
+
+      # NSIS provides makensis for the Windows installer generator.
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        run: choco install nsis --no-progress -y
+
+      - name: Configure MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNETVIS_VERSION=${{ inputs.version }}
+          -DNETVIS_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        working-directory: build
+        run: cpack -G ${{ matrix.gen }}
+
+      # Collect whatever CPack produced (.zip / .pkg / .exe) into dist/.
+      - name: Collect artifact
+        shell: bash
+        working-directory: build
+        run: |
+          mkdir -p dist
+          shopt -s nullglob
+          for f in NetVis-*.zip NetVis-*.pkg NetVis-*.exe; do
+            cp "$f" dist/
+          done
+          echo "Packaged:"; ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netvis-${{ runner.os }}
+          path: build/dist/*
+          if-no-files-found: error

@@ -1,0 +1,115 @@
+# Main CI: sanitizers (ASan+UBSan, TSan) and a headless build+test on every
+# push/PR. On a vX.Y.Z tag it additionally builds the per-OS installers and
+# publishes them to a GitHub Release.
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]   # e.g. v1.2.0 — drives the release
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write   # needed by the release job to create/attach to a Release
+
+jobs:
+  # --- Correctness: run the test suite under each sanitizer -------------------
+  sanitizers:
+    name: sanitizer (${{ matrix.san }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 'address' also enables UBSan (they combine); 'thread' runs alone.
+        san: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Configure
+        run: >
+          cmake -B build/san -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DNETVIS_BUILD_APP=OFF
+          -DNETVIS_SANITIZER=${{ matrix.san }}
+      - name: Build tests
+        run: cmake --build build/san --target netvis_tests
+      - name: Run tests under sanitizer
+        working-directory: ${{ github.workspace }}
+        env:
+          # Fail the job on the first sanitizer report; ignore benign leaks.
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ./build/san/netvis_tests
+
+  # Dedicated UBSan-only job (address already bundles UBSan, but this proves the
+  # standalone undefined preset also builds/passes).
+  ubsan:
+    name: sanitizer (undefined)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - run: >
+          cmake -B build/ubsan -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DNETVIS_BUILD_APP=OFF -DNETVIS_SANITIZER=undefined
+      - run: cmake --build build/ubsan --target netvis_tests
+      - env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build/ubsan/netvis_tests
+
+  # --- Plain headless build + ctest (fast gate, no instrumentation) -----------
+  build-test:
+    name: build + ctest (core-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - run: cmake --preset core-only
+      - run: cmake --build --preset core-only
+      - run: ctest --preset core-only
+
+  # --- Derive the version from the tag (only on a vX.Y.Z tag) -----------------
+  version:
+    name: resolve version
+    needs: [sanitizers, ubsan, build-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        # Strip the leading "v" from refs/tags/vX.Y.Z.
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  # --- Build the installers for all OSes (reusable workflow) ------------------
+  package:
+    name: package
+    needs: version
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  # --- Publish the GitHub Release with the installers attached ----------------
+  release:
+    name: publish release
+    needs: [version, package]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la dist
+      - name: Create / update the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: NetVis ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          files: dist/*

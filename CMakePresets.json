@@ -25,15 +25,54 @@
         "CMAKE_BUILD_TYPE": "Release",
         "NETVIS_BUILD_APP": "OFF"
       }
+    },
+    {
+      "name": "asan",
+      "displayName": "AddressSanitizer + UBSan (headless)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "NETVIS_BUILD_APP": "OFF",
+        "NETVIS_SANITIZER": "address"
+      }
+    },
+    {
+      "name": "ubsan",
+      "displayName": "UndefinedBehaviorSanitizer (headless)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ubsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "NETVIS_BUILD_APP": "OFF",
+        "NETVIS_SANITIZER": "undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer (headless)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "NETVIS_BUILD_APP": "OFF",
+        "NETVIS_SANITIZER": "thread"
+      }
     }
   ],
   "buildPresets": [
     { "name": "debug", "configurePreset": "debug" },
     { "name": "release", "configurePreset": "release" },
-    { "name": "core-only", "configurePreset": "core-only" }
+    { "name": "core-only", "configurePreset": "core-only" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" }
   ],
   "testPresets": [
     { "name": "core-only", "configurePreset": "core-only", "output": { "outputOnFailure": true } },
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } }
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
+    { "name": "ubsan", "configurePreset": "ubsan", "output": { "outputOnFailure": true } },
+    { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } }
   ]
 }

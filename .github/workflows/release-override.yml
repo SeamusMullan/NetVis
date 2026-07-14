@@ -1,0 +1,55 @@
+# Manual release override: build the installers and publish a GitHub Release for
+# an explicitly-entered version, WITHOUT requiring a vX.Y.Z tag push. Use for
+# re-cutting a broken release or an out-of-band build. Run from the Actions tab.
+name: release-override
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version X.Y.Z (no leading v)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create as a draft (do not publish immediately)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  # Reuse the exact same build+package path as tag-driven releases.
+  package:
+    name: package
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ inputs.version }}
+
+  release:
+    name: publish release (override)
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - name: Create the Release (tag v<version>)
+        uses: softprops/action-gh-release@v2
+        with:
+          # Creates the tag v<version> on the current commit if it does not exist.
+          tag_name: v${{ inputs.version }}
+          name: NetVis ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          draft: ${{ inputs.draft }}
+          generate_release_notes: true
+          files: dist/*
