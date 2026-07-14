@@ -266,9 +266,8 @@ if(NETVIS_BUILD_APP)
   # Per-arch, per-os artifact file name, e.g. NetVis-1.2.0-Linux-x86_64.
   set(CPACK_PACKAGE_FILE_NAME
       "NetVis-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
-  if(EXISTS ${CMAKE_SOURCE_DIR}/README.md)
-    set(CPACK_RESOURCE_FILE_README "${CMAKE_SOURCE_DIR}/README.md")
-  endif()
+  # NOTE: do NOT set CPACK_RESOURCE_FILE_README to a .md — productbuild only
+  # accepts .rtf/.rtfd/.html/.txt and errors on other extensions.
 
   if(WIN32)
     # NSIS: a standard Start-menu + uninstall installer. `makensis` must be on

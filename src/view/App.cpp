@@ -28,17 +28,20 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
-// Raw GL entry points for the offscreen-FBO PNG export path. Header location is
-// platform-specific: Apple ships OpenGL under <OpenGL/>, and its gl3.h already
-// declares the FBO core API; elsewhere GL_GLEXT_PROTOTYPES makes <GL/glext.h>
-// declare glGenFramebuffers/... so we need no loader library.
+// Raw GL entry points for the PNG export (glReadPixels/glViewport — GL 1.1 core,
+// no extensions needed). Header location is platform-specific:
+//  - Apple ships OpenGL under <OpenGL/gl.h>.
+//  - Windows' <GL/gl.h> depends on WINGDIAPI/APIENTRY from <windows.h>, so that
+//    must be included first.
+//  - Other platforms just include <GL/gl.h>.
 #if defined(__APPLE__)
 #define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl3.h>
-#else
-#define GL_GLEXT_PROTOTYPES
+#include <OpenGL/gl.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #include <GL/gl.h>
-#include <GL/glext.h>
+#else
+#include <GL/gl.h>
 #endif
 
 // stb_image_write is header-only; its implementation is compiled EXACTLY once,
@@ -465,67 +468,31 @@ ImU32 App::category_color(OpCategory c, bool dark) {
 }
 
 // ---------------------------------------------------------------------------
-// PNG export (spec §8.7): render current draw data into a 2x offscreen target.
+// PNG export (spec §8.7): read back the rendered window and write a PNG.
 // ---------------------------------------------------------------------------
 void App::export_view_png(const std::string& path) {
-  ImDrawData* dd = ImGui::GetDrawData();
-  if (dd == nullptr || !dd->Valid) {
-    add_toast("Export failed: nothing to render yet", true);
-    return;
-  }
-
-  const ImGuiIO& io = ImGui::GetIO();
-  const int scale = 2;  // 2x supersample for a crisp export.
-  int w = static_cast<int>(io.DisplaySize.x) * scale;
-  int h = static_cast<int>(io.DisplaySize.y) * scale;
+  // DECISION (portability): read back the DEFAULT framebuffer (the just-rendered
+  // window) with glReadPixels instead of rendering into an offscreen 2x FBO. The
+  // FBO path needs glGenFramebuffers/... which live in GL extensions — available
+  // on Linux/macOS core GL but NOT in the Windows SDK's GL 1.1 <GL/gl.h> without
+  // a loader library. glReadPixels/glViewport are GL 1.1 core everywhere, so this
+  // builds on all three platforms with no loader. Trade-off: capture is at window
+  // resolution (no supersample), which is fine for a "screenshot the view" feature.
+  //
+  // Called from App::frame() immediately AFTER ImGui_ImplOpenGL3_RenderDrawData,
+  // so the back buffer already holds the current frame's pixels.
+  int fb_w = 0, fb_h = 0;
+  glfwGetFramebufferSize(window_, &fb_w, &fb_h);
+  const int w = fb_w;
+  const int h = fb_h;
   if (w <= 0 || h <= 0) {
     add_toast("Export failed: zero-size viewport", true);
     return;
   }
 
-  // Create an offscreen color texture + framebuffer at 2x.
-  GLint prev_fbo = 0;
-  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
-  GLuint tex = 0, fbo = 0;
-  glGenTextures(1, &tex);
-  glBindTexture(GL_TEXTURE_2D, tex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-               nullptr);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glGenFramebuffers(1, &fbo);
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                         tex, 0);
-
-  bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-  std::vector<unsigned char> pixels;
-  if (ok) {
-    glViewport(0, 0, w, h);
-    const ImVec4 bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
-    glClearColor(bg.x, bg.y, bg.z, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    // Temporarily rescale the draw data so ImGui rasterizes at 2x into the FBO.
-    const ImVec2 saved_scale = dd->FramebufferScale;
-    dd->FramebufferScale = ImVec2(static_cast<float>(scale),
-                                  static_cast<float>(scale));
-    ImGui_ImplOpenGL3_RenderDrawData(dd);
-    dd->FramebufferScale = saved_scale;
-
-    pixels.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-  }
-
-  // Restore the previous framebuffer and release the offscreen resources.
-  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
-  glDeleteFramebuffers(1, &fbo);
-  glDeleteTextures(1, &tex);
-
-  if (!ok) {
-    add_toast("Export failed: framebuffer incomplete", true);
-    return;
-  }
+  std::vector<unsigned char> pixels(static_cast<size_t>(w) *
+                                    static_cast<size_t>(h) * 4u);
+  glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
 
   // GL reads bottom-up; flip vertically so the PNG is upright.
   const size_t row = static_cast<size_t>(w) * 4u;
