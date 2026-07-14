@@ -24,8 +24,8 @@ jobs:
             ext: zip
             label: Linux-x86_64
           - os: macos-latest
-            gen: productbuild
-            ext: pkg
+            gen: DragNDrop
+            ext: dmg
             label: macOS-arm64
           - os: windows-latest
             gen: NSIS

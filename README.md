@@ -137,7 +137,7 @@ Pushing a `vX.Y.Z` tag additionally builds the per-OS installers and publishes a
 GitHub Release with them attached:
 
 - **Windows** — NSIS installer (`.exe`)
-- **macOS** — `.pkg` (installs `NetVis.app` into `/Applications`)
+- **macOS** — `.dmg` (drag `NetVis.app` into `/Applications`)
 - **Linux** — portable `.zip`
 
 ```sh

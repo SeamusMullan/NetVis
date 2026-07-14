@@ -295,15 +295,12 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_DELETE_ICONS_EXTRA
         "Delete '$SMPROGRAMS\\\\NetVis\\\\NetVis.lnk'")
   elseif(APPLE)
-    # productbuild -> a .pkg dropping NetVis.app into /Applications. Bundle is
-    # installed to a relative "." destination; this prefix relocates the whole
-    # payload under /Applications.
-    set(CPACK_GENERATOR "productbuild")
-    set(CPACK_PACKAGING_INSTALL_PREFIX "/Applications")
-    # CRITICAL: the pkg identifier MUST be a space-free reverse-DNS string. CMake
-    # otherwise derives it from CPACK_PACKAGE_VENDOR ("Seamus Mullan"), and the
-    # space in "com.Seamus Mullan.NetVis" makes pkgbuild emit a ~1 KB EMPTY pkg.
-    set(CPACK_PRODUCTBUILD_IDENTIFIER "com.seamusmullan.netvis")
+    # DragNDrop -> a .dmg containing NetVis.app (drag into /Applications). This is
+    # the reliable macOS distribution format for a GUI .app: the productbuild
+    # generator repeatedly produced a ~1 KB empty .pkg in CI (its pkgbuild payload
+    # walk did not embed the bundle), whereas DragNDrop just images the staged
+    # tree. The .app is installed to a relative "." so the DMG root holds it.
+    set(CPACK_GENERATOR "DragNDrop")
     set(CPACK_PACKAGE_VENDOR "seamusmullan")
   else()
     # Linux: a portable .zip (spec-requested). TGZ also produced as a courtesy.
