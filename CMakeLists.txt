@@ -150,6 +150,15 @@ if(NETVIS_BUILD_APP)
   set(GLFW_BUILD_TESTS OFF CACHE INTERNAL "")
   set(GLFW_BUILD_DOCS OFF CACHE INTERNAL "")
   set(GLFW_INSTALL OFF CACHE INTERNAL "")
+  # On Linux, GLFW 3.4 builds the Wayland backend by default, which requires
+  # wayland-scanner + Wayland dev headers not present on a stock CI image. Build
+  # the X11 backend only — it works everywhere (incl. XWayland) and drops the
+  # extra build-time dependency. NETVIS_GLFW_WAYLAND=ON re-enables both backends.
+  option(NETVIS_GLFW_WAYLAND "Also build the GLFW Wayland backend on Linux" OFF)
+  if(UNIX AND NOT APPLE AND NOT NETVIS_GLFW_WAYLAND)
+    set(GLFW_BUILD_WAYLAND OFF CACHE INTERNAL "")
+    set(GLFW_BUILD_X11 ON CACHE INTERNAL "")
+  endif()
   FetchContent_MakeAvailable(glfw)
 
   # Dear ImGui (docking branch) — panels, dialogs, and the ImDrawList canvas.

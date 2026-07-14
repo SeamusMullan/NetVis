@@ -28,12 +28,18 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
-// Raw GL entry points for the offscreen-FBO PNG export path. GL_GLEXT_PROTOTYPES
-// makes <GL/glext.h> declare glGenFramebuffers/... so we can render draw data to
-// an offscreen target without a loader library.
+// Raw GL entry points for the offscreen-FBO PNG export path. Header location is
+// platform-specific: Apple ships OpenGL under <OpenGL/>, and its gl3.h already
+// declares the FBO core API; elsewhere GL_GLEXT_PROTOTYPES makes <GL/glext.h>
+// declare glGenFramebuffers/... so we need no loader library.
+#if defined(__APPLE__)
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl3.h>
+#else
 #define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
 #include <GL/glext.h>
+#endif
 
 // stb_image_write is header-only; its implementation is compiled EXACTLY once,
 // here (spec §8.7). Wrap it so its internal style does not trip -Werror.
