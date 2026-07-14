@@ -68,7 +68,7 @@ jobs:
 
       - name: Package
         working-directory: build
-        run: cpack -G ${{ matrix.gen }}
+        run: cpack -G ${{ matrix.gen }} --verbose
 
       # Collect the CPack output and rename it to a CANONICAL name. CPack's NSIS
       # generator ignores CPACK_PACKAGE_FILE_NAME and names the .exe using only
