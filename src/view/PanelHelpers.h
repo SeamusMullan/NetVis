@@ -12,6 +12,7 @@
 
 #include "core/SmallVec.h"
 #include "engine/CollapseTree.h"
+#include "engine/Layout.h"
 #include "ir/IR.h"
 
 namespace netvis {
@@ -37,6 +38,13 @@ uint32_t resolve_edge_value(const ir::Graph& g, const ir::Range& r, uint32_t slo
 // == `ir_node`, or, if that node is hidden inside a collapsed group, the display
 // node for that group. Returns -1 if not currently displayed.
 int32_t display_index_for_node(const CollapseTree& collapse, uint32_t ir_node);
+
+// World-space center of the layout box for `display_id`, or {0,0} if the id is
+// out of range / no layout. Hoisted here (was private to SearchBar.cpp) so
+// search, navigation jump-to, and the diff panel can share one fly-to helper.
+// `layout` may be null (returns {0,0}). Defined in PanelHelpers.cpp.
+struct BoxCenter { float x = 0.0f; float y = 0.0f; };
+BoxCenter box_center_for_display(const LayoutResult* layout, int32_t display_id);
 
 }  // namespace panel_detail
 }  // namespace netvis

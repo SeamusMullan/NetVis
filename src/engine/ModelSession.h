@@ -90,7 +90,7 @@ class ModelSession {
 
   const SearchIndex& search() const { return search_; }
 
-  const MappedFile& file() const { return file_; }
+  const MappedFile& file() const { return *file_; }
   std::string model_dir() const;  // directory of `path_`, for external_data
 
   // Provided by the view so layout can measure label extents (font metrics).
@@ -103,7 +103,13 @@ class ModelSession {
   JobSystem& jobs_;
 
   // --- Owned model state (main thread; mutated only via completions) ---------
-  MappedFile file_;
+  // shared_ptr, not a bare MappedFile: worker jobs (parse/search/shape) read the
+  // mapping off the main thread, and a reopen would otherwise munmap it under a
+  // live worker (use-after-free). Each job captures a shared_ptr snapshot so the
+  // mapping outlives the job; reopen swaps in a fresh mapping without unmapping
+  // the one an in-flight worker still holds. Never null after the first open;
+  // file() dereferences it. Default-constructed to an empty mapping.
+  std::shared_ptr<MappedFile> file_ = std::make_shared<MappedFile>();
   std::unique_ptr<ir::Model> model_;
   CollapseTree collapse_;
   std::unique_ptr<LayoutResult> layout_;

@@ -62,6 +62,21 @@ uint32_t resolve_edge_value(const ir::Graph& g, const ir::Range& r, uint32_t slo
   return value_idx;
 }
 
+BoxCenter box_center_for_display(const LayoutResult* layout, int32_t display_id) {
+  // Boxes carry their own display_id, so match on that rather than trusting index
+  // parity (the layout box array is not guaranteed 1:1 with the display list).
+  BoxCenter out;
+  if (layout == nullptr || display_id < 0) return out;
+  for (const NodeBox& b : layout->boxes) {
+    if (static_cast<int32_t>(b.display_id) == display_id) {
+      out.x = b.pos.x + b.size.x * 0.5f;
+      out.y = b.pos.y + b.size.y * 0.5f;
+      return out;
+    }
+  }
+  return out;
+}
+
 int32_t display_index_for_node(const CollapseTree& collapse, uint32_t ir_node) {
   const auto& display = collapse.display_nodes();
   // First pass: a directly-visible leaf. Linear scan is fine — display lists are

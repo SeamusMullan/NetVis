@@ -186,6 +186,23 @@ Result<std::vector<uint64_t>> read_offset_vector(ByteReader& r, const Table& t,
   return out;
 }
 
+// Open a sub-table referenced by table field `idx` (a UOFFSET). Returns nullopt
+// (via *present=false) when the field is absent; a real error otherwise.
+Result<bool> field_table(ByteReader& r, const Table& t, uint32_t idx,
+                         Table& out, bool& present) {
+  present = false;
+  auto loc = table_field(r, t, idx);
+  if (!loc) return loc.error();
+  if (*loc == 0) return true;  // absent
+  auto tpos = read_uoffset(r, *loc);
+  if (!tpos) return tpos.error();
+  auto tab = open_table(r, *tpos);
+  if (!tab) return tab.error();
+  out = *tab;
+  present = true;
+  return true;
+}
+
 // Map TFLite tensor type code -> ir::DType.
 ir::DType map_dtype(uint8_t code) {
   switch (code) {
@@ -234,8 +251,27 @@ namespace f_opcode { enum { deprecated_builtin_code = 0, custom_code = 1,
 namespace f_subgraph { enum { tensors = 0, inputs = 1, outputs = 2,
                               operators = 3, name = 4 }; }
 namespace f_tensor { enum { shape = 0, type = 1, buffer = 2, name = 3 }; }
-namespace f_operator { enum { opcode_index = 0, inputs = 1, outputs = 2 }; }
+namespace f_operator { enum { opcode_index = 0, inputs = 1, outputs = 2,
+                              builtin_options_type = 3, builtin_options = 4 }; }
 namespace f_buffer { enum { data = 0 }; }
+
+// BuiltinOptions union tag values (schema.fbs BuiltinOptions enum ordinal, NOT
+// the operator BuiltinOperator code). Only the control-flow ops that reference
+// other subgraphs matter here. These are the ordinals in the canonical TFLite
+// BuiltinOptions union: IfOptions=92, WhileOptions=93, CallOnceOptions=103.
+// (The earlier 45/62/76 were GreaterEqual/LogicalAnd/SquaredDifference options —
+// wrong union, so control-flow linking never fired on a real .tflite file.)
+namespace builtin_options_type {
+enum {
+  IfOptions = 92,
+  WhileOptions = 93,
+  CallOnceOptions = 103,
+};
+}
+// Field indices inside the control-flow option tables (all i32 subgraph refs).
+namespace f_if { enum { then_subgraph_index = 0, else_subgraph_index = 1 }; }
+namespace f_while { enum { cond_subgraph_index = 0, body_subgraph_index = 1 }; }
+namespace f_call_once { enum { init_subgraph_index = 0 }; }
 
 // Resolved buffer: file offset + length of its `data` vector. offset ==
 // UINT64_MAX and len == 0 when the buffer is empty (no weights).
@@ -469,6 +505,47 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
       }
       node.outputs.count =
           static_cast<uint32_t>(g.edge_refs.size()) - node.outputs.begin;
+
+      // Control-flow linking: If/While/CallOnce carry a builtin_options union
+      // (tag = field 3, table = field 4) that references other subgraphs by
+      // index. Link the primary referenced subgraph into Node.subgraph so the
+      // view can descend. Bounds-checked against the subgraph count.
+      {
+        auto tag = field_u8(r, *ot, f_operator::builtin_options_type, 0);
+        if (!tag) return tag.error();
+        if (*tag == builtin_options_type::IfOptions ||
+            *tag == builtin_options_type::WhileOptions ||
+            *tag == builtin_options_type::CallOnceOptions) {
+          Table opts;
+          bool present = false;
+          if (auto s = field_table(r, *ot, f_operator::builtin_options, opts,
+                                   present);
+              !s) {
+            return s.error();
+          }
+          if (present) {
+            uint32_t sub_field = 0;
+            switch (*tag) {
+              case builtin_options_type::IfOptions:
+                sub_field = f_if::then_subgraph_index;
+                break;
+              case builtin_options_type::WhileOptions:
+                sub_field = f_while::cond_subgraph_index;
+                break;
+              default:  // CallOnceOptions
+                sub_field = f_call_once::init_subgraph_index;
+                break;
+            }
+            auto sidx = field_i32(r, opts, sub_field, -1);
+            if (!sidx) return sidx.error();
+            // Subgraph indices are stable: out.graphs[i] == subgraphs[i] since
+            // we append in order. Bounds-check against the total count.
+            if (*sidx >= 0 && static_cast<uint64_t>(*sidx) < sg_total) {
+              node.subgraph = *sidx;
+            }
+          }
+        }
+      }
 
       g.nodes.push_back(std::move(node));
     }

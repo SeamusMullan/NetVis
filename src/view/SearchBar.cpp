@@ -39,22 +39,6 @@ const char* kind_tag(SearchKind k) {
   return "?";
 }
 
-// Look up a display node's world-space center from the published layout. Boxes
-// carry their own display_id, so we match on that rather than trusting index
-// parity. Returns false if there's no layout or no matching box.
-bool box_center_for_display(App& app, int32_t display_id, ImVec2* out) {
-  const LayoutResult* layout = app.session().layout();
-  if (!layout || display_id < 0) return false;
-  for (const NodeBox& b : layout->boxes) {
-    if (static_cast<int32_t>(b.display_id) == display_id) {
-      out->x = b.pos.x + b.size.x * 0.5f;
-      out->y = b.pos.y + b.size.y * 0.5f;
-      return true;
-    }
-  }
-  return false;
-}
-
 // Resolve a hit's producer node index within its graph, or -1. For Node hits
 // that's ref directly; for Value hits it's the value's producer.
 int32_t node_index_for_hit(const ir::Model& model, const SearchEntry& e) {
@@ -115,10 +99,12 @@ void resolve_hit(App& app, const SearchEntry& e) {
     // Fly-to: center the node in the current viewport. The canvas dock size is
     // not known from here, so use the main viewport work area as the view size
     // proxy — animate_camera_to only needs a reasonable extent to solve pan.
-    ImVec2 center;
-    if (box_center_for_display(app, disp, &center)) {
+    panel_detail::BoxCenter center =
+        panel_detail::box_center_for_display(session.layout(), disp);
+    if (center.x != 0.0f || center.y != 0.0f) {
       ImGuiViewport* vp = ImGui::GetMainViewport();
-      animate_camera_to(app.view(), center, vp->WorkSize, app.view().cam.zoom);
+      animate_camera_to(app.view(), ImVec2(center.x, center.y), vp->WorkSize,
+                        app.view().cam.zoom);
     } else {
       // Layout not ready yet: leave selection set so the canvas can center on it
       // once a layout is published (request_fit is the closest existing intent).

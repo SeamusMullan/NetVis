@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/CollapseTree.h"
@@ -230,31 +231,142 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     }
   }
 
+  // ==========================================================================
+  //  v0.2.0 LAYOUT-NODE MODEL (LayoutCache kVersion v3). All ordering and
+  //  coordinate passes below run on INTERNAL arrays indexed by LAYOUT-node id:
+  //  indices [0,V) are the real display nodes, then per-consumer CLONES of
+  //  multi-consumer sources, then Sugiyama DUMMY nodes for long edges. Only real
+  //  + clone nodes become out.boxes (a clone shares its source's display_id, so
+  //  out.boxes may exceed display_nodes().size() and several boxes may share a
+  //  display_id — every view consumer keys off box.display_id, not box index).
+  //  Dummies are bezier waypoints only and are never emitted.
+  // ==========================================================================
+  constexpr uint32_t kDummyOwner = UINT32_MAX;
+  std::vector<Vec2> nsize;      // per layout-node measured size
+  std::vector<int32_t> nlayer;  // per layout-node layer
+  std::vector<uint32_t> nowner; // owning display id, or kDummyOwner for a dummy
+  nsize.reserve(static_cast<size_t>(V) * 2);
+  nlayer.reserve(static_cast<size_t>(V) * 2);
+  nowner.reserve(static_cast<size_t>(V) * 2);
+  for (uint32_t i = 0; i < V; ++i) {
+    nsize.push_back(out.boxes[i].size);
+    nlayer.push_back(layer[i]);
+    nowner.push_back(i);
+  }
+
+  // A routed edge in EFFECTIVE (acyclic) direction u(upper)->v(lower). from_disp/
+  // to_disp/reversed carry the ORIGINAL display-space direction for the emitted
+  // EdgeCurve; `chain` holds intermediate dummy node ids (top->bottom).
+  struct RouteEdge {
+    uint32_t u, v;
+    uint32_t from_disp, to_disp;
+    bool reversed;
+    std::vector<uint32_t> chain;
+  };
+  std::vector<RouteEdge> routes;
+  routes.reserve(edges.size());
+  for (const DEdge& e : edges)
+    routes.push_back(RouteEdge{eff_from(e), eff_to(e), e.from, e.to, e.reversed,
+                               {}});
+
+  // -- Multi-consumer source duplication. A real, non-group source (effective
+  // in-degree 0) feeding >=2 consumers emits one long edge per consumer (the
+  // hairball). Clone it once per EXTRA consumer so each clone sits just above a
+  // single consumer. The first consumer (ascending by (layer, id)) keeps the
+  // original node; clones re-point that consumer's edge. Deterministic.
+  constexpr uint32_t kMaxDuplicate = 64;  // fan-out cap: above this stay shared
+  {
+    std::vector<uint32_t> indeg(V, 0);
+    std::vector<std::vector<uint32_t>> out_routes(V);
+    for (uint32_t ri = 0; ri < routes.size(); ++ri) {
+      const RouteEdge& r = routes[ri];
+      if (r.u < V) out_routes[r.u].push_back(ri);
+      if (r.v < V) ++indeg[r.v];
+    }
+    for (uint32_t s = 0; s < V; ++s) {
+      if (indeg[s] != 0 || disp[s].is_group) continue;  // real sources only
+      std::vector<uint32_t>& outs = out_routes[s];
+      if (outs.size() < 2 || outs.size() > kMaxDuplicate) continue;
+      std::sort(outs.begin(), outs.end(), [&](uint32_t a, uint32_t b) {
+        uint32_t va = routes[a].v, vb = routes[b].v;
+        if (nlayer[va] != nlayer[vb]) return nlayer[va] < nlayer[vb];
+        return va < vb;  // deterministic tiebreak
+      });
+      nlayer[s] = std::max(0, nlayer[routes[outs[0]].v] - 1);  // keep, place
+      for (size_t k = 1; k < outs.size(); ++k) {
+        RouteEdge& r = routes[outs[k]];
+        uint32_t clone = static_cast<uint32_t>(nsize.size());
+        nsize.push_back(nsize[s]);
+        nlayer.push_back(std::max(0, nlayer[r.v] - 1));
+        nowner.push_back(nowner[s]);  // clone shares the source's display id
+        r.u = clone;
+      }
+    }
+  }
+
+  // -- Sugiyama dummy nodes: for a route spanning D>1 layers, insert D-1 dummies
+  // on the intermediate layers so crossing reduction converges and the edge can
+  // bend around nodes. Capped per edge (above the cap, route straight).
+  constexpr uint32_t kMaxDummiesPerEdge = 128;
+  for (RouteEdge& r : routes) {
+    int32_t lu = nlayer[r.u], lv = nlayer[r.v];
+    int32_t d = lv - lu;
+    if (d <= 1 || static_cast<uint32_t>(d - 1) > kMaxDummiesPerEdge) continue;
+    for (int32_t li = lu + 1; li < lv; ++li) {
+      uint32_t dm = static_cast<uint32_t>(nsize.size());
+      nsize.push_back(Vec2{1.0f, 1.0f});
+      nlayer.push_back(li);
+      nowner.push_back(kDummyOwner);
+      r.chain.push_back(dm);
+    }
+  }
+
+  const uint32_t M = static_cast<uint32_t>(nsize.size());
+
+  // Unit segments (each spans exactly one layer) drive ordering/crossings/align.
+  // Same-layer degenerate segments (a clone level with its consumer) are dropped
+  // from adjacency — they cannot be ordered across a layer — but the route still
+  // renders. NB: routing uses `routes`, ordering uses `segs`.
+  std::vector<std::pair<uint32_t, uint32_t>> segs;  // (upper, lower)
+  segs.reserve(routes.size());
+  auto add_seg = [&](uint32_t a, uint32_t b) {
+    if (nlayer[b] == nlayer[a] + 1) segs.push_back({a, b});
+  };
+  for (const RouteEdge& r : routes) {
+    if (r.chain.empty()) {
+      add_seg(r.u, r.v);
+    } else {
+      add_seg(r.u, r.chain.front());
+      for (size_t i = 0; i + 1 < r.chain.size(); ++i)
+        add_seg(r.chain[i], r.chain[i + 1]);
+      add_seg(r.chain.back(), r.v);
+    }
+  }
+
   int32_t max_layer = 0;
-  for (uint32_t v = 0; v < V; ++v) max_layer = std::max(max_layer, layer[v]);
+  for (uint32_t v = 0; v < M; ++v) max_layer = std::max(max_layer, nlayer[v]);
   const size_t L = static_cast<size_t>(max_layer) + 1;
   if (progress) progress->set(0.5f, "layout: layering");
 
-  // Layer membership; `pos_in_layer` = order index within a layer.
+  // Layer membership over ALL layout nodes; order index within a layer.
   std::vector<std::vector<uint32_t>> layers(L);
-  for (uint32_t v = 0; v < V; ++v)
-    layers[static_cast<size_t>(layer[v])].push_back(v);
-  // Initial order: by display index (deterministic).
+  for (uint32_t v = 0; v < M; ++v)
+    layers[static_cast<size_t>(nlayer[v])].push_back(v);
+  // Initial order: by layout-node id (deterministic).
   for (auto& lv : layers) std::sort(lv.begin(), lv.end());
 
-  std::vector<uint32_t> order_idx(V, 0);
+  std::vector<uint32_t> order_idx(M, 0);
   auto refresh_order = [&]() {
     for (auto& lv : layers)
       for (uint32_t p = 0; p < lv.size(); ++p) order_idx[lv[p]] = p;
   };
   refresh_order();
 
-  // Predecessor / successor adjacency in effective direction for barycenters.
-  std::vector<std::vector<uint32_t>> preds(V), succs(V);
-  for (const DEdge& e : edges) {
-    uint32_t f = eff_from(e), t = eff_to(e);
-    succs[f].push_back(t);
-    preds[t].push_back(f);
+  // Predecessor / successor adjacency (effective direction) for barycenters.
+  std::vector<std::vector<uint32_t>> preds(M), succs(M);
+  for (const auto& s : segs) {
+    succs[s.first].push_back(s.second);
+    preds[s.second].push_back(s.first);
   }
 
   // Count total crossings between all adjacent layer pairs (for early-stop).
@@ -265,22 +377,22 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   // would blow the sub-250ms budget.
   auto count_crossings = [&]() -> uint64_t {
     uint64_t total = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> segs;  // (upper_pos, lower_pos)
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;  // (upper_pos, lower_pos)
     std::vector<uint32_t> bit;
     for (size_t li = 0; li + 1 < L; ++li) {
-      segs.clear();
+      pairs.clear();
       for (uint32_t u : layers[li])
         for (uint32_t w : succs[u])
-          if (static_cast<size_t>(layer[w]) == li + 1)
-            segs.push_back({order_idx[u], order_idx[w]});
-      if (segs.size() < 2) continue;
+          if (static_cast<size_t>(nlayer[w]) == li + 1)
+            pairs.push_back({order_idx[u], order_idx[w]});
+      if (pairs.size() < 2) continue;
       // Order by upper endpoint (ties by lower) so that, scanning left to right,
       // a crossing is exactly a previously-seen edge with a GREATER lower pos.
-      std::sort(segs.begin(), segs.end());
+      std::sort(pairs.begin(), pairs.end());
       const size_t width = layers[li + 1].size();
       bit.assign(width + 1, 0);
       size_t seen = 0;
-      for (const auto& s : segs) {
+      for (const auto& s : pairs) {
         // #previously-seen edges with lower_pos <= s.second, via prefix sum.
         uint32_t leq = 0;
         for (size_t x = s.second + 1; x > 0; x -= x & (~x + 1)) leq += bit[x];
@@ -337,18 +449,17 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   }
   if (progress) progress->set(0.75f, "layout: ordering");
 
-  // -- 5) Coordinate assignment.
+  // -- 5) Coordinate assignment, on the internal per-layout-node arrays.
+  std::vector<Vec2> npos(M);
   // y: accumulate per layer top-down (max node height in layer + rank_sep).
-  std::vector<float> layer_y(L, 0.0f);
   {
     float y = 0.0f;
     for (size_t li = 0; li < L; ++li) {
       float maxh = 0.0f;
-      for (uint32_t v : layers[li]) maxh = std::max(maxh, out.boxes[v].size.y);
-      layer_y[li] = y;
+      for (uint32_t v : layers[li]) maxh = std::max(maxh, nsize[v].y);
       // Center each node vertically within its layer band.
       for (uint32_t v : layers[li])
-        out.boxes[v].pos.y = y + (maxh - out.boxes[v].size.y) * 0.5f;
+        npos[v].y = y + (maxh - nsize[v].y) * 0.5f;
       y += maxh + params.rank_sep;
     }
   }
@@ -357,8 +468,8 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     for (size_t li = 0; li < L; ++li) {
       float x = 0.0f;
       for (uint32_t v : layers[li]) {
-        out.boxes[v].pos.x = x;
-        x += out.boxes[v].size.x + params.node_sep;
+        npos[v].x = x;
+        x += nsize[v].x + params.node_sep;
       }
     }
   };
@@ -366,9 +477,7 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   // Median alignment pass: shift each node toward the median x-center of its
   // neighbors (both layers), then re-resolve overlaps left-to-right. One down +
   // one up pass keeps chains vertically aligned without expensive optimization.
-  auto center_of = [&](uint32_t v) {
-    return out.boxes[v].pos.x + out.boxes[v].size.x * 0.5f;
-  };
+  auto center_of = [&](uint32_t v) { return npos[v].x + nsize[v].x * 0.5f; };
   auto align_pass = [&](bool use_preds) {
     const auto& nbr = use_preds ? preds : succs;
     for (size_t li = 0; li < L; ++li) {
@@ -381,39 +490,68 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
         for (uint32_t nb : nbr[v]) cs.push_back(center_of(nb));
         std::sort(cs.begin(), cs.end());
         float med = cs[cs.size() / 2];
-        out.boxes[v].pos.x = med - out.boxes[v].size.x * 0.5f;
+        npos[v].x = med - nsize[v].x * 0.5f;
       }
       // Resolve overlaps left-to-right preserving order.
       for (size_t p = 1; p < lv.size(); ++p) {
-        float min_x = out.boxes[lv[p - 1]].pos.x +
-                      out.boxes[lv[p - 1]].size.x + params.node_sep;
-        if (out.boxes[lv[p]].pos.x < min_x) out.boxes[lv[p]].pos.x = min_x;
+        float min_x = npos[lv[p - 1]].x + nsize[lv[p - 1]].x + params.node_sep;
+        if (npos[lv[p]].x < min_x) npos[lv[p]].x = min_x;
       }
     }
   };
   align_pass(/*use_preds=*/true);
   align_pass(/*use_preds=*/false);
 
-  // -- 6) Edge routing as cubic beziers. p0 producer bottom-center, p3 consumer
-  // top-center, p1/p2 vertical control points for a smooth flow. Reversed edges
-  // keep their ORIGINAL from/to display ids (visual direction) but flag it.
-  out.edges.reserve(edges.size());
-  for (const DEdge& e : edges) {
+  // -- Emit boxes: ONLY real + clone layout nodes (dummies are waypoints). Each
+  // box carries its OWNING display id; clones share their source's display id so
+  // the view's display_id-keyed lookups still resolve. boxes may therefore be
+  // longer than display_nodes() and share display ids (documented, kVersion v3).
+  out.boxes.clear();
+  out.boxes.reserve(M);
+  for (uint32_t v = 0; v < M; ++v) {
+    if (nowner[v] == kDummyOwner) continue;  // dummy: no box
+    NodeBox b;
+    b.display_id = nowner[v];
+    b.pos = npos[v];
+    b.size = nsize[v];
+    b.layer = nlayer[v];
+    out.boxes.push_back(b);
+  }
+
+  // -- 6) Edge routing as cubic beziers through any dummy waypoints. p0 at the
+  // source's bottom-center, p3 at the consumer's top-center. With dummies the
+  // control points are pulled toward the first/last waypoint x so the edge bends
+  // around intervening layers instead of cutting straight through them. Reversed
+  // edges keep their ORIGINAL display-space from/to (visual direction) + flag.
+  auto bottom_center = [&](uint32_t v) {
+    return Vec2{npos[v].x + nsize[v].x * 0.5f, npos[v].y + nsize[v].y};
+  };
+  auto top_center = [&](uint32_t v) {
+    return Vec2{npos[v].x + nsize[v].x * 0.5f, npos[v].y};
+  };
+  out.edges.reserve(routes.size());
+  for (const RouteEdge& r : routes) {
     EdgeCurve c;
-    c.from_display_id = e.from;
-    c.to_display_id = e.to;
-    c.reversed = e.reversed;
-    const NodeBox& fb = out.boxes[e.from];
-    const NodeBox& tb = out.boxes[e.to];
-    c.p0 = Vec2{fb.pos.x + fb.size.x * 0.5f, fb.pos.y + fb.size.y};
-    c.p3 = Vec2{tb.pos.x + tb.size.x * 0.5f, tb.pos.y};
+    c.from_display_id = r.from_disp;
+    c.to_display_id = r.to_disp;
+    c.reversed = r.reversed;
+    c.p0 = bottom_center(r.u);
+    c.p3 = top_center(r.v);
     float dy = (c.p3.y - c.p0.y) * 0.5f;
-    c.p1 = Vec2{c.p0.x, c.p0.y + dy};
-    c.p2 = Vec2{c.p3.x, c.p3.y - dy};
+    if (r.chain.empty()) {
+      c.p1 = Vec2{c.p0.x, c.p0.y + dy};
+      c.p2 = Vec2{c.p3.x, c.p3.y - dy};
+    } else {
+      // Bend toward the first/last dummy waypoint centers.
+      float fx = npos[r.chain.front()].x + nsize[r.chain.front()].x * 0.5f;
+      float lx = npos[r.chain.back()].x + nsize[r.chain.back()].x * 0.5f;
+      c.p1 = Vec2{fx, c.p0.y + dy};
+      c.p2 = Vec2{lx, c.p3.y - dy};
+    }
     out.edges.push_back(c);
   }
 
-  // -- Bounds.
+  // -- Bounds (over emitted boxes only).
   float minx = std::numeric_limits<float>::max();
   float miny = std::numeric_limits<float>::max();
   float maxx = std::numeric_limits<float>::lowest();
@@ -424,7 +562,7 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     maxx = std::max(maxx, b.pos.x + b.size.x);
     maxy = std::max(maxy, b.pos.y + b.size.y);
   }
-  if (V == 0) {
+  if (out.boxes.empty()) {
     minx = miny = maxx = maxy = 0.0f;
   }
   out.bounds_min = Vec2{minx, miny};

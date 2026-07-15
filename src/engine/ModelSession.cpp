@@ -29,6 +29,7 @@
 
 #include "engine/LayoutCache.h"
 #include "engine/ShapeInference.h"
+#include "engine/ShapeInferenceExt.h"
 
 namespace netvis {
 
@@ -94,7 +95,10 @@ void ModelSession::open_async(const std::string& path) {
     error_ = mapped.error().message;
     return;
   }
-  file_ = mapped.take();
+  // Fresh mapping in a NEW shared_ptr: any worker from a previous open still
+  // holds the old shared_ptr, so replacing ours never munmaps under it.
+  file_ = std::make_shared<MappedFile>(mapped.take());
+  std::shared_ptr<MappedFile> file = file_;  // snapshot captured by the jobs
 
   const std::string ext = ext_of(path);
   stage_ = LoadStage::Parsing;
@@ -102,12 +106,13 @@ void ModelSession::open_async(const std::string& path) {
 
   // ParseJob: runs on a worker. It owns the produced Model until publication.
   // The MappedFile is immutable after mapping, so read-only concurrent access
-  // from the worker is safe (see MappedFile threading note).
-  jobs_.submit([this, gen, ext] {
+  // from the worker is safe (see MappedFile threading note). The captured
+  // shared_ptr keeps the mapping alive for the job even across a reopen.
+  jobs_.submit([this, gen, ext, file] {
     auto t_parse = std::chrono::steady_clock::now();
     // parse_model reads ONLY structure through ByteReader and records tensor
     // payload offset+length; it never reads weight bytes.
-    Result<ir::Model> parsed = parse_model(file_, ext, progress_);
+    Result<ir::Model> parsed = parse_model(*file, ext, progress_);
     double parse_ms = ms_since(t_parse);
 
     if (!parsed) {
@@ -171,9 +176,13 @@ void ModelSession::open_async(const std::string& path) {
       // acts as the happens-before publication point for those writes.
       if (is_onnx) {
         stage_ = LoadStage::Enriching;
-        jobs_.submit([this, gen] {
+        // Snapshot the mapping (main thread) so the worker holds it alive even
+        // if the primary is reopened mid-inference — reading file_ off-thread
+        // would otherwise race a munmap.
+        std::shared_ptr<MappedFile> file = file_;
+        jobs_.submit([this, gen, file] {
           auto t_shapes = std::chrono::steady_clock::now();
-          infer_shapes(*model_, 0, &progress_);
+          infer_shapes_ext(*model_, 0, file->data(), file->size(), &progress_);
           double shapes_ms = ms_since(t_shapes);
           jobs_.post_to_main([this, gen, shapes_ms] {
             if (jobs_.generation() != gen) return;  // stale: drop

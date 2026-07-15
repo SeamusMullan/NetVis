@@ -96,3 +96,46 @@ by `tests/test_hardening.cpp` and an ASan/UBSan truncation fuzz):
   overflow UB (`CollapseTree.cpp`).
 - **Crossing counting is O(E log E)** (Fenwick tree), not O(E²), so a wide
   non-collapsing graph still meets the layout budget (`LayoutEngine.cpp`).
+
+## v0.2.0 additions
+
+- **Layout works on internal layout-node arrays, not `out.boxes`.** To place a
+  shared constant next to *each* consumer, `compute_layout` now duplicates a
+  multi-consumer source (in-degree 0, non-group, ≥2 consumers) into one clone per
+  consumer, and inserts Sugiyama dummy nodes along edges spanning >1 layer.
+  Ordering/coordinate/routing passes run on internal `npos/nsize/nlayer/nowner`
+  arrays covering *real + clones + dummies*; only real+clone nodes are emitted as
+  `NodeBox`es. **Invariant relaxation:** `LayoutResult.boxes` may therefore exceed
+  `display_nodes().size()`, and several boxes may share a `display_id` (a clone
+  carries its source's id). Every view consumer keys off `box.display_id`
+  (bounds-checked `< display_nodes().size()`), never the box index — this was
+  already true. Duplication is capped at 64 consumers and dummies at 128/edge
+  (deterministic fallback to a shared node / straight edge) to hold the budget.
+  Any position-affecting layout change **must bump `kVersion`** in `LayoutCache.cpp`
+  or a stale `.nvl` masks it (v3 covers duplication + dummy routing).
+- **`view/` is not a frozen contract.** `CONTRACTS.md` lists `view/` as
+  *to-implement*; the `App.h` banner comment is historical. `ViewState` is
+  append-only — v0.2.0 adds `hide_const_edges`, a `unique_ptr<GraphNavState> nav`,
+  and `diff_panel_open`. New panels are new `draw_*` free functions in new TUs, so
+  frozen panel signatures in `App.h` are never edited.
+- **Graph adjacency is built synchronously on the main thread.** `GraphAdjacency`
+  (CSR forward+reverse) is one O(V+E) pass — far cheaper than `compute_layout`,
+  which already runs per open — so navigation rebuilds it inline on
+  generation/graph change. Backgrounding it would need a shared-ownership handle
+  to the `ir::Model` the view doesn't have (the worker could read a freed model on
+  re-open), so we keep it on the main thread and avoid the lifetime hazard entirely.
+- **Model diff uses a second `JobSystem`.** The comparison model is loaded + diffed
+  through `engine/DiffLoader` (engine may include parsers; the view must not). It
+  owns its *own* `JobSystem` so its generation counter can't cross-cancel the
+  primary session's in-flight parse/layout/shape jobs. The diff reads only
+  op_type/name/attributes/arity/topology — never `ValueInfo.shape/dtype` — so it is
+  race-free against in-flight shape inference on either model. Cross-model node
+  matching compares string **content** (`model.str(id)`), since the two models have
+  independent `StringArena`s and a raw `StringId` is meaningless across them.
+- **Shape inference gained an mmap-aware overload.** The frozen 3-arg
+  `infer_shapes` delegates to `infer_shapes_ext(…, base, size, …)`; when a base is
+  supplied, shape-driven ops (Reshape/Slice/Gather/…) resolve by reading a
+  *raw_data*-backed shape initializer through the mapping (every read
+  bounds-checked against `base+size`). Shapes packed into `int64_data`/`int32_data`
+  protobuf fields have no recorded offset (`file_offset == UINT64_MAX`) and stay
+  `Unknown` — best-effort, never a crash.

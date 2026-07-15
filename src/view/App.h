@@ -17,6 +17,7 @@
 #include "imgui.h"
 
 #include "core/JobSystem.h"
+#include "engine/DiffLoader.h"
 #include "engine/ModelSession.h"
 #include "engine/OpCategory.h"
 #include "engine/TensorStats.h"
@@ -25,6 +26,10 @@
 struct GLFWwindow;
 
 namespace netvis {
+
+// Navigation state lives in its own view header; ViewState holds it by pointer
+// so App.h stays light. Forward-declared here, defined in view/GraphNav.h.
+struct GraphNavState;
 
 // World<->screen transform for the graph canvas (spec §8.1). world*zoom+pan.
 struct Camera {
@@ -82,6 +87,21 @@ struct ViewState {
   bool dark_theme = true;
   bool show_minimap = true;
   bool request_fit = false;      // set to trigger a fit-to-graph next frame
+
+  // --- v0.2.0 additions (append-only; see CONTRACTS.md: view/ is not frozen) --
+  // Layout readability: hide constant/initializer input edges in the canvas and
+  // show a "+N" badge on consumers instead. Pure view toggle, no re-layout.
+  bool hide_const_edges = false;
+
+  // Graph navigation: highlight/focus/filter state + derived display-space masks.
+  // Held by pointer (forward-declared) so App.h needn't include GraphNav.h; the
+  // instance is created lazily by ensure_nav(). App.cpp MUST include GraphNav.h
+  // so the unique_ptr's deleter sees the complete type at ~App().
+  std::unique_ptr<GraphNavState> nav;
+
+  // Model diff: panel-open flag. The comparison model + diff live in DiffLoader
+  // (App-owned engine object); this is just the panel's visibility toggle.
+  bool diff_panel_open = false;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather
@@ -118,6 +138,10 @@ class App {
   // Accessors used by panel free functions.
   ModelSession& session() { return *session_; }
   JobSystem& jobs() { return *jobs_; }
+  // Comparison-model loader for diff mode (v0.2.0). Backed by its OWN JobSystem
+  // (diff_jobs_) so its generation counter never cross-cancels the primary
+  // session's in-flight parse/layout/shape jobs.
+  DiffLoader& diff_loader() { return *diff_loader_; }
   ViewState& view() { return view_; }
   PendingDecode& decode() { return decode_; }
   const Fonts& fonts() const { return fonts_; }
@@ -137,6 +161,10 @@ class App {
   GLFWwindow* window_ = nullptr;
   std::unique_ptr<JobSystem> jobs_;
   std::unique_ptr<ModelSession> session_;
+  // Second JobSystem dedicated to the comparison-model load/diff pipeline, kept
+  // separate from jobs_ so the two generation counters never interfere.
+  std::unique_ptr<JobSystem> diff_jobs_;
+  std::unique_ptr<DiffLoader> diff_loader_;
   ViewState view_;
   PendingDecode decode_;
   Fonts fonts_;

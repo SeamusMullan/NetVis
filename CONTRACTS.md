@@ -80,6 +80,27 @@ entries are indices into `Graph::values`.
 - main.cpp: create App, handle CLI arg + GLFW drop callback, run loop
   (`session.update()` once/frame).
 
+## v0.2.0 additions (additive — no frozen signature changed)
+- **engine/GraphAdjacency.h** — CSR forward/reverse adjacency over one graph;
+  `build(model,graph)`, `reachable_succ/pred(start,max_hops,cap)`. Built
+  synchronously on the main thread (cheap O(V+E)).
+- **engine/ModelDiff.h** — `diff_models(A,gA,B,gB) -> ModelDiffResult`
+  (`a_status/b_status/a_to_b/b_to_a` + counts). Matches by string CONTENT across
+  independent arenas; reads no shape/dtype. Deterministic.
+- **engine/DiffLoader.h** — owns the comparison model + async load + diff (engine
+  may include parsers; the view must not). Uses its OWN JobSystem.
+- **engine/ShapeInferenceExt.h** — `infer_shapes_ext(model,graph,base,size,prog)`;
+  the frozen 3-arg `infer_shapes` delegates here with `base=nullptr`.
+- **view/GraphNav.h**, **view/DiffPanel.h** — module-private view state + panels.
+- **`LayoutResult.boxes` invariant RELAXED:** after source duplication, `boxes`
+  may exceed `display_nodes().size()` and several boxes may share a `display_id`
+  (a clone carries its source's id). Consumers MUST key off `box.display_id`
+  (bounds-checked `< display_nodes().size()`), never the box index. Any
+  position-affecting layout change bumps `kVersion` in `LayoutCache.cpp`.
+- **`view/` is NOT frozen.** This file (not the `App.h` banner comment) is the
+  authority; `view/` is *to-implement*. `ViewState` is append-only. Frozen `App.h`
+  panel `draw_*` signatures are unchanged; new panels are new free functions.
+
 ## Rules for implementers
 - C++20, warnings-as-errors clean. RAII, no UB, no data races.
 - Comment every perf-relevant decision at its site.

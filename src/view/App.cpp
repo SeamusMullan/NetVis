@@ -82,7 +82,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include "engine/DiffLoader.h"
 #include "engine/LayoutCache.h"
+// GraphNav.h defines GraphNavState so ViewState's unique_ptr<GraphNavState>
+// deleter sees the complete type at ~App(); DiffPanel.h for draw_diff_panel.
+#include "view/DiffPanel.h"
+#include "view/GraphNav.h"
 
 // tinyfiledialogs ships only a .c/.h that is NOT on our include path; its two
 // entry points are plain C, so we declare them ourselves (spec §8.7). At link
@@ -140,6 +145,11 @@ App::~App() {
   // still-running decode job could touch session_->file() after session_ is
   // gone. shutdown() joins every worker first, closing that window.
   if (jobs_) jobs_->shutdown();
+  // diff_loader_ owns jobs on diff_jobs_; stop those workers before diff_loader_
+  // (and its captured shared_ptr<const ir::Model>) is destroyed. Members destruct
+  // in reverse declaration order (diff_loader_ then diff_jobs_), so shutting the
+  // pool down here first closes the window on a still-running diff job.
+  if (diff_jobs_) diff_jobs_->shutdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +204,12 @@ bool App::init(const std::string& initial_path) {
   // it references and must be destroyed before jobs_ — see ~App).
   jobs_ = std::make_unique<JobSystem>();
   session_ = std::make_unique<ModelSession>(*jobs_);
+
+  // Comparison-model diff pipeline runs on its OWN JobSystem so its generation
+  // counter never cross-cancels the primary session's in-flight parse/layout/
+  // shape jobs (see App.h / DiffLoader.h).
+  diff_jobs_ = std::make_unique<JobSystem>();
+  diff_loader_ = std::make_unique<DiffLoader>(*diff_jobs_);
 
   // Font-metric-based node sizing (spec §8.1): the layout worker calls this to
   // measure each display node's box. It reads only glyph advance widths from the
@@ -256,6 +272,7 @@ int App::run() {
   while (!glfwWindowShouldClose(window_)) {
     glfwPollEvents();
     session_->update();  // drain job completions once per frame (spec §4).
+    if (diff_loader_) diff_loader_->update();  // drain diff completions after.
     frame();
 
     // Render the assembled draw data to the default framebuffer.
@@ -353,6 +370,17 @@ void App::frame() {
       }
       ImGui::Separator();
       ImGui::MenuItem("Minimap", nullptr, &view_.show_minimap);
+      // Layout-readability toggle (v0.2.0 Feature 2): hide constant/initializer
+      // input edges + source boxes; consumers get a "+N" badge instead.
+      ImGui::MenuItem("Hide constant edges", nullptr, &view_.hide_const_edges);
+      ImGui::Separator();
+      // Graph navigation controls (v0.2.0): highlight/focus + category filter.
+      if (ImGui::BeginMenu("Navigation")) {
+        draw_nav_controls(*this);
+        ImGui::EndMenu();
+      }
+      // Model diff panel visibility (v0.2.0).
+      ImGui::MenuItem("Model diff panel", nullptr, &view_.diff_panel_open);
       ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -362,12 +390,16 @@ void App::frame() {
   // With a compute graph, the canvas owns the center; otherwise (GGUF / weight-
   // only files) we present the flat tensor table instead (spec §8.6).
   if (session_->has_graph()) {
+    // Refresh nav adjacency + display-space masks BEFORE the canvas reads them
+    // (cheap no-op unless the nav cache key changed).
+    ensure_nav(*this);
     draw_graph_canvas(*this);
   } else if (session_->model() != nullptr && !session_->has_graph()) {
     draw_tensor_table(*this);
   }
 
   // Panels + overlays are always present (they self-hide when empty).
+  draw_diff_panel(*this);
   draw_properties_panel(*this);
   draw_weight_inspector(*this);
   draw_search_bar(*this);

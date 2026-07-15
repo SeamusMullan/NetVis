@@ -10,17 +10,124 @@
 #include "view/App.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 #include "imgui.h"
 
 #include "engine/OpCategory.h"
+#include "view/DiffPanel.h"
+#include "view/GraphNav.h"
+#include "view/PanelHelpers.h"
 
 namespace netvis {
 
 namespace {
+
+// Per-display-node readability classification for the "hide constant edges"
+// toggle (Feature 2). Recomputed only when the session (generation / graph /
+// collapse) changes — NOT every frame. is_const_source[i] marks a leaf display
+// node that is a constant/initializer source (inputs.count==0 or op categorizes
+// to OpCategory::Tensor); const_badge[i] counts a consumer's hidden constant/
+// initializer inputs (for the "+N" badge).
+struct ReadabilityCache {
+  uint64_t key_generation = UINT64_MAX;
+  uint32_t key_graph = UINT32_MAX;
+  uint64_t key_collapse = UINT64_MAX;
+  bool valid = false;
+  std::vector<uint8_t> is_const_source;   // indexed by display id
+  std::vector<uint16_t> const_badge;      // indexed by display id
+};
+
+// True if IR node `n` is a constant/initializer *source* (a leaf producing a
+// constant with no compute inputs).
+bool node_is_const_source(const ir::Model& m, const ir::Node& n) {
+  if (n.inputs.count == 0) return true;
+  return categorize_op(m.str(n.op_type)) == OpCategory::Tensor;
+}
+
+// Recompute the readability cache if the session key changed. Returns it.
+const ReadabilityCache& readability_cache(App& app) {
+  static ReadabilityCache cache;
+  ModelSession& s = app.session();
+  const uint64_t gen = s.generation();
+  const uint32_t gi = s.current_graph();
+  const uint64_t ch = s.collapse().collapse_hash();
+  if (cache.valid && cache.key_generation == gen && cache.key_graph == gi &&
+      cache.key_collapse == ch)
+    return cache;
+
+  cache.key_generation = gen;
+  cache.key_graph = gi;
+  cache.key_collapse = ch;
+  cache.valid = true;
+
+  const auto& disp = s.collapse().display_nodes();
+  const size_t n = disp.size();
+  cache.is_const_source.assign(n, 0);
+  cache.const_badge.assign(n, 0);
+
+  const ir::Model* m = s.model();
+  if (m == nullptr || gi >= m->graphs.size()) return cache;
+  const ir::Graph& g = m->graphs[gi];
+
+  // Per-IR-node const-source classification + set of initializer value names.
+  std::vector<uint8_t> node_const(g.nodes.size(), 0);
+  for (size_t i = 0; i < g.nodes.size(); ++i)
+    node_const[i] = node_is_const_source(*m, g.nodes[i]) ? 1 : 0;
+  // Initializer value NAMES: a consumer input with no producer whose value name
+  // matches an initializer is a hidden constant input (counted in the badge).
+  std::vector<StringId> init_names;
+  init_names.reserve(g.initializers.size());
+  for (const ir::TensorRef& t : g.initializers) init_names.push_back(t.name);
+  auto is_init_name = [&](StringId id) {
+    for (StringId in : init_names)
+      if (in == id) return true;
+    return false;
+  };
+
+  for (size_t i = 0; i < n; ++i) {
+    const DisplayNode& dn = disp[i];
+    if (dn.is_group) continue;  // only leaf nodes are const sources.
+    if (dn.ir_node >= g.nodes.size()) continue;
+    if (node_const[dn.ir_node]) cache.is_const_source[i] = 1;
+
+    // Count this consumer's hidden constant/initializer inputs.
+    const ir::Node& node = g.nodes[dn.ir_node];
+    uint32_t badge = 0;
+    for (uint32_t slot = 0; slot < node.inputs.count; ++slot) {
+      uint32_t vidx = panel_detail::resolve_edge_value(g, node.inputs, slot);
+      if (vidx == UINT32_MAX || vidx >= g.values.size()) continue;
+      const ir::ValueInfo& vi = g.values[vidx];
+      if (vi.producer >= 0) {
+        if (static_cast<size_t>(vi.producer) < node_const.size() &&
+            node_const[vi.producer])
+          ++badge;
+      } else if (is_init_name(vi.name)) {
+        ++badge;  // initializer input (no producing node / no edge).
+      }
+    }
+    if (badge > 0)
+      cache.const_badge[i] = static_cast<uint16_t>(std::min<uint32_t>(badge, 0xFFFFu));
+  }
+  return cache;
+}
+
+// Badge glyph size tracks zoom like the node label text (clamped).
+float text_px_for_badge(float zoom) {
+  return std::clamp(11.0f * zoom, 11.0f * 0.5f, 11.0f * 3.0f);
+}
+
+// Apply an alpha multiplier to a packed color (for nav "dim" de-emphasis).
+ImU32 with_alpha_mul(ImU32 col, float mul) {
+  ImVec4 c = ImGui::ColorConvertU32ToFloat4(col);
+  c.w *= mul;
+  return ImGui::ColorConvertFloat4ToU32(c);
+}
 
 // LOD zoom thresholds (spec §8.1). Above kFull we draw the full node with two
 // text lines + edge labels; between kMid..kFull just the op_type; between
@@ -221,6 +328,33 @@ void draw_graph_canvas(App& app) {
 
   const Fonts& fonts = app.fonts();
 
+  // --- Navigation masks + readability cache (display-id indexed) -------------
+  // ensure_nav() (called from App::frame before us) keeps these in sync; guard
+  // for a null nav or a stale-size mask across a display-list rebuild this frame.
+  const GraphNavState* nav = vs.nav.get();
+  const size_t disp_count = session.collapse().display_nodes().size();
+  auto nav_hidden = [&](uint32_t did) -> bool {
+    return nav != nullptr && did < nav->hidden.size() &&
+           nav->hidden.size() == disp_count && nav->hidden[did] != 0;
+  };
+  auto nav_dim = [&](uint32_t did) -> bool {
+    return nav != nullptr && did < nav->dim.size() &&
+           nav->dim.size() == disp_count && nav->dim[did] != 0;
+  };
+  const bool hide_const = vs.hide_const_edges;
+  const ReadabilityCache& rc = readability_cache(app);
+  auto is_const_source = [&](uint32_t did) -> bool {
+    return hide_const && did < rc.is_const_source.size() &&
+           rc.is_const_source.size() == disp_count &&
+           rc.is_const_source[did] != 0;
+  };
+  // A display box is culled entirely when nav hides it OR it is a hidden const
+  // source. A box is de-emphasized when nav dims it.
+  auto box_culled = [&](uint32_t did) -> bool {
+    return nav_hidden(did) || is_const_source(did);
+  };
+  const float kDimAlpha = 0.18f;
+
   // --- Hover hit-test (against culled boxes) ---------------------------------
   const ImVec2 mouse = io.MousePos;
   int32_t hover_box = -1;
@@ -228,6 +362,7 @@ void draw_graph_canvas(App& app) {
     // Iterate reverse so topmost (later) boxes win ties.
     for (size_t i = layout->boxes.size(); i-- > 0;) {
       const NodeBox& b = layout->boxes[i];
+      if (box_culled(b.display_id)) continue;  // can't hover a culled box.
       ImVec2 bmin(b.pos.x, b.pos.y);
       ImVec2 bmax(b.pos.x + b.size.x, b.pos.y + b.size.y);
       if (!aabb_overlap(bmin, bmax, vw_min, vw_max)) continue;
@@ -247,6 +382,12 @@ void draw_graph_canvas(App& app) {
   const float edge_thick = std::clamp(1.5f * zoom, 0.75f, 3.0f);
   const bool draw_edge_labels = zoom > kZoomFull;
   for (const EdgeCurve& e : layout->edges) {
+    // Feature 2: skip edges whose source is a hidden constant/initializer box.
+    // Also cull edges touching a nav-hidden endpoint.
+    if (is_const_source(e.from_display_id)) continue;
+    if (nav_hidden(e.from_display_id) || nav_hidden(e.to_display_id)) continue;
+    const bool edge_dim =
+        nav_dim(e.from_display_id) || nav_dim(e.to_display_id);
     ImVec2 emin(std::min(std::min(e.p0.x, e.p1.x), std::min(e.p2.x, e.p3.x)),
                 std::min(std::min(e.p0.y, e.p1.y), std::min(e.p2.y, e.p3.y)));
     ImVec2 emax(std::max(std::max(e.p0.x, e.p1.x), std::max(e.p2.x, e.p3.x)),
@@ -261,6 +402,7 @@ void draw_graph_canvas(App& app) {
                            static_cast<int32_t>(e.to_display_id) == hover_box);
     ImU32 ec = touches_hover ? col_edge_hi : col_edge;
     float th = touches_hover ? edge_thick + 1.0f : edge_thick;
+    if (edge_dim && !touches_hover) ec = with_alpha_mul(ec, kDimAlpha);
     dl->AddBezierCubic(p0, p1, p2, p3, ec, th);
 
     // Edge shape label (highest LOD only) placed near the curve midpoint.
@@ -274,6 +416,7 @@ void draw_graph_canvas(App& app) {
   if (zoom < kZoomFlat) {
     // Lowest LOD: one blob per collapse group / node, tinted by category.
     for (const NodeBox& b : layout->boxes) {
+      if (box_culled(b.display_id)) continue;
       ImVec2 bmin(b.pos.x, b.pos.y);
       ImVec2 bmax(b.pos.x + b.size.x, b.pos.y + b.size.y);
       if (!aabb_overlap(bmin, bmax, vw_min, vw_max)) continue;
@@ -282,10 +425,16 @@ void draw_graph_canvas(App& app) {
           cam, origin,
           ImVec2((bmin.x + bmax.x) * 0.5f, (bmin.y + bmax.y) * 0.5f));
       float r = std::max(2.0f, 0.25f * b.size.x * zoom);
-      dl->AddCircleFilled(c, r, App::category_color(lab.cat, dark), 8);
+      // Diff overlay overrides the category color at the low-LOD blob site.
+      ImU32 blob = App::category_color(lab.cat, dark);
+      DiffTint tint = diff_tint_for_display(app, static_cast<int32_t>(b.display_id));
+      if (tint.active) blob = tint.color;
+      if (nav_dim(b.display_id)) blob = with_alpha_mul(blob, kDimAlpha);
+      dl->AddCircleFilled(c, r, blob, 8);
     }
   } else {
     for (const NodeBox& b : layout->boxes) {
+      if (box_culled(b.display_id)) continue;
       ImVec2 bmin(b.pos.x, b.pos.y);
       ImVec2 bmax(b.pos.x + b.size.x, b.pos.y + b.size.y);
       if (!aabb_overlap(bmin, bmax, vw_min, vw_max)) continue;
@@ -295,12 +444,18 @@ void draw_graph_canvas(App& app) {
       const bool selected =
           vs.selected_display == static_cast<int32_t>(b.display_id);
       const bool hovered = hover_box == static_cast<int32_t>(b.display_id);
+      const bool dimmed = nav_dim(b.display_id);
       NodeLabel lab = label_for(app, b.display_id);
       ImU32 header = App::category_color(lab.cat, dark);
+      // Diff overlay overrides the header color when a diff is active.
+      DiffTint tint = diff_tint_for_display(app, static_cast<int32_t>(b.display_id));
+      if (tint.active) header = tint.color;
+      if (dimmed) header = with_alpha_mul(header, kDimAlpha);
 
       ImU32 body = dark ? IM_COL32(34, 38, 44, 255) : IM_COL32(244, 246, 249, 255);
       if (hovered)
         body = dark ? IM_COL32(48, 54, 62, 255) : IM_COL32(232, 238, 246, 255);
+      if (dimmed) body = with_alpha_mul(body, kDimAlpha);
 
       if (zoom < kZoomMid) {
         // Flat rect, no text.
@@ -348,6 +503,25 @@ void draw_graph_canvas(App& app) {
       if (selected) {
         dl->AddRect(ImVec2(smin.x - 2, smin.y - 2), ImVec2(smax.x + 2, smax.y + 2),
                     col_accent, 6.0f, 0, 2.5f);
+      }
+
+      // Feature 2: "+N" badge counting this consumer's hidden constant/
+      // initializer inputs (only when the hide-const toggle is on and we're at a
+      // legible LOD).
+      if (hide_const && zoom >= kZoomFlat &&
+          b.display_id < rc.const_badge.size() &&
+          rc.const_badge.size() == disp_count && rc.const_badge[b.display_id] > 0 &&
+          fonts.small != nullptr) {
+        char badge[16];
+        std::snprintf(badge, sizeof(badge), "+%u",
+                      static_cast<unsigned>(rc.const_badge[b.display_id]));
+        float bs = text_px_for_badge(zoom);
+        ImVec2 ts = fonts.small->CalcTextSizeA(bs, FLT_MAX, 0.0f, badge);
+        ImVec2 bp(smin.x - ts.x - 4.0f, smin.y);
+        dl->AddRectFilled(ImVec2(bp.x - 2, bp.y - 1),
+                          ImVec2(bp.x + ts.x + 2, bp.y + ts.y + 1),
+                          IM_COL32(60, 66, 78, 230), 3.0f);
+        dl->AddText(fonts.small, bs, bp, col_text_muted, badge);
       }
     }
 

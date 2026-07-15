@@ -403,6 +403,9 @@ class FlatBufferBuilder:
     def prepend_bool(self, x):
         self.prep(1, 0); self._place(1 if x else 0, "<B")
 
+    def prepend_u8(self, x):
+        self.prep(1, 0); self._place(x, "<B")
+
     def prepend_uoffset(self, off):
         self.prep(4, 0)
         assert off <= self.offset()
@@ -462,6 +465,10 @@ class FlatBufferBuilder:
     def add_u32(self, o, x, default):
         if x != default:
             self.prepend_u32(x); self.slot(o)
+
+    def add_u8(self, o, x, default):
+        if x != default:
+            self.prepend_u8(x); self.slot(o)
 
     def add_bool(self, o, x, default):
         if x != default:
@@ -577,6 +584,89 @@ def build_tflite():
     return b.finish(model, b"TFL3")
 
 
+# TFLite with control flow: main subgraph holds one IF operator whose
+# builtin_options (union tag 92 = IfOptions in the canonical schema.fbs
+# BuiltinOptions enum) references then_subgraph_index=1. Exercises the
+# f_operator field-3/4 fix + subgraph linking (spec §7.x).
+def build_tflite_ctrlflow():
+    b = FlatBufferBuilder(size=8192)
+
+    # --- buffers: single empty buffer -----------------------------------
+    b.start_object(1)
+    buffer0 = b.end_object()
+    buffers = b.create_offset_vector([buffer0])
+
+    # ================= then-branch subgraph (index 1) ===================
+    # One tensor, no operators; just needs to be a valid subgraph.
+    t1_name = b.create_string("then_out")
+    t1_shape = b.create_int_vector([1])
+    b.start_object(8)
+    b.add_offset(0, t1_shape, 0)
+    b.add_offset(3, t1_name, 0)
+    then_tensor = b.end_object()
+    then_tensors = b.create_offset_vector([then_tensor])
+    then_name = b.create_string("then_branch")
+    b.start_object(5)
+    b.add_offset(0, then_tensors, 0)
+    b.add_offset(4, then_name, 0)
+    then_subgraph = b.end_object()
+
+    # ================= main subgraph (index 0) ==========================
+    mt_name = b.create_string("cond")
+    mt_shape = b.create_int_vector([1])
+    b.start_object(8)
+    b.add_offset(0, mt_shape, 0)
+    b.add_offset(3, mt_name, 0)
+    main_tensor = b.end_object()
+    main_tensors = b.create_offset_vector([main_tensor])
+
+    # IfOptions table: then_subgraph_index=1 (field 0), else=0 (field 1 default).
+    b.start_object(2)
+    b.add_i32(0, 1, 0x7FFFFFFF)   # then_subgraph_index = 1 (force present)
+    if_options = b.end_object()
+
+    op_inputs = b.create_int_vector([0])
+    op_outputs = b.create_int_vector([0])
+    b.start_object(6)
+    b.add_u32(0, 0, 0xFFFFFFFF)   # opcode_index 0 (force present)
+    b.add_offset(1, op_inputs, 0)
+    b.add_offset(2, op_outputs, 0)
+    b.add_u8(3, 92, 0)            # builtin_options_type = IfOptions (schema ord 92)
+    b.add_offset(4, if_options, 0)
+    operator = b.end_object()
+    operators = b.create_offset_vector([operator])
+
+    main_name = b.create_string("main")
+    main_inputs = b.create_int_vector([0])
+    main_outputs = b.create_int_vector([0])
+    b.start_object(5)
+    b.add_offset(0, main_tensors, 0)
+    b.add_offset(1, main_inputs, 0)
+    b.add_offset(2, main_outputs, 0)
+    b.add_offset(3, operators, 0)
+    b.add_offset(4, main_name, 0)
+    main_subgraph = b.end_object()
+
+    subgraphs = b.create_offset_vector([main_subgraph, then_subgraph])
+
+    # --- operator_codes: IF builtin_code == 118 -------------------------
+    b.start_object(4)
+    b.add_i32(3, 118, 0)          # builtin_code = IF
+    opcode0 = b.end_object()
+    operator_codes = b.create_offset_vector([opcode0])
+
+    description = b.create_string("netvis-ctrlflow")
+    b.start_object(7)
+    b.add_u32(0, 3, 0)
+    b.add_offset(1, operator_codes, 0)
+    b.add_offset(2, subgraphs, 0)
+    b.add_offset(3, description, 0)
+    b.add_offset(4, buffers, 0)
+    model = b.end_object()
+
+    return b.finish(model, b"TFL3")
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -602,6 +692,12 @@ def main():
     root = struct.unpack_from("<I", tfl, 0)[0]
     assert 0 < root < len(tfl), "TFLite root offset out of range"
     write("model.tflite", tfl)
+
+    tfl_cf = build_tflite_ctrlflow()
+    assert tfl_cf[4:8] == b"TFL3", "TFLite ctrlflow identifier misplaced"
+    root_cf = struct.unpack_from("<I", tfl_cf, 0)[0]
+    assert 0 < root_cf < len(tfl_cf), "TFLite ctrlflow root offset out of range"
+    write("model_ctrlflow.tflite", tfl_cf)
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):

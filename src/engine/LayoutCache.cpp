@@ -25,8 +25,11 @@ namespace {
 // the new algorithm never runs (a changed layout would appear "identical").
 //   v1: initial layered layout.
 //   v2: constants/initializers pulled down next to their consumers.
+//   v3: multi-consumer source duplication (per-consumer clones) + Sugiyama
+//       dummy-node long-edge routing. boxes may exceed display_nodes().size()
+//       and multiple boxes may share a display_id (consumers key off display_id).
 constexpr uint32_t kMagic = 0x4C56454Eu;  // "NEVL" little-endian
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 
 // On-disk header. POD, written/read verbatim. All fields little-endian on the
 // platforms we target (x86-64 / arm64); the cache is machine-local so we do not

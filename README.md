@@ -34,12 +34,24 @@ sortable table with a module hierarchy tree.*
   milliseconds. Double-click to expand.
 - **Deterministic layered layout:** from-scratch Sugiyama-style layout (longest-path
   layering, barycenter crossing reduction, bezier edges). Same file → same layout,
-  cached to disk keyed by structure hash.
+  cached to disk keyed by structure hash. Shared constants/weights are **duplicated
+  next to each consumer** and long edges are routed through dummy nodes, so a big
+  graph reads as a clean flow instead of a top-row hairball. A one-key toggle hides
+  constant/weight edges entirely and badges each consumer with a `+N` count.
+- **Graph navigation:** click a node to highlight its fan-in/fan-out (dimming the
+  rest), focus/isolate an N-hop neighborhood, filter by op category, and jump the
+  camera to a value's producer or consumers.
+- **Model diff:** open a second model as a comparison and the graph tints nodes
+  **added / removed / changed** — before/after quantization or fine-tuning at a
+  glance. The comparison loads on its own background pipeline; the main thread
+  never stalls.
 - **Weight inspector:** lazily decodes a tensor to streaming stats (min/max/mean/std,
   zero & NaN/Inf counts, 64-bucket histogram) without materializing a converted
   copy. Export to `.npy` or raw `.bin`.
-- **Shape inference (ONNX):** best-effort propagation over the common ops fills in
-  edge shape labels in the background.
+- **Shape inference (ONNX):** best-effort propagation over the common ops (incl.
+  constant-driven Reshape/Slice/Gather/Concat/Transpose/Split and dtype
+  propagation) fills in edge shape labels in the background. TFLite `If`/`While`/
+  `CallOnce` subgraphs are linked and divable.
 - **Search:** fuzzy, case-insensitive substring/subsequence search over all names;
   Enter flies the camera to the hit.
 - **Tensor-table mode:** graph-less formats (GGUF/SafeTensors/PyTorch) show a
