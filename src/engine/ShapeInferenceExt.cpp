@@ -628,10 +628,10 @@ uint32_t infer_shapes_ext(Model& model, uint32_t graph_index,
         int64_t axis = attr_int(model, g, n, "axis", 0);
         if (axis < 0) axis += rank;
         if (axis >= 0 && axis < rank) {
-          const Shape& idx = s1;  // indices shape (empty => scalar => rank-0)
+          const Shape& idx_shape = s1;  // indices shape (empty => scalar => rank-0)
           Shape out;
           for (int64_t i = 0; i < axis; ++i) out.push_back(s0[static_cast<size_t>(i)]);
-          for (int64_t d : idx) out.push_back(d);
+          for (int64_t d : idx_shape) out.push_back(d);
           for (int64_t i = axis + 1; i < rank; ++i)
             out.push_back(s0[static_cast<size_t>(i)]);
           if (set_shape(outv, out, dt0)) ++resolved;
