@@ -28,8 +28,10 @@ namespace {
 //   v3: multi-consumer source duplication (per-consumer clones) + Sugiyama
 //       dummy-node long-edge routing. boxes may exceed display_nodes().size()
 //       and multiple boxes may share a display_id (consumers key off display_id).
+//   v4: symmetric x-alignment (true median + centered overlap resolution) and a
+//       de-shear pass that removes the systematic rightward drift.
 constexpr uint32_t kMagic = 0x4C56454Eu;  // "NEVL" little-endian
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 
 // On-disk header. POD, written/read verbatim. All fields little-endian on the
 // platforms we target (x86-64 / arm64); the cache is machine-local so we do not

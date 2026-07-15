@@ -139,3 +139,26 @@ by `tests/test_hardening.cpp` and an ASan/UBSan truncation fuzz):
   bounds-checked against `base+size`). Shapes packed into `int64_data`/`int32_data`
   protobuf fields have no recorded offset (`file_offset == UINT64_MAX`) and stay
   `Unknown` — best-effort, never a crash.
+
+## v0.2.1 — layout drift fix (LayoutCache kVersion 4)
+
+The v0.2.0 x-coordinate assignment made graphs march consistently *down and to
+the right*, so the minimap collapsed to a diagonal line. Three compounding
+rightward biases, all fixed in `LayoutEngine.cpp`:
+
+- **Even-count median took the upper (right) neighbor.** A 2-input node aligned
+  to `cs[k/2]` — the *right* of its two inputs. Now uses the true median (mean of
+  the two middle centers for even counts), so a node sits between its inputs.
+- **Overlap resolution only pushed right.** A single left-to-right sweep
+  (`if (x < min_x) x = min_x`) is a ratchet that never moves a node left. Now
+  resolves symmetrically: average a left-packed solution (biases right) with a
+  right-packed one (biases left). Averaging two gap-feasible monotone solutions
+  is itself gap-feasible and centered — no net directional push.
+- **Dummy lanes shear the flow.** Skip/residual edges insert dummy nodes on the
+  layers they cross; a real chain node aligning against a consistently-offset
+  dummy accumulates a small per-layer shift, i.e. a linear *shear*. A final
+  least-squares **de-shear** fits the per-layer centroid trend (`centroid ≈
+  a + b·layer`) and subtracts `b·layer` from every node. This removes only the
+  global drift: a straight chain has slope 0 (untouched), and all within-layer
+  order + relative offsets are preserved. O(V+L), deterministic. Result: a deep
+  skip-chain that spanned ~29 node-widths of horizontal drift now stays under 1.

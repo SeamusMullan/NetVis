@@ -475,32 +475,99 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   };
   pack_x();
   // Median alignment pass: shift each node toward the median x-center of its
-  // neighbors (both layers), then re-resolve overlaps left-to-right. One down +
-  // one up pass keeps chains vertically aligned without expensive optimization.
+  // neighbors (both layers), then re-resolve overlaps. One down + one up pass
+  // keeps chains vertically aligned without expensive optimization.
+  //
+  // SYMMETRY (v0.2.1 drift fix): both the median pick and the overlap resolution
+  // must be left/right symmetric, or the layout drifts consistently rightward
+  // with depth (minimap collapses to a diagonal line). The two bugs were:
+  //   (1) an EVEN neighbor count took the upper median cs[k/2] — the RIGHT
+  //       neighbor — so every 2-input node chased its right input. Use the true
+  //       median (mean of the two middle values) for even counts.
+  //   (2) overlap resolution ran a single left-to-right pass that only ever
+  //       PUSHED RIGHT, a ratchet that accumulated layer over layer. Instead
+  //       resolve symmetrically: average a left-packed solution (biases right)
+  //       with a right-packed one (biases left). Averaging two gap-feasible
+  //       monotone solutions is itself gap-feasible and is centered, so there is
+  //       no net directional push.
   auto center_of = [&](uint32_t v) { return npos[v].x + nsize[v].x * 0.5f; };
   auto align_pass = [&](bool use_preds) {
     const auto& nbr = use_preds ? preds : succs;
+    std::vector<float> want, lo, hi;
     for (size_t li = 0; li < L; ++li) {
       auto& lv = layers[li];
-      // Desired center per node from neighbor median.
-      for (uint32_t v : lv) {
-        if (nbr[v].empty()) continue;
-        std::vector<float> cs;
+      const size_t k = lv.size();
+      if (k == 0) continue;
+      // Desired center per node = TRUE median of neighbor centers; a node with
+      // no neighbor keeps its current center.
+      want.assign(k, 0.0f);
+      std::vector<float> cs;
+      for (size_t p = 0; p < k; ++p) {
+        uint32_t v = lv[p];
+        if (nbr[v].empty()) { want[p] = center_of(v); continue; }
+        cs.clear();
         cs.reserve(nbr[v].size());
         for (uint32_t nb : nbr[v]) cs.push_back(center_of(nb));
         std::sort(cs.begin(), cs.end());
-        float med = cs[cs.size() / 2];
-        npos[v].x = med - nsize[v].x * 0.5f;
+        const size_t c = cs.size();
+        want[p] = (c & 1u) ? cs[c / 2] : (cs[c / 2 - 1] + cs[c / 2]) * 0.5f;
       }
-      // Resolve overlaps left-to-right preserving order.
-      for (size_t p = 1; p < lv.size(); ++p) {
-        float min_x = npos[lv[p - 1]].x + nsize[lv[p - 1]].x + params.node_sep;
-        if (npos[lv[p]].x < min_x) npos[lv[p]].x = min_x;
+      // Minimum center-to-center gap between ordered neighbors p-1,p.
+      auto gap = [&](size_t p) {
+        return (nsize[lv[p - 1]].x + nsize[lv[p]].x) * 0.5f + params.node_sep;
+      };
+      // Left-packed (only pushes right).
+      lo.assign(k, 0.0f);
+      lo[0] = want[0];
+      for (size_t p = 1; p < k; ++p)
+        lo[p] = std::max(want[p], lo[p - 1] + gap(p));
+      // Right-packed (only pushes left).
+      hi.assign(k, 0.0f);
+      hi[k - 1] = want[k - 1];
+      for (size_t p = k - 1; p-- > 0;)
+        hi[p] = std::min(want[p], hi[p + 1] - gap(p + 1));
+      // Centered average of the two feasible solutions.
+      for (size_t p = 0; p < k; ++p) {
+        float center = (lo[p] + hi[p]) * 0.5f;
+        npos[lv[p]].x = center - nsize[lv[p]].x * 0.5f;
       }
     }
   };
   align_pass(/*use_preds=*/true);
   align_pass(/*use_preds=*/false);
+
+  // -- De-shear (v0.2.1). Median alignment against dummy "lanes" from skip/
+  // residual edges leaves a systematic horizontal SHEAR: layer centroids grow
+  // roughly linearly with layer index, so the whole graph marches down-and-to-
+  // the-right and the minimap collapses to a diagonal line. The shear is a
+  // linear trend in the per-layer centroid; fit it by least squares over the
+  // occupied layers and subtract b*layer from every node. This removes only the
+  // global drift — all within-layer order and relative offsets (and thus a
+  // straight chain, whose slope contribution is 0) are preserved. O(V+L).
+  {
+    // Per-layer centroid over ALL layout nodes (dummies included: they are part
+    // of the visual flow and drive the shear).
+    std::vector<double> csum(L, 0.0);
+    std::vector<uint32_t> ccnt(L, 0);
+    for (uint32_t v = 0; v < M; ++v) {
+      csum[static_cast<size_t>(nlayer[v])] += center_of(v);
+      ++ccnt[static_cast<size_t>(nlayer[v])];
+    }
+    // Least-squares slope of centroid vs layer index over occupied layers.
+    double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (size_t li = 0; li < L; ++li) {
+      if (!ccnt[li]) continue;
+      double x = static_cast<double>(li);
+      double y = csum[li] / ccnt[li];
+      n += 1; sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    double denom = n * sxx - sx * sx;
+    if (n >= 2 && denom > 1e-6) {
+      double slope = (n * sxy - sx * sy) / denom;
+      for (uint32_t v = 0; v < M; ++v)
+        npos[v].x -= static_cast<float>(slope * nlayer[v]);
+    }
+  }
 
   // -- Emit boxes: ONLY real + clone layout nodes (dummies are waypoints). Each
   // box carries its OWNING display id; clones share their source's display id so
