@@ -18,6 +18,7 @@
 
 #include "core/JobSystem.h"
 #include "engine/DiffLoader.h"
+#include "engine/HeatmapGradient.h"
 #include "engine/ModelSession.h"
 #include "engine/OpCategory.h"
 #include "engine/TensorStats.h"
@@ -126,6 +127,21 @@ struct ViewState {
   // via cost_tint_for_display (mutually exclusive with diff tint at the call site
   // — diff wins if both active).
   bool cost_heatmap = false;
+
+  // --- v0.3.2 additions (append-only) ----------------------------------------
+  // Heatmap gradient (preset or custom stops + reverse) and scale. Persisted to
+  // view_prefs.json across sessions. Defaults to Viridis / log scale.
+  HeatmapGradient heatmap_gradient;
+  bool heatmap_log_scale = true;  // false => linear FLOPs normalization
+
+  // Cached heatmap FLOPs range, recomputed once per frame in ensure_cost() (not
+  // per visible node — cost_tint_for_display and the legend both read this). The
+  // valid flag is cleared when there is no cost report or no known FLOPs.
+  // Type is engine/CostPanel's HeatmapRange; forward use only via the fields below
+  // to keep App.h free of that include — stored as plain scalars.
+  bool heatmap_range_valid = false;
+  uint64_t heatmap_range_min = 0;
+  uint64_t heatmap_range_max = 0;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather
@@ -181,6 +197,11 @@ class App {
   // Recent files (persisted next to layout cache, spec §8.7).
   const std::vector<std::string>& recent_files() const { return recent_; }
 
+  // Persist view preferences (heatmap gradient/scale, theme, toggles) to
+  // view_prefs.json in the cache dir. Called by panels when a pref changes.
+  // Best-effort; failure is silent (a missing prefs file just uses defaults).
+  void save_prefs();
+
  private:
   GLFWwindow* window_ = nullptr;
   std::unique_ptr<JobSystem> jobs_;
@@ -200,6 +221,7 @@ class App {
   void handle_shortcuts();
   void load_recent();
   void save_recent();
+  void load_prefs();  // read view_prefs.json into view_ (best-effort)
   void add_recent(const std::string& path);
 };
 

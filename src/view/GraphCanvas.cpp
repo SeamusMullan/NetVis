@@ -611,6 +611,9 @@ void draw_graph_canvas(App& app) {
   // Minimap is drawn inside the same child region, inset bottom-right.
   draw_minimap(app);
 
+  // Heatmap legend, inset top-left (only when the cost heatmap is active).
+  draw_heatmap_legend(app);
+
   ImGui::EndChild();
   ImGui::End();
 }

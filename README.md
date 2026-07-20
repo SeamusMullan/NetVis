@@ -50,7 +50,11 @@ sortable table with a module hierarchy tree.*
   from shapes alone (no weights read), plus a **quant-coverage** table (per-dtype
   params/bytes, effective bits/param, size-vs-fp32). Estimates are honest:
   unsupported ops / unresolved shapes are reported as unknown, never faked. A
-  one-key **cost heatmap** tints the graph by `log(FLOPs)` to spot the hot nodes.
+  one-key **cost heatmap** tints the graph by FLOPs with a **customizable
+  gradient** (colorblind-safe Viridis / Magma / Cool→Hot / Grayscale presets or
+  your own low/mid/high stops, log or linear scale, on-canvas legend), and the
+  cost summary copies to the clipboard as TSV. View preferences persist across
+  sessions.
 - **Weight inspector:** lazily decodes a tensor to streaming stats (min/max/mean/std,
   zero & NaN/Inf counts, 64-bucket histogram) without materializing a converted
   copy. Export to `.npy` or raw `.bin`.

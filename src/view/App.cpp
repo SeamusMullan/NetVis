@@ -196,6 +196,10 @@ bool App::init(const std::string& initial_path) {
   if (fonts_.small == nullptr) fonts_.small = fonts_.body;
   if (fonts_.bold == nullptr) fonts_.bold = fonts_.body;
 
+  // Load persisted view prefs BEFORE applying the theme so a saved theme choice
+  // and the heatmap gradient take effect on startup.
+  load_prefs();
+
   apply_theme(view_.dark_theme);
 
   // Route OS file drops to open_file() via the window user pointer.
@@ -365,13 +369,15 @@ void App::frame() {
       if (ImGui::MenuItem("Dark theme", nullptr, view_.dark_theme)) {
         view_.dark_theme = !view_.dark_theme;
         apply_theme(view_.dark_theme);
+        save_prefs();
       }
       if (ImGui::MenuItem("Light theme", nullptr, !view_.dark_theme)) {
         view_.dark_theme = false;
         apply_theme(false);
+        save_prefs();
       }
       ImGui::Separator();
-      ImGui::MenuItem("Minimap", nullptr, &view_.show_minimap);
+      if (ImGui::MenuItem("Minimap", nullptr, &view_.show_minimap)) save_prefs();
       // Layout-readability toggle (v0.2.0 Feature 2): hide constant/initializer
       // input edges + source boxes; consumers get a "+N" badge instead.
       ImGui::MenuItem("Hide constant edges", nullptr, &view_.hide_const_edges);
@@ -604,6 +610,94 @@ void App::add_recent(const std::string& path) {
   const size_t kMaxRecent = 10;
   if (recent_.size() > kMaxRecent) recent_.resize(kMaxRecent);
   save_recent();
+}
+
+// ---------------------------------------------------------------------------
+// View preferences (view_prefs.json next to the layout cache) — v0.3.2 QoL.
+// Persists the heatmap gradient/scale, theme, and a couple of toggles so they
+// survive across sessions. Best-effort: a missing/corrupt file just keeps the
+// in-memory defaults, exactly like recent.json.
+// ---------------------------------------------------------------------------
+namespace {
+nlohmann::json rgba_to_json(const Rgba8& c) {
+  return nlohmann::json::array({c.r, c.g, c.b});
+}
+Rgba8 rgba_from_json(const nlohmann::json& j, Rgba8 fallback) {
+  if (!j.is_array() || j.size() < 3) return fallback;
+  auto byte = [](const nlohmann::json& e, uint8_t f) -> uint8_t {
+    if (!e.is_number_integer() && !e.is_number_unsigned()) return f;
+    int64_t v = e.get<int64_t>();
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    return static_cast<uint8_t>(v);
+  };
+  return Rgba8{byte(j[0], fallback.r), byte(j[1], fallback.g),
+               byte(j[2], fallback.b), 255};
+}
+GradientPreset preset_from_name(const std::string& s) {
+  for (int i = 0; i < kGradientPresetCount; ++i) {
+    auto p = static_cast<GradientPreset>(i);
+    if (s == gradient_preset_name(p)) return p;
+  }
+  return GradientPreset::Viridis;
+}
+}  // namespace
+
+void App::save_prefs() {
+  const HeatmapGradient& g = view_.heatmap_gradient;
+  nlohmann::json j;
+  j["dark_theme"] = view_.dark_theme;
+  j["show_minimap"] = view_.show_minimap;
+  j["cost_heatmap"] = view_.cost_heatmap;
+  j["heatmap_log_scale"] = view_.heatmap_log_scale;
+  j["gradient_preset"] = gradient_preset_name(g.preset);
+  j["gradient_reverse"] = g.reverse;
+  j["gradient_low"] = rgba_to_json(g.low);
+  j["gradient_mid"] = rgba_to_json(g.mid);
+  j["gradient_high"] = rgba_to_json(g.high);
+  std::ofstream f(layout_cache_dir() + "/view_prefs.json");
+  if (f) f << j.dump(2);
+}
+
+void App::load_prefs() {
+  const std::string p = layout_cache_dir() + "/view_prefs.json";
+  std::ifstream f(p);
+  if (!f) return;
+  try {
+    nlohmann::json j;
+    f >> j;
+    if (!j.is_object()) return;
+    if (j.contains("dark_theme") && j["dark_theme"].is_boolean())
+      view_.dark_theme = j["dark_theme"].get<bool>();
+    if (j.contains("show_minimap") && j["show_minimap"].is_boolean())
+      view_.show_minimap = j["show_minimap"].get<bool>();
+    if (j.contains("cost_heatmap") && j["cost_heatmap"].is_boolean())
+      view_.cost_heatmap = j["cost_heatmap"].get<bool>();
+    if (j.contains("heatmap_log_scale") && j["heatmap_log_scale"].is_boolean())
+      view_.heatmap_log_scale = j["heatmap_log_scale"].get<bool>();
+
+    HeatmapGradient& g = view_.heatmap_gradient;
+    if (j.contains("gradient_preset") && j["gradient_preset"].is_string()) {
+      GradientPreset preset = preset_from_name(j["gradient_preset"].get<std::string>());
+      gradient_set_preset(g, preset);  // fills stops for a built-in preset
+    }
+    if (j.contains("gradient_reverse") && j["gradient_reverse"].is_boolean())
+      g.reverse = j["gradient_reverse"].get<bool>();
+    // Only a Custom gradient carries its own stops; for a built-in preset the
+    // preset's stops (just filled by gradient_set_preset) are authoritative, so a
+    // "Viridis" tag always shows Viridis colors and a future change to the preset
+    // constants isn't pinned to a stale persisted copy.
+    if (g.preset == GradientPreset::Custom) {
+      if (j.contains("gradient_low"))
+        g.low = rgba_from_json(j["gradient_low"], g.low);
+      if (j.contains("gradient_mid"))
+        g.mid = rgba_from_json(j["gradient_mid"], g.mid);
+      if (j.contains("gradient_high"))
+        g.high = rgba_from_json(j["gradient_high"], g.high);
+    }
+  } catch (...) {
+    // Corrupt prefs -> keep defaults.
+  }
 }
 
 // ---------------------------------------------------------------------------

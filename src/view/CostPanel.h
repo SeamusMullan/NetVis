@@ -13,9 +13,40 @@
 
 #include "imgui.h"
 
+#include "engine/HeatmapGradient.h"
+
 namespace netvis {
 
 class App;  // forward; defined in view/App.h
+
+// Convert an engine-side Rgba8 to an ImGui packed color.
+inline ImU32 rgba8_to_imu32(const Rgba8& c) {
+  return IM_COL32(c.r, c.g, c.b, c.a);
+}
+inline Rgba8 imu32_to_rgba8(ImU32 c) {
+  return Rgba8{static_cast<uint8_t>((c >> IM_COL32_R_SHIFT) & 0xFF),
+               static_cast<uint8_t>((c >> IM_COL32_G_SHIFT) & 0xFF),
+               static_cast<uint8_t>((c >> IM_COL32_B_SHIFT) & 0xFF),
+               static_cast<uint8_t>((c >> IM_COL32_A_SHIFT) & 0xFF)};
+}
+
+// Normalized [min,max] FLOPs the heatmap maps its gradient across, computed over
+// the SAME aggregation unit the tint uses (per display node), so a collapsed group
+// and a leaf share one scale. valid==false when no display node has known FLOPs.
+struct HeatmapRange {
+  bool valid = false;
+  uint64_t min_flops = 0;
+  uint64_t max_flops = 0;
+};
+// Compute the heatmap range for the current model/report/collapse state. Cheap
+// (O(display nodes)); used by both cost_tint_for_display and the legend so they
+// never diverge (the v0.3.1 group-scale bug was exactly such a divergence).
+HeatmapRange heatmap_range(App& app);
+
+// Draw the heatmap legend (gradient bar + min/max FLOP labels) as a canvas overlay
+// — call from draw_graph_canvas while its draw list is active, AFTER the nodes.
+// No-op when the heatmap toggle is off or the range is invalid.
+void draw_heatmap_legend(App& app);
 
 // Rebuild App.view().cost (a CostReport) if stale. Keyed on the primary session's
 // generation() + current_graph() + collapse().collapse_hash() so it recomputes on

@@ -273,3 +273,36 @@ A follow-up scan of the cost surface found two defects the v0.3.0 sweep missed:
   twice, freed once. Fix: the `produced` guard now covers the seed loop too
   (hoisted above it). Both covered by new `test_cost.cpp` regressions (suite: 85
   cases / 592 assertions, ASan+UBSan clean).
+
+## v0.3.2 — QoL: customizable heatmap gradient + prefs persistence
+
+Quality-of-life pass on the analyzer, headlined by a configurable cost heatmap.
+
+- **Gradient math is a pure engine module.** `engine/HeatmapGradient` (a 3-stop
+  low/mid/high ramp + reverse + preset tag) is ImGui-free, so `gradient_sample`
+  and the presets are unit-tested headless (`test_gradient.cpp`) exactly like
+  OpCategory/CostModel. The view converts `Rgba8 -> ImU32` and owns the picker UI.
+  A heatmap is a SEQUENTIAL encoding (one increasing magnitude), so the built-in
+  presets — Viridis, Magma, Grayscale — are monotonic in lightness (asserted in a
+  test); Cool→Hot is kept as the prior default. "Custom" keeps user-edited stops;
+  editing any stop in the UI switches the preset tag to Custom.
+- **One scale, shared by tint and legend.** The heatmap min/max FLOPs range is a
+  single helper, `heatmap_range`, consumed by both `cost_tint_for_display` and the
+  on-canvas legend, so they can never diverge (the v0.3.1 group-scale bug was
+  exactly such a divergence). The range is computed over the same aggregation unit
+  the tint uses — per display node. `normalize_flops` guards the log domain
+  (clamp ≥1) and the degenerate min==max case for both log and linear scales.
+- **Legend mirrors the minimap.** Drawn with the canvas's own `ImDrawList`, inset
+  top-left (minimap owns bottom-right), only when the heatmap is on and the range
+  is valid.
+- **View prefs persist in `view_prefs.json`.** Written next to the layout cache /
+  recent-files list (`layout_cache_dir()`), holding the gradient (preset + stops +
+  reverse), scale, theme, and toggles. Load is best-effort with per-key type
+  guards and a try/catch — a missing/corrupt/hostile file falls back to defaults,
+  exactly like `recent.json`. Custom stops are applied AFTER `gradient_set_preset`
+  in load so a persisted Custom gradient's stops win over the preset's.
+- **Copy cost to clipboard.** `cost_summary_text` builds a tab-separated block
+  (model totals + quant table) for `ImGui::SetClipboardText`. Reads only the
+  published report — still zero payload reads.
+
+Suite: 92 cases / 651 assertions, GUI + ASan/UBSan clean.

@@ -42,38 +42,13 @@ namespace {
 using panel_detail::grouped_count;
 using panel_detail::human_bytes;
 
-// Cost-heatmap overlay colors (cool -> neutral -> hot, log scale).
-// Chosen distinct from diff/category colors; neutral gray for flops_known==false.
-constexpr ImU32 kColCool = IM_COL32(100, 150, 240, 255);     // blue (cheap)
-constexpr ImU32 kColNeutral = IM_COL32(150, 150, 150, 255); // gray (unknown)
-constexpr ImU32 kColWarm = IM_COL32(240, 180, 60, 255);     // amber (mid)
-constexpr ImU32 kColHot = IM_COL32(240, 80, 80, 255);       // red (expensive)
+// Neutral gray for flops_known==false nodes (independent of the chosen gradient).
+constexpr ImU32 kColNeutral = IM_COL32(150, 150, 150, 255);
 
-// Interpolate between two colors (RGBA32).
-ImU32 lerp_color(ImU32 a, ImU32 b, float t) {
-  if (t <= 0.0f) return a;
-  if (t >= 1.0f) return b;
-  auto ar = static_cast<uint8_t>((a >> IM_COL32_R_SHIFT) & 0xFF);
-  auto ag = static_cast<uint8_t>((a >> IM_COL32_G_SHIFT) & 0xFF);
-  auto ab = static_cast<uint8_t>((a >> IM_COL32_B_SHIFT) & 0xFF);
-  auto aa = static_cast<uint8_t>((a >> IM_COL32_A_SHIFT) & 0xFF);
-  auto br = static_cast<uint8_t>((b >> IM_COL32_R_SHIFT) & 0xFF);
-  auto bg = static_cast<uint8_t>((b >> IM_COL32_G_SHIFT) & 0xFF);
-  auto bb = static_cast<uint8_t>((b >> IM_COL32_B_SHIFT) & 0xFF);
-  auto ba = static_cast<uint8_t>((b >> IM_COL32_A_SHIFT) & 0xFF);
-  auto r = static_cast<uint8_t>(ar + (br - ar) * t);
-  auto g = static_cast<uint8_t>(ag + (bg - ag) * t);
-  auto blu = static_cast<uint8_t>(ab + (bb - ab) * t);
-  auto alp = static_cast<uint8_t>(aa + (ba - aa) * t);
-  return IM_COL32(r, g, blu, alp);
-}
-
-// Ramp cool -> warm -> hot by normalized t in [0, 1].
-ImU32 cost_ramp(float t) {
-  if (t < 0.5f) {
-    return lerp_color(kColCool, kColWarm, t * 2.0f);
-  }
-  return lerp_color(kColWarm, kColHot, (t - 0.5f) * 2.0f);
+// Ramp by normalized t in [0,1] using the user's active gradient (engine-side
+// pure sampler; the view only maps the result to ImU32).
+ImU32 cost_ramp(const HeatmapGradient& gradient, float t) {
+  return rgba8_to_imu32(gradient_sample(gradient, t));
 }
 
 // Collect IR node indices a display node stands for (mirroring GraphNav pattern).
@@ -110,7 +85,27 @@ NodeCost sum_node_costs(const CostReport& report,
   return sum;
 }
 
+// Compact FLOPs label for the legend, e.g. "3.2 GF", "812 MF". Deterministic.
+std::string human_flops(uint64_t f) {
+  const char* unit = "F";
+  double v = static_cast<double>(f);
+  if (f >= 1000000000000ULL) { v = f / 1e12; unit = "TF"; }
+  else if (f >= 1000000000ULL) { v = f / 1e9; unit = "GF"; }
+  else if (f >= 1000000ULL) { v = f / 1e6; unit = "MF"; }
+  else if (f >= 1000ULL) { v = f / 1e3; unit = "KF"; }
+  char buf[48];
+  if (unit[0] == 'F')
+    std::snprintf(buf, sizeof(buf), "%llu F", static_cast<unsigned long long>(f));
+  else
+    std::snprintf(buf, sizeof(buf), "%.1f %s", v, unit);
+  return buf;
+}
+
 }  // namespace
+
+// Forward decls for helpers defined later in this TU.
+static std::string cost_summary_text(App& app, const CostReport& report);
+static void recompute_heatmap_range(App& app);
 
 void ensure_cost(App& app) {
   ViewState& vs = app.view();
@@ -133,17 +128,85 @@ void ensure_cost(App& app) {
       vs.cost && vs.cost_key_generation == generation &&
       vs.cost_key_graph == graph && vs.cost_key_collapse == collapse_hash &&
       vs.cost_key_enrich == enrich;
-  if (key_match) return;  // nothing changed — keep the cached report.
+  if (!key_match) {
+    // Record the key we are rebuilding for.
+    vs.cost_key_generation = generation;
+    vs.cost_key_graph = graph;
+    vs.cost_key_collapse = collapse_hash;
+    vs.cost_key_enrich = enrich;
 
-  // Record the key we are rebuilding for.
-  vs.cost_key_generation = generation;
-  vs.cost_key_graph = graph;
-  vs.cost_key_collapse = collapse_hash;
-  vs.cost_key_enrich = enrich;
+    // Compute the cost report (pure headless call, no payload reads).
+    CostReport report = compute_cost(*model, graph);
+    vs.cost = std::make_unique<CostReport>(std::move(report));
+  }
 
-  // Compute the cost report (pure headless call, no payload reads).
-  CostReport report = compute_cost(*model, graph);
-  vs.cost = std::make_unique<CostReport>(std::move(report));
+  // Refresh the cached heatmap range once per frame (cheap; O(display nodes)) so
+  // the per-node tint and the legend read a scalar cache instead of re-scanning.
+  recompute_heatmap_range(app);
+}
+
+// Normalize a FLOPs value into [0,1] across [min,max] using the chosen scale.
+// log_scale: interpolate in log10 space (clamped to >=1 to avoid log10(0)), the
+// default — model FLOPs span orders of magnitude. Otherwise linear. Both guard the
+// degenerate min==max case (single distinct value) to 0.
+float normalize_flops(uint64_t flops, uint64_t min_flops, uint64_t max_flops,
+                      bool log_scale) {
+  if (flops < min_flops) flops = min_flops;
+  if (flops > max_flops) flops = max_flops;
+  float t = 0.0f;
+  if (log_scale) {
+    double lmin = std::log10(static_cast<double>(min_flops < 1 ? 1 : min_flops));
+    double lmax = std::log10(static_cast<double>(max_flops < 1 ? 1 : max_flops));
+    double lf = std::log10(static_cast<double>(flops < 1 ? 1 : flops));
+    if (lmax > lmin) t = static_cast<float>((lf - lmin) / (lmax - lmin));
+  } else {
+    if (max_flops > min_flops) {
+      t = static_cast<float>(static_cast<double>(flops - min_flops) /
+                             static_cast<double>(max_flops - min_flops));
+    }
+  }
+  return std::clamp(t, 0.0f, 1.0f);
+}
+
+// Scan display nodes to (re)compute the heatmap FLOPs range, writing the cached
+// scalars on ViewState. Called once per frame from ensure_cost — NOT per node —
+// so cost_tint_for_display and the legend read the cache instead of each
+// re-scanning + heap-allocating. Scale is over the SAME aggregation unit the tint
+// uses: per DISPLAY node (a collapsed group's tint is the sum over its members, so
+// it must be scaled against other display nodes' sums — scaling a group sum
+// against individual per-node FLOPs saturated every group to max/hot, the v0.3.1
+// bug).
+static void recompute_heatmap_range(App& app) {
+  ViewState& vs = app.view();
+  vs.heatmap_range_valid = false;
+  vs.heatmap_range_min = 0;
+  vs.heatmap_range_max = 0;
+  if (!vs.cost) return;
+  ModelSession& s = app.session();
+  const auto& disp = s.collapse().display_nodes();
+  uint64_t min_flops = UINT64_MAX, max_flops = 0;
+  std::vector<uint32_t> scale_nodes;
+  for (int32_t d = 0; d < static_cast<int32_t>(disp.size()); ++d) {
+    ir_nodes_for_display(s, d, scale_nodes);
+    if (scale_nodes.empty()) continue;
+    NodeCost agg = sum_node_costs(*vs.cost, scale_nodes);
+    if (!agg.flops_known || agg.flops == 0) continue;
+    if (agg.flops < min_flops) min_flops = agg.flops;
+    if (agg.flops > max_flops) max_flops = agg.flops;
+  }
+  if (max_flops == 0 || min_flops == UINT64_MAX) return;  // no known FLOPs
+  vs.heatmap_range_valid = true;
+  vs.heatmap_range_min = min_flops;
+  vs.heatmap_range_max = max_flops;
+}
+
+HeatmapRange heatmap_range(App& app) {
+  ViewState& vs = app.view();
+  HeatmapRange r;
+  r.valid = vs.heatmap_range_valid;
+  r.min_flops = vs.heatmap_range_min;
+  r.max_flops = vs.heatmap_range_max;
+  return r;
 }
 
 CostTint cost_tint_for_display(App& app, int32_t display_id) {
@@ -171,44 +234,17 @@ CostTint cost_tint_for_display(App& app, int32_t display_id) {
     return out;
   }
 
-  // Find min/max known FLOPs for normalization over the SAME aggregation unit as
-  // the numerator: per DISPLAY node (a collapsed group's tint is the sum over its
-  // members, so it must be scaled against other display nodes' sums, not against
-  // individual per-node FLOPs — otherwise every multi-node group's sum exceeds the
-  // largest single node and saturates to max/hot, which is the default view).
-  uint64_t min_flops = UINT64_MAX, max_flops = 0;
-  std::vector<uint32_t> scale_nodes;
-  for (int32_t d = 0; d < static_cast<int32_t>(disp.size()); ++d) {
-    ir_nodes_for_display(s, d, scale_nodes);
-    if (scale_nodes.empty()) continue;
-    NodeCost agg = sum_node_costs(*vs.cost, scale_nodes);
-    if (!agg.flops_known || agg.flops == 0) continue;
-    if (agg.flops < min_flops) min_flops = agg.flops;
-    if (agg.flops > max_flops) max_flops = agg.flops;
-  }
-  // No known FLOPs in the whole report -> neutral.
-  if (max_flops == 0 || min_flops == UINT64_MAX) {
+  HeatmapRange range = heatmap_range(app);
+  if (!range.valid) {
     out.active = true;
     out.color = kColNeutral;
     return out;
   }
 
-  // Log-scale ramp: log10(flops) between log10(min_flops) and log10(max_flops).
-  // Clamp to [1, max_flops] to avoid log10(0).
-  uint64_t flops = nc.flops > 0 ? nc.flops : 1;
-  if (flops < min_flops) flops = min_flops;
-  if (flops > max_flops) flops = max_flops;
-  double log_min = std::log10(static_cast<double>(min_flops));
-  double log_max = std::log10(static_cast<double>(max_flops));
-  double log_flops = std::log10(static_cast<double>(flops));
-  float t = 0.0f;
-  if (log_max > log_min) {
-    t = static_cast<float>((log_flops - log_min) / (log_max - log_min));
-  }
-  t = std::clamp(t, 0.0f, 1.0f);
-
+  float t = normalize_flops(nc.flops, range.min_flops, range.max_flops,
+                            vs.heatmap_log_scale);
   out.active = true;
-  out.color = cost_ramp(t);
+  out.color = cost_ramp(vs.heatmap_gradient, t);
   return out;
 }
 
@@ -375,16 +411,206 @@ void draw_cost_section(App& app) {
     ImGui::Text("Size vs fp32: %.2f×", vs_fp32);
   }
 
-  // --- Heatmap toggle ---------------------------------------------------------
+  // --- Copy-to-clipboard ------------------------------------------------------
   ImGui::Separator();
+  if (ImGui::Button("Copy cost summary")) {
+    ImGui::SetClipboardText(cost_summary_text(app, *report).c_str());
+  }
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Copy model totals + quant table as tab-separated text.");
+
+  // --- Heatmap toggle + gradient controls -------------------------------------
+  ImGui::Separator();
+  bool dirty = false;  // any pref changed this frame -> persist
   bool heatmap = vs.cost_heatmap;
   if (ImGui::Checkbox("Cost heatmap overlay", &heatmap)) {
     vs.cost_heatmap = heatmap;
+    dirty = true;
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip(
-        "Color nodes by log(FLOPs): cool (cheap) -> warm -> hot (expensive).");
+        "Color nodes by FLOPs using the gradient below (cheap -> expensive).");
   }
+
+  if (vs.cost_heatmap) {
+    HeatmapGradient& grad = vs.heatmap_gradient;
+
+    // Preset dropdown.
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::BeginCombo("Gradient",
+                          gradient_preset_name(grad.preset))) {
+      for (int i = 0; i < kGradientPresetCount; ++i) {
+        auto p = static_cast<GradientPreset>(i);
+        bool is_sel = (grad.preset == p);
+        if (ImGui::Selectable(gradient_preset_name(p), is_sel)) {
+          gradient_set_preset(grad, p);
+          dirty = true;
+        }
+        if (is_sel) ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
+    }
+
+    // Live preview bar (samples the active gradient across its width).
+    {
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      ImVec2 p0 = ImGui::GetCursorScreenPos();
+      const float bar_w = 220.0f, bar_h = 14.0f;
+      const int segs = 48;
+      for (int i = 0; i < segs; ++i) {
+        float t0 = static_cast<float>(i) / segs;
+        float t1 = static_cast<float>(i + 1) / segs;
+        ImU32 c0 = rgba8_to_imu32(gradient_sample(grad, t0));
+        ImU32 c1 = rgba8_to_imu32(gradient_sample(grad, t1));
+        ImVec2 s0(p0.x + bar_w * t0, p0.y);
+        ImVec2 s1(p0.x + bar_w * t1, p0.y + bar_h);
+        dl->AddRectFilledMultiColor(s0, s1, c0, c1, c1, c0);
+      }
+      dl->AddRect(p0, ImVec2(p0.x + bar_w, p0.y + bar_h),
+                  IM_COL32(90, 90, 90, 255));
+      ImGui::Dummy(ImVec2(bar_w, bar_h));
+    }
+
+    // Editable stops. Applying the value live keeps the preview in sync every
+    // frame of a drag, but persistence is coalesced to IsItemDeactivatedAfterEdit
+    // so we don't rewrite view_prefs.json ~60x/sec while the user drags a swatch.
+    auto edit_stop = [&](const char* label, Rgba8& stop) {
+      float col[3] = {stop.r / 255.0f, stop.g / 255.0f, stop.b / 255.0f};
+      if (ImGui::ColorEdit3(label, col,
+                            ImGuiColorEditFlags_NoInputs |
+                                ImGuiColorEditFlags_NoLabel)) {
+        stop.r = static_cast<uint8_t>(std::clamp(col[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+        stop.g = static_cast<uint8_t>(std::clamp(col[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+        stop.b = static_cast<uint8_t>(std::clamp(col[2], 0.0f, 1.0f) * 255.0f + 0.5f);
+        stop.a = 255;
+        grad.preset = GradientPreset::Custom;  // live: switches tag immediately
+      }
+      if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;  // persist once
+      ImGui::SameLine();
+      ImGui::TextUnformatted(label);
+    };
+    edit_stop("low", grad.low);
+    edit_stop("mid", grad.mid);
+    edit_stop("high", grad.high);
+
+    if (ImGui::Checkbox("Reverse", &grad.reverse)) dirty = true;
+
+    // Scale: log vs linear.
+    ImGui::TextUnformatted("Scale:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("log", vs.heatmap_log_scale)) {
+      vs.heatmap_log_scale = true;
+      dirty = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("linear", !vs.heatmap_log_scale)) {
+      vs.heatmap_log_scale = false;
+      dirty = true;
+    }
+  }
+
+  if (dirty) app.save_prefs();
+}
+
+// Build the tab-separated "copy summary" text: model totals + quant table.
+static std::string cost_summary_text(App& app, const CostReport& report) {
+  ModelSession& s = app.session();
+  const ir::Model* model = s.model();
+  std::string out = "NetVis cost summary\n";
+  if (model) {
+    out += "model\t";
+    out += std::string(model->str(model->format_name));
+    out += "\n";
+  }
+  char line[128];
+  if (report.from_graph) {
+    if (report.nodes_flops_known > 0) {
+      std::snprintf(line, sizeof(line), "total FLOPs\t%llu\n",
+                    static_cast<unsigned long long>(report.total_flops));
+      out += line;
+    } else {
+      out += "total FLOPs\t(none known)\n";
+    }
+    std::snprintf(line, sizeof(line), "FLOPs known nodes\t%u / %u\n",
+                  report.nodes_flops_known, report.nodes_total);
+    out += line;
+  }
+  std::snprintf(line, sizeof(line), "total params\t%llu\n",
+                static_cast<unsigned long long>(report.total_params));
+  out += line;
+  std::snprintf(line, sizeof(line), "total weight bytes\t%llu\n",
+                static_cast<unsigned long long>(report.total_weight_bytes));
+  out += line;
+  std::snprintf(line, sizeof(line), "peak activation bytes\t%llu\n",
+                static_cast<unsigned long long>(report.peak_activation_bytes));
+  out += line;
+  std::snprintf(line, sizeof(line), "effective bits/param\t%.3f\n",
+                report.effective_bits_per_param());
+  out += line;
+  std::snprintf(line, sizeof(line), "size vs fp32\t%.4f\n",
+                report.size_vs_fp32());
+  out += line;
+  if (!report.dtype_usage.empty()) {
+    out += "\ndtype\tparams\tbytes\n";
+    for (const DTypeUsage& d : report.dtype_usage) {
+      std::snprintf(line, sizeof(line), "%s\t%llu\t%llu\n",
+                    ir::dtype_name(d.dtype),
+                    static_cast<unsigned long long>(d.params),
+                    static_cast<unsigned long long>(d.bytes));
+      out += line;
+    }
+  }
+  return out;
+}
+
+void draw_heatmap_legend(App& app) {
+  ViewState& vs = app.view();
+  if (!vs.cost_heatmap || !vs.cost) return;
+  HeatmapRange range = heatmap_range(app);
+  if (!range.valid) return;
+
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 win_min = ImGui::GetWindowPos();
+  const ImVec2 win_sz = ImGui::GetWindowSize();
+
+  // Inset the legend in the TOP-LEFT of the canvas (the minimap owns bottom-right).
+  const float kPad = 12.0f;
+  const float bar_w = 160.0f, bar_h = 12.0f;
+  ImVec2 p0(win_min.x + kPad, win_min.y + kPad + 16.0f);  // leave room for a title
+
+  // Title.
+  const ImU32 text_col = IM_COL32(220, 220, 220, 255);
+  const ImU32 shadow = IM_COL32(0, 0, 0, 180);
+  auto label = [&](ImVec2 at, const char* txt) {
+    dl->AddText(ImVec2(at.x + 1, at.y + 1), shadow, txt);
+    dl->AddText(at, text_col, txt);
+  };
+  label(ImVec2(win_min.x + kPad, win_min.y + kPad), "FLOPs");
+
+  // Gradient bar (respects the active gradient + reverse).
+  const int segs = 64;
+  for (int i = 0; i < segs; ++i) {
+    float t0 = static_cast<float>(i) / segs;
+    float t1 = static_cast<float>(i + 1) / segs;
+    ImU32 c0 = rgba8_to_imu32(gradient_sample(vs.heatmap_gradient, t0));
+    ImU32 c1 = rgba8_to_imu32(gradient_sample(vs.heatmap_gradient, t1));
+    dl->AddRectFilledMultiColor(ImVec2(p0.x + bar_w * t0, p0.y),
+                                ImVec2(p0.x + bar_w * t1, p0.y + bar_h),
+                                c0, c1, c1, c0);
+  }
+  dl->AddRect(p0, ImVec2(p0.x + bar_w, p0.y + bar_h), IM_COL32(90, 90, 90, 255));
+
+  // Min/max labels under the bar ends.
+  std::string lo = human_flops(range.min_flops);
+  std::string hi = human_flops(range.max_flops);
+  ImVec2 lbl_pos(p0.x, p0.y + bar_h + 2.0f);
+  label(lbl_pos, lo.c_str());
+  float hi_w = ImGui::CalcTextSize(hi.c_str()).x;
+  label(ImVec2(p0.x + bar_w - hi_w, p0.y + bar_h + 2.0f), hi.c_str());
+  // Scale note.
+  const char* scale = vs.heatmap_log_scale ? "log" : "linear";
+  label(ImVec2(p0.x, p0.y + bar_h + 18.0f), scale);
+  (void)win_sz;
 }
 
 }  // namespace netvis
