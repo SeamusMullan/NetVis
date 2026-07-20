@@ -418,21 +418,23 @@ uint64_t compute_peak_activation_bytes(const ir::Graph& g) {
     free_at[static_cast<uint32_t>(lu)].push_back(vidx);
   }
 
+  // Each activation value contributes its bytes to `live` exactly ONCE. `free_at`
+  // removes it exactly once, so adding per output SLOT (or re-adding a graph input
+  // later emitted as a node output) would break the add/free symmetry and
+  // permanently inflate the reported peak on malformed input. `produced` gates
+  // every add site — including the graph_inputs seed below.
+  std::vector<bool> produced(g.values.size(), false);
+
   // Initialize live with graph_inputs bytes.
   uint64_t live = 0;
   for (uint32_t vidx : g.graph_inputs) {
     if (vidx >= g.values.size()) continue;
     if (!is_activation[vidx]) continue;  // shouldn't happen, but guard
+    if (produced[vidx]) continue;        // duplicate graph_input entry
+    produced[vidx] = true;
     live = safe_add(live, value_bytes(g.values[vidx]));
   }
   uint64_t peak = live;
-
-  // Each activation value contributes its bytes to `live` exactly ONCE, when
-  // first produced. `free_at` already removes it exactly once, so counting an add
-  // per output SLOT would break the add/free symmetry: a malformed graph mapping
-  // two output slots (of one node, or of two nodes) to the same value index would
-  // add its bytes twice but free once, permanently inflating the reported peak.
-  std::vector<bool> produced(g.values.size(), false);
 
   // Topological pass: for each node in index order, add outputs, update peak,
   // free values whose last_use == this node (unless graph output).

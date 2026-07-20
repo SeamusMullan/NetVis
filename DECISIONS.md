@@ -253,3 +253,23 @@ defects the tests missed; each is now covered by a `test_cost.cpp` regression.
   assertions, ASan+UBSan clean. (The view-layer cache-keying path remains untested
   — it needs a GUI/ModelSession harness the headless `netvis_core` tests don't
   link; verified manually via the xvfb smoke run instead.)
+
+## v0.3.1 — second sweep (2 more bugs)
+
+A follow-up scan of the cost surface found two defects the v0.3.0 sweep missed:
+
+- **(major) Cost heatmap saturated every collapsed group to max/hot.**
+  `cost_tint_for_display` takes the group's tint as the SUM of its member nodes'
+  FLOPs, but normalized that sum against a min/max computed over individual
+  *per-node* FLOPs. Any multi-node group sum exceeds the largest single node, so
+  every group clamped to `t=1` (hot red) — and the default view is collapsed, so
+  the heatmap was useless exactly where it mattered. Fix: build the normalization
+  scale over the same aggregation unit as the numerator — per *display node* (each
+  aggregated via `ir_nodes_for_display`+`sum_node_costs`), so groups and leaves are
+  compared on one scale.
+- **(minor) Peak liveness double-counted a graph input re-emitted as an output.**
+  The `graph_inputs` seed loop added a value's bytes without marking it `produced`,
+  so if a malformed graph also listed that value as a node output it was added
+  twice, freed once. Fix: the `produced` guard now covers the seed loop too
+  (hoisted above it). Both covered by new `test_cost.cpp` regressions (suite: 85
+  cases / 592 assertions, ASan+UBSan clean).

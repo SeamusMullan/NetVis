@@ -171,12 +171,20 @@ CostTint cost_tint_for_display(App& app, int32_t display_id) {
     return out;
   }
 
-  // Find min/max known FLOPs in the report for normalization.
+  // Find min/max known FLOPs for normalization over the SAME aggregation unit as
+  // the numerator: per DISPLAY node (a collapsed group's tint is the sum over its
+  // members, so it must be scaled against other display nodes' sums, not against
+  // individual per-node FLOPs — otherwise every multi-node group's sum exceeds the
+  // largest single node and saturates to max/hot, which is the default view).
   uint64_t min_flops = UINT64_MAX, max_flops = 0;
-  for (const NodeCost& c : vs.cost->per_node) {
-    if (!c.flops_known || c.flops == 0) continue;
-    if (c.flops < min_flops) min_flops = c.flops;
-    if (c.flops > max_flops) max_flops = c.flops;
+  std::vector<uint32_t> scale_nodes;
+  for (int32_t d = 0; d < static_cast<int32_t>(disp.size()); ++d) {
+    ir_nodes_for_display(s, d, scale_nodes);
+    if (scale_nodes.empty()) continue;
+    NodeCost agg = sum_node_costs(*vs.cost, scale_nodes);
+    if (!agg.flops_known || agg.flops == 0) continue;
+    if (agg.flops < min_flops) min_flops = agg.flops;
+    if (agg.flops > max_flops) max_flops = agg.flops;
   }
   // No known FLOPs in the whole report -> neutral.
   if (max_flops == 0 || min_flops == UINT64_MAX) {

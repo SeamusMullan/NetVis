@@ -793,3 +793,31 @@ TEST_CASE("Cost: unknown op leaves flops UNTOUCHED (sentinel guard)") {
   CHECK(r.total_flops == 200);       // unknown contributes nothing
   CHECK(ByteReader::payload_read_counter() == 0);
 }
+
+// --- v0.3.1 sweep regression --------------------------------------------------
+
+TEST_CASE("Cost: peak does not double-count a graph_input re-emitted as an output") {
+  // Regression: the graph_inputs seed loop added a value's bytes to `live` but did
+  // not mark it `produced`. A (malformed) graph where the same value index is both
+  // a graph_input AND a node output then added its bytes a second time at the
+  // production site while freeing it only once, inflating the peak.
+  // Graph: a[100] is a graph_input AND the output of node 0; consumed by node 1.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::F32, {100});  // 400 bytes
+  uint32_t b = add_value(m, g, "b", ir::DType::F32, {100});
+  g.graph_inputs.push_back(a);   // a seeded as a graph input...
+  g.graph_outputs.push_back(b);
+  add_node(m, g, "Identity", {a}, {a});  // ...and (malformed) re-emitted as output
+  add_node(m, g, "Relu", {a}, {b});      // consumes a
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);  // must not crash
+
+  // a counted once (400) + b produced at node 1 (400). Peak = 800, not 1200.
+  CHECK(r.peak_activation_bytes == 2 * 400);  // 800
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
