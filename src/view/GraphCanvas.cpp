@@ -8,6 +8,7 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "engine/LayoutEngine.h"
 #include "view/App.h"
+#include "view/CostPanel.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -427,8 +428,14 @@ void draw_graph_canvas(App& app) {
       float r = std::max(2.0f, 0.25f * b.size.x * zoom);
       // Diff overlay overrides the category color at the low-LOD blob site.
       ImU32 blob = App::category_color(lab.cat, dark);
+      // Diff overlay wins; else cost heatmap; else category color.
       DiffTint tint = diff_tint_for_display(app, static_cast<int32_t>(b.display_id));
-      if (tint.active) blob = tint.color;
+      if (tint.active) {
+        blob = tint.color;
+      } else {
+        CostTint ct = cost_tint_for_display(app, static_cast<int32_t>(b.display_id));
+        if (ct.active) blob = ct.color;
+      }
       if (nav_dim(b.display_id)) blob = with_alpha_mul(blob, kDimAlpha);
       dl->AddCircleFilled(c, r, blob, 8);
     }
@@ -447,9 +454,14 @@ void draw_graph_canvas(App& app) {
       const bool dimmed = nav_dim(b.display_id);
       NodeLabel lab = label_for(app, b.display_id);
       ImU32 header = App::category_color(lab.cat, dark);
-      // Diff overlay overrides the header color when a diff is active.
+      // Diff overlay wins; else cost heatmap; else category color.
       DiffTint tint = diff_tint_for_display(app, static_cast<int32_t>(b.display_id));
-      if (tint.active) header = tint.color;
+      if (tint.active) {
+        header = tint.color;
+      } else {
+        CostTint ct = cost_tint_for_display(app, static_cast<int32_t>(b.display_id));
+        if (ct.active) header = ct.color;
+      }
       if (dimmed) header = with_alpha_mul(header, kDimAlpha);
 
       ImU32 body = dark ? IM_COL32(34, 38, 44, 255) : IM_COL32(244, 246, 249, 255);

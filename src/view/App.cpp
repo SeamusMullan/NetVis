@@ -86,6 +86,8 @@
 #include "engine/LayoutCache.h"
 // GraphNav.h defines GraphNavState so ViewState's unique_ptr<GraphNavState>
 // deleter sees the complete type at ~App(); DiffPanel.h for draw_diff_panel.
+#include "engine/CostModel.h"  // complete type for ViewState's unique_ptr<CostReport>
+#include "view/CostPanel.h"
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
 
@@ -393,8 +395,12 @@ void App::frame() {
     // Refresh nav adjacency + display-space masks BEFORE the canvas reads them
     // (cheap no-op unless the nav cache key changed).
     ensure_nav(*this);
+    // Rebuild the cost report if stale BEFORE the canvas reads cost tints (cheap
+    // no-op unless generation/graph/collapse changed).
+    ensure_cost(*this);
     draw_graph_canvas(*this);
   } else if (session_->model() != nullptr && !session_->has_graph()) {
+    ensure_cost(*this);  // table-mode report (dtype/quant totals) for Properties
     draw_tensor_table(*this);
   }
 

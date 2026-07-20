@@ -31,6 +31,10 @@ namespace netvis {
 // so App.h stays light. Forward-declared here, defined in view/GraphNav.h.
 struct GraphNavState;
 
+// Static cost/analyzer report (v0.3.0). Forward-declared so App.h needn't include
+// engine/CostModel.h; ViewState holds it by unique_ptr, rebuilt by ensure_cost().
+struct CostReport;
+
 // World<->screen transform for the graph canvas (spec §8.1). world*zoom+pan.
 struct Camera {
   ImVec2 pan{0, 0};
@@ -102,6 +106,26 @@ struct ViewState {
   // Model diff: panel-open flag. The comparison model + diff live in DiffLoader
   // (App-owned engine object); this is just the panel's visibility toggle.
   bool diff_panel_open = false;
+
+  // --- v0.3.0 additions (append-only) ----------------------------------------
+  // Static cost/analyzer report for the current graph. Held by pointer
+  // (forward-declared CostReport) and rebuilt lazily by ensure_cost(); null until
+  // a model is loaded. cost_key_* record what `cost` was built for, so
+  // ensure_cost() knows when to recompute (generation/graph/collapse changed).
+  std::unique_ptr<CostReport> cost;
+  uint64_t cost_key_generation = UINT64_MAX;
+  uint32_t cost_key_graph = UINT32_MAX;
+  uint64_t cost_key_collapse = 0;
+  // Shape-enrichment epoch the cached report was built for. ONNX shape inference
+  // mutates ValueInfo shapes in place AFTER the model is published (same
+  // model/generation), so without this the report is built pre-inference (all
+  // FLOPs unknown, peak=0) and served forever. See ModelSession::enrich_generation().
+  uint64_t cost_key_enrich = UINT64_MAX;
+
+  // Cost-heatmap overlay toggle: when true, GraphCanvas tints nodes by log(FLOPs)
+  // via cost_tint_for_display (mutually exclusive with diff tint at the call site
+  // — diff wins if both active).
+  bool cost_heatmap = false;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather

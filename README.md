@@ -45,6 +45,12 @@ sortable table with a module hierarchy tree.*
   **added / removed / changed** — before/after quantization or fine-tuning at a
   glance. The comparison loads on its own background pipeline; the main thread
   never stalls.
+- **Analyzer mode:** a static, zero-payload cost report — per-node and model-wide
+  **FLOPs, parameter counts, weight bytes, and peak activation memory** computed
+  from shapes alone (no weights read), plus a **quant-coverage** table (per-dtype
+  params/bytes, effective bits/param, size-vs-fp32). Estimates are honest:
+  unsupported ops / unresolved shapes are reported as unknown, never faked. A
+  one-key **cost heatmap** tints the graph by `log(FLOPs)` to spot the hot nodes.
 - **Weight inspector:** lazily decodes a tensor to streaming stats (min/max/mean/std,
   zero & NaN/Inf counts, 64-bucket histogram) without materializing a converted
   copy. Export to `.npy` or raw `.bin`.

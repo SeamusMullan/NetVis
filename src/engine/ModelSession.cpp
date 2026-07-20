@@ -187,6 +187,10 @@ void ModelSession::open_async(const std::string& path) {
           jobs_.post_to_main([this, gen, shapes_ms] {
             if (jobs_.generation() != gen) return;  // stale: drop
             timings_.shapes_ms = shapes_ms;
+            // Shapes were mutated in place under the same model/generation, so
+            // anything derived from ValueInfo shapes (cost report) must know to
+            // recompute — the model pointer and generation_ are unchanged.
+            ++enrich_generation_;
             // Enrichment done; if layout has already landed we are Ready.
             if (stage_ == LoadStage::Enriching && layout_) stage_ = LoadStage::Ready;
           });

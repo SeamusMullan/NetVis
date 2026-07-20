@@ -23,6 +23,7 @@
 #include "engine/OpCategory.h"
 #include "ir/IR.h"
 #include "view/App.h"
+#include "view/CostPanel.h"
 #include "view/PanelHelpers.h"
 
 namespace netvis {
@@ -218,7 +219,9 @@ void draw_model_root(App& app, const ir::Model& model) {
   ImGui::Text("nodes:   %s", grouped_count(static_cast<int64_t>(node_count)).c_str());
   ImGui::Text("edges:   %s", grouped_count(static_cast<int64_t>(edge_count)).c_str());
   ImGui::Text("params:  %s", grouped_count(total_params).c_str());
-  (void)app;
+
+  // v0.3.0 analyzer: model-wide cost totals + quant-coverage + heatmap toggle.
+  draw_cost_section(app);
 }
 
 }  // namespace
@@ -266,6 +269,7 @@ void draw_properties_panel(App& app) {
     ImGui::Text("members:  %zu nodes", grp.member_nodes.size());
     const char* btn = dn.expanded ? "Collapse" : "Expand";
     if (ImGui::Button(btn)) session.toggle_group(dn.group_index);
+    draw_cost_section(app);  // per-instance + rolled-up (xN) group cost + totals
     ImGui::End();
     return;
   }
@@ -313,6 +317,7 @@ void draw_properties_panel(App& app) {
     }
   }
 
+  draw_cost_section(app);  // this node's FLOPs/params/bytes + model totals
   ImGui::End();
 }
 

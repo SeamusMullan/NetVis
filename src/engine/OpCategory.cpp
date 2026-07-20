@@ -56,12 +56,18 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"hardsigmoid", OpCategory::Activation},
       {"swish", OpCategory::Activation},
       {"silu", OpCategory::Activation},
-      // Norm
+      // Norm — both the ONNX "*Normalization" op names and the bare short forms
+      // common in PyTorch/exported/custom graphs (e.g. "LayerNorm", "BatchNorm").
       {"batchnormalization", OpCategory::Norm},
+      {"batchnorm", OpCategory::Norm},
       {"layernormalization", OpCategory::Norm},
+      {"layernorm", OpCategory::Norm},
       {"groupnormalization", OpCategory::Norm},
+      {"groupnorm", OpCategory::Norm},
       {"instancenormalization", OpCategory::Norm},
+      {"instancenorm", OpCategory::Norm},
       {"rmsnorm", OpCategory::Norm},
+      {"rmsnormalization", OpCategory::Norm},
       {"lpnormalization", OpCategory::Norm},
       // Pool
       {"maxpool", OpCategory::Pool},

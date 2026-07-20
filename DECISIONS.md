@@ -162,3 +162,94 @@ rightward biases, all fixed in `LayoutEngine.cpp`:
   global drift: a straight chain has slope 0 (untouched), and all within-layer
   order + relative offsets are preserved. O(V+L), deterministic. Result: a deep
   skip-chain that spanned ~29 node-widths of horizontal drift now stays under 1.
+
+## v0.3.0 — analyzer mode (static cost/memory analysis)
+
+NetVis moves from "see the model" to "understand its cost." `engine/CostModel.h`
+adds `compute_cost(model, graph_idx) -> CostReport`: per-node FLOPs, params,
+weight bytes, activation bytes; model totals; peak-activation estimate; and a
+per-dtype quant-coverage report.
+
+- **Static, structural, zero-payload.** `compute_cost` is a pure headless function
+  over the already-parsed `ir::Model` — it reads only resolved `ValueInfo`
+  shapes/dtypes and `TensorRef` metadata (`elem_count`/`byte_len`/`dtype`), never a
+  tensor payload. It upholds the same zero-payload-read thesis the parsers do
+  (asserted in `test_cost.cpp` via `payload_read_counter()==0`), and like
+  `infer_shapes`/`GraphAdjacency` it is deterministic, never throws, and runs
+  headless in tests. It is an **estimate**: an unsupported op or an unresolved
+  shape is reported honestly as `flops_known=false` and excluded from `total_flops`
+  (never faked); the panel shows "FLOPs unknown for k/N nodes."
+- **FLOPs = 2 × MACs.** One multiply-accumulate is one multiply + one add. MatMul
+  = `2·|O|·K` (K = last input dim); Conv = `2·|O|·(Cin/g)·∏kernel` reading
+  Cin/group + kernel from the weight-initializer shape `[Cout, Cin/g, k…]`;
+  elementwise/activation/norm = `|O|`; reduce = `|input[0]|`; pool = `|O|·∏kernel`.
+  Structural ops (Reshape/Concat/Gather/Cast/control-flow) carry ~0 arithmetic and
+  are `flops_known=false`. The formula table is frozen **in the header** so the
+  implementation and the test agree on one source of truth. A node with a corrupt
+  (out-of-range) input edge_ref is treated as structurally invalid → `flops_known
+  =false` rather than estimating from partial shapes (hostile-input honesty).
+- **`total_params`/`total_weight_bytes` aggregate over initializers, not
+  `sum(per_node)`.** A weight feeding K consumers must count once, and an
+  unconsumed initializer must still count; summing the per-node attribution would
+  double-count shared weights and drop orphans. `per_node.params` remains the
+  per-node view (deliberately double-counts shared weights — that is the node's
+  cost); the report totals are the model view, consistent with `dtype_usage`.
+- **Peak activation via single-pass liveness.** ONNX node order is topological, so
+  one index-order pass tracks live activation bytes: add a node's output bytes,
+  update the peak, then free each value at its last consumer unless it is a graph
+  output. Freed values are bucketed by their freeing node up front (`free_at[ni]`)
+  so the pass is O(V+E), not the O(V²) of rescanning all values per node.
+- **Quant-coverage report.** `dtype_usage` aggregates weights per `DType`, sorted by
+  bytes descending. Quantized blocks (Q4/Q8) have `dtype_size==0`, so their byte
+  count comes from the recorded `TensorRef::byte_len` (the truth for block formats),
+  never `elem_count*dtype_size`. Derived: `effective_bits_per_param` and
+  `size_vs_fp32` — the compression story at a glance.
+- **View surface mirrors existing patterns; not a frozen contract.** `view/
+  CostPanel.h` follows GraphNav (lazy `ensure_cost()` keyed on
+  generation/graph/collapse) and DiffPanel (a `CostTint` the canvas overrides
+  category color with). Heatmap ramps by `log10(flops)`; diff tint wins if both are
+  active. `draw_cost_section` renders into the Properties panel. `ViewState` gains
+  append-only `unique_ptr<CostReport> cost`, its rebuild keys, and `cost_heatmap`;
+  `App.cpp` includes `CostModel.h` so the `unique_ptr` deleter sees the complete
+  type at `~App()`.
+
+### v0.3.0 post-release adversarial sweep (6 bugs, all fixed)
+
+An Opus find→verify-to-refute sweep of the cost code surfaced six confirmed
+defects the tests missed; each is now covered by a `test_cost.cpp` regression.
+
+- **(blocker) Cost report served permanently stale after shape inference.** ONNX
+  shape inference runs as a worker job submitted *after* the model is published; it
+  mutates `ValueInfo.shape` in place and its completion did NOT bump
+  `generation_`/`current_graph_`/`collapse_hash`. `ensure_cost` keyed only on those
+  three, so it built the report one frame *before* shapes landed (every FLOP
+  unknown, peak 0) and then short-circuited forever. Fix: `ModelSession` exposes a
+  monotonic **`enrich_generation()`**, bumped on the main thread in the
+  shape-inference completion; `ensure_cost`'s key includes it, so the report
+  recomputes exactly once shapes resolve. (Analogue of the v0.2.0 diff-tint-stale-
+  on-reopen bug: a derived view depending on state that changes without a key bump.)
+- **(major) Gemm ignored `transA`.** K was taken as `in0.shape.back()`
+  unconditionally, but shape inference writes only the *output* shape, not a
+  transposed input-operand view — so for `transA=1` operand A is `[K, M]` and
+  `back()` is M, computing `M·N·M` instead of `M·N·K`. Fix: read the `transA`
+  attribute and pick `K = transA ? shape[0] : shape.back()`.
+- **(major) ConvTranspose used the Conv formula.** ConvTranspose's weight is the
+  *transposed* layout `[Cin, Cout/g, k…]` and its output spatial size differs from
+  the input's, so basing MACs on `|O|` and reading `shape[1]` as Cin/g is wrong.
+  Fix: for ConvTranspose base MACs on `|input|` (`macs = |input|·(Cout/g)·∏kernel`,
+  `Cout/g = weight.shape[1]`), disambiguating on the op string (both share
+  `OpCategory::Conv`).
+- **(minor) Einsum got fabricated MatMul FLOPs.** Einsum shares the MatMul category
+  (for coloring) but its FLOPs depend on the `equation`, not `|O|·K`. Fix: exclude
+  it (`flops_known=false`) rather than guess.
+- **(minor) Peak liveness double-counted a value on duplicate output slots.** The
+  add-side added output bytes per output *slot*, while the free-side frees each
+  value once — so a malformed graph mapping two output slots to one value index
+  inflated the peak. Fix: a `produced` set adds each activation's bytes once, at
+  first production, restoring add/free symmetry.
+- **(minor) Test gaps.** No `transA` Gemm, no ConvTranspose, no Einsum, no
+  duplicate-slot liveness, and an unknown-op check that couldn't distinguish
+  "computed unknown" from "uninitialized". All added; suite is 84 cases / 590
+  assertions, ASan+UBSan clean. (The view-layer cache-keying path remains untested
+  — it needs a GUI/ModelSession harness the headless `netvis_core` tests don't
+  link; verified manually via the xvfb smoke run instead.)

@@ -99,6 +99,14 @@ class ModelSession {
 
   uint64_t generation() const { return generation_; }
 
+  // Bumped on the main thread each time background enrichment mutates the
+  // published model in place (currently: ONNX shape inference completing). The
+  // model pointer/generation do NOT change when this happens, so derived state
+  // that depends on ValueInfo shapes (e.g. the cost report) must fold this epoch
+  // into its rebuild key or it serves a pre-inference (all-shapes-empty) result
+  // forever. Starts at 0; only ever increases within a generation.
+  uint64_t enrich_generation() const { return enrich_generation_; }
+
  private:
   JobSystem& jobs_;
 
@@ -126,6 +134,7 @@ class ModelSession {
 
   SizeFn size_fn_;
   uint64_t generation_ = 0;
+  uint64_t enrich_generation_ = 0;  // see enrich_generation()
 
   // Kick a layout job for the current collapse view (used after parse + expand).
   void request_layout();
