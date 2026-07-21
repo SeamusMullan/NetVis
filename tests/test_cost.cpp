@@ -1380,3 +1380,141 @@ TEST_CASE("Cost: liveness curve empty in table mode / out-of-range graph_index")
     CHECK(ByteReader::payload_read_counter() == 0);
   }
 }
+
+// =============================================================================
+//  #26 — per-op-category cost rollup (rollup_by_category)
+// =============================================================================
+
+TEST_CASE("Cost: rollup_by_category aggregates FLOPs/params by category") {
+  // Build a tiny graph: Conv (has weight), MatMul, Relu. Verify the per-category
+  // sums equal the manually computed per-node values and the sort order.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  // Conv: out [1,64,28,28], weight [64,32,3,3], group=1. (numbers from the Conv
+  // test above): flops = 28901376, params = 18432, weight_bytes = 73728.
+  uint32_t cinp = add_value(m, g, "cinp", ir::DType::F32, {1, 32, 30, 30});
+  uint32_t cw = add_value(m, g, "cw", ir::DType::F32, {64, 32, 3, 3});
+  uint32_t cout = add_value(m, g, "cout", ir::DType::F32, {1, 64, 28, 28});
+  add_initializer(m, g, "cw", ir::DType::F32, {64, 32, 3, 3});
+  add_node(m, g, "Conv", {cinp, cw}, {cout});
+  add_attr_int(m, g, "group", 1);
+
+  // MatMul: [8,16]x[16,32]->[8,32]. flops = 2*8*32*16 = 8192, no params.
+  uint32_t ma = add_value(m, g, "ma", ir::DType::F32, {8, 16});
+  uint32_t mb = add_value(m, g, "mb", ir::DType::F32, {16, 32});
+  uint32_t mo = add_value(m, g, "mo", ir::DType::F32, {8, 32});
+  add_node(m, g, "MatMul", {ma, mb}, {mo});
+
+  // Relu: [10] -> flops = 10.
+  uint32_t ra = add_value(m, g, "ra", ir::DType::F32, {10});
+  uint32_t ro = add_value(m, g, "ro", ir::DType::F32, {10});
+  add_node(m, g, "Relu", {ra}, {ro});
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+  std::vector<CategoryCost> cats = rollup_by_category(m, 0, r);
+  CHECK(ByteReader::payload_read_counter() == 0);
+
+  REQUIRE(cats.size() == 3);
+  // Sort order: Conv (28901376) > MatMul (8192) > Activation (10).
+  CHECK(cats[0].category == OpCategory::Conv);
+  CHECK(cats[1].category == OpCategory::MatMul);
+  CHECK(cats[2].category == OpCategory::Activation);
+
+  const int64_t conv_flops = 2 * (1 * 64 * 28 * 28) * 32 * 9;  // 28901376
+  CHECK(cats[0].flops == static_cast<uint64_t>(conv_flops));
+  CHECK(cats[0].params == 64 * 32 * 3 * 3);   // 18432
+  CHECK(cats[0].weight_bytes == 18432 * 4);   // 73728
+  CHECK(cats[0].node_count == 1);
+
+  CHECK(cats[1].flops == 2 * 8 * 32 * 16);  // 8192
+  CHECK(cats[1].params == 0);
+  CHECK(cats[1].node_count == 1);
+
+  CHECK(cats[2].flops == 10);
+  CHECK(cats[2].node_count == 1);
+
+  // The category FLOPs must sum to the report total.
+  uint64_t sum = cats[0].flops + cats[1].flops + cats[2].flops;
+  CHECK(sum == r.total_flops);
+}
+
+TEST_CASE("Cost: rollup_by_category groups multiple nodes into one category") {
+  // Two Elementwise ops (Add, Mul) collapse into a single Elementwise row whose
+  // flops/node_count are the sum of both.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::F32, {10});
+  uint32_t b = add_value(m, g, "b", ir::DType::F32, {10});
+  uint32_t c = add_value(m, g, "c", ir::DType::F32, {10});
+  uint32_t d = add_value(m, g, "d", ir::DType::F32, {10});
+  add_node(m, g, "Add", {a, b}, {c});   // flops = 10
+  add_node(m, g, "Mul", {c, b}, {d});   // flops = 10
+
+  CostReport r = compute_cost(m, 0);
+  std::vector<CategoryCost> cats = rollup_by_category(m, 0, r);
+
+  REQUIRE(cats.size() == 1);
+  CHECK(cats[0].category == OpCategory::Elementwise);
+  CHECK(cats[0].flops == 20);
+  CHECK(cats[0].node_count == 2);
+}
+
+TEST_CASE("Cost: rollup_by_category rolls up params for flops-unknown nodes") {
+  // HONESTY: a node whose FLOPs are unknown (dynamic output dim) still contributes
+  // 0 FLOPs but its params/weight_bytes DO roll up (they are known independent of
+  // FLOPs), and it still counts toward node_count.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  // Conv with a DYNAMIC output dim -> flops_known=false, but weight params known.
+  uint32_t inp = add_value(m, g, "inp", ir::DType::F32, {1, 32, 30, 30});
+  uint32_t w = add_value(m, g, "w", ir::DType::F32, {64, 32, 3, 3});
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {-1, 64, 28, 28});
+  add_initializer(m, g, "w", ir::DType::F32, {64, 32, 3, 3});
+  add_node(m, g, "Conv", {inp, w}, {out});
+  add_attr_int(m, g, "group", 1);
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  REQUIRE_FALSE(r.per_node[0].flops_known);
+
+  std::vector<CategoryCost> cats = rollup_by_category(m, 0, r);
+  REQUIRE(cats.size() == 1);
+  CHECK(cats[0].category == OpCategory::Conv);
+  CHECK(cats[0].flops == 0);                      // honest: unknown FLOPs -> 0
+  CHECK(cats[0].params == 64 * 32 * 3 * 3);       // params still rolled up
+  CHECK(cats[0].weight_bytes == 18432 * 4);       // and weight bytes
+  CHECK(cats[0].node_count == 1);                 // and still counted
+}
+
+TEST_CASE("Cost: rollup_by_category empty / table-mode report returns empty") {
+  // Table mode (no compute graph) -> per_node empty -> empty rollup, no crash.
+  ir::Model m;
+  m.format_name = m.intern("GGUF");
+  m.has_graph = false;
+  ir::TensorRef t;
+  t.name = m.intern("t");
+  t.dtype = ir::DType::F32;
+  t.shape.push_back(100);
+  t.byte_len = 400;
+  m.flat_tensors.push_back(std::move(t));
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+  std::vector<CategoryCost> cats = rollup_by_category(m, 0, r);
+  CHECK(cats.empty());
+
+  // Out-of-range graph_index must also return empty without crashing.
+  std::vector<CategoryCost> cats2 = rollup_by_category(m, 999, r);
+  CHECK(cats2.empty());
+  CHECK(ByteReader::payload_read_counter() == 0);
+}

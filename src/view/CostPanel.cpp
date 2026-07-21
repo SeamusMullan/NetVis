@@ -541,6 +541,62 @@ void draw_cost_section(App& app) {
           "machine balance (datasheet estimates, not measurements).");
   }
 
+  // --- Cost by op category (graph-mode only) ----------------------------------
+  // Roll up per-node cost by op category (Conv, MatMul, Attention, ...). The
+  // compute lives in the engine (rollup_by_category, unit-tested); the view only
+  // renders. Percentages are against report->total_flops (guard div-by-zero).
+  if (report->from_graph) {
+    std::vector<CategoryCost> cats =
+        rollup_by_category(*model, s.current_graph(), *report);
+    if (!cats.empty()) {
+      ImGui::SeparatorText("Cost by op category");
+      const ImGuiTableFlags cflags = ImGuiTableFlags_Borders |
+                                     ImGuiTableFlags_RowBg |
+                                     ImGuiTableFlags_SizingStretchProp;
+      if (ImGui::BeginTable("opcat", 7, cflags)) {
+        ImGui::TableSetupColumn("category", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("FLOPs");
+        ImGui::TableSetupColumn("% FLOPs");
+        ImGui::TableSetupColumn("params");
+        ImGui::TableSetupColumn("weights");
+        ImGui::TableSetupColumn("act");
+        ImGui::TableSetupColumn("nodes", ImGuiTableColumnFlags_WidthFixed, 44.0f);
+        ImGui::TableHeadersRow();
+
+        const uint64_t total_flops = report->total_flops;
+        for (const CategoryCost& cc : cats) {
+          ImGui::TableNextRow();
+          ImGui::TableSetColumnIndex(0);
+          ImGui::TextUnformatted(category_name(cc.category));
+          ImGui::TableSetColumnIndex(1);
+          ImGui::TextUnformatted(human_flops(cc.flops).c_str());
+          ImGui::TableSetColumnIndex(2);
+          if (total_flops > 0) {
+            float frac = static_cast<float>(static_cast<double>(cc.flops) /
+                                            static_cast<double>(total_flops));
+            frac = std::clamp(frac, 0.0f, 1.0f);
+            // Tiny in-panel bar so the dominant categories read at a glance.
+            char pct[16];
+            std::snprintf(pct, sizeof(pct), "%.1f%%", frac * 100.0f);
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), pct);
+          } else {
+            ImGui::TextDisabled("-");
+          }
+          ImGui::TableSetColumnIndex(3);
+          ImGui::TextUnformatted(
+              grouped_count(static_cast<int64_t>(cc.params)).c_str());
+          ImGui::TableSetColumnIndex(4);
+          ImGui::TextUnformatted(human_bytes(cc.weight_bytes).c_str());
+          ImGui::TableSetColumnIndex(5);
+          ImGui::TextUnformatted(human_bytes(cc.act_bytes).c_str());
+          ImGui::TableSetColumnIndex(6);
+          ImGui::Text("%u", cc.node_count);
+        }
+        ImGui::EndTable();
+      }
+    }
+  }
+
   // --- Quant-coverage table ---------------------------------------------------
   if (!report->dtype_usage.empty()) {
     ImGui::SeparatorText("Quantization profile");

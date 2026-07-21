@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "engine/HeatmapGradient.h"  // HeatmapMetric (engine-leaf, only <cstdint>)
+#include "engine/OpCategory.h"       // OpCategory (engine-leaf, string_view->enum)
 #include "ir/IR.h"
 
 namespace netvis {
@@ -205,6 +206,31 @@ constexpr uint64_t kArithIntensityScale = 1000;
 //   ActBytes       -> {act_bytes, act_bytes!=0}  (0 => unresolved -> honest unknown)
 //   ArithIntensity -> {round(ai*scale), flops_known && bytes_moved()>0}
 MetricValue metric_value(const NodeCost& nc, HeatmapMetric m);
+
+// --- v0.4.0 (#26): per-op-category cost rollup ----------------------------
+// Aggregate cost by op CATEGORY (Conv, MatMul, Attention, ...) so the analyzer
+// can show "where the FLOPs/params/bytes go" at a glance. One entry per category
+// that has at least one node.
+struct CategoryCost {
+  OpCategory category = OpCategory::Other;
+  uint64_t flops = 0;         // sum of per_node.flops over this category's nodes
+  uint64_t params = 0;        // sum of per_node.params (per-node attribution)
+  uint64_t weight_bytes = 0;  // sum of per_node.weight_bytes
+  uint64_t act_bytes = 0;     // sum of per_node.act_bytes
+  uint32_t node_count = 0;    // number of nodes mapped to this category
+};
+
+// Roll up report.per_node by op category (node index -> op_type -> categorize_op).
+// PURE, O(V), never throws, saturating adds. Reads ONLY the CostReport + IR
+// structure (op strings) — no tensor payloads. HONEST: a flops_known==false node
+// contributes 0 FLOPs but its params/bytes still roll up (they are known
+// independent of FLOPs), and it still counts toward node_count. Bounds-checks
+// per_node vs nodes (iterates over min(size)). Returns only categories with
+// node_count > 0, SORTED by flops descending (ties: OpCategory enum order). An
+// empty/table-mode report (no per_node) returns an empty vector.
+std::vector<CategoryCost> rollup_by_category(const ir::Model& model,
+                                             uint32_t graph_index,
+                                             const CostReport& report);
 
 // Build the cost report for graphs[graph_index]. Out-of-range graph_index, or a
 // model with has_graph == false, yields a table-mode report (from_graph == false,

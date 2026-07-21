@@ -927,6 +927,47 @@ MetricValue metric_value(const NodeCost& nc, HeatmapMetric m) {
   return {0, false};
 }
 
+// Public API (#26): roll up per-node cost by op category. Pure, O(V), saturating.
+std::vector<CategoryCost> rollup_by_category(const ir::Model& model,
+                                             uint32_t graph_index,
+                                             const CostReport& report) {
+  std::vector<CategoryCost> out;
+  // Table-mode / empty report OR out-of-range graph -> nothing to categorize.
+  if (report.per_node.empty() || graph_index >= model.graphs.size()) return out;
+  const ir::Graph& g = model.graphs[graph_index];
+
+  // One accumulator per category enum value (Other is last, so size = Other+1).
+  constexpr size_t kNumCats = static_cast<size_t>(OpCategory::Other) + 1;
+  CategoryCost acc[kNumCats];
+  for (size_t c = 0; c < kNumCats; ++c)
+    acc[c].category = static_cast<OpCategory>(c);
+
+  // Iterate the overlap of per_node and nodes (hostile-input bounds guard).
+  const size_t n = std::min(report.per_node.size(), g.nodes.size());
+  for (size_t i = 0; i < n; ++i) {
+    const NodeCost& nc = report.per_node[i];
+    OpCategory cat = categorize_op(model.str(g.nodes[i].op_type));
+    CategoryCost& a = acc[static_cast<size_t>(cat)];
+    // HONEST: flops only count when known (else 0); params/bytes always roll up.
+    if (nc.flops_known) a.flops = safe_add(a.flops, nc.flops);
+    a.params = safe_add(a.params, nc.params);
+    a.weight_bytes = safe_add(a.weight_bytes, nc.weight_bytes);
+    a.act_bytes = safe_add(a.act_bytes, nc.act_bytes);
+    a.node_count += 1;  // uint32; node count can never overflow a graph
+  }
+
+  // Emit only non-empty categories, sorted by flops desc (ties: enum order).
+  for (size_t c = 0; c < kNumCats; ++c)
+    if (acc[c].node_count > 0) out.push_back(acc[c]);
+  std::stable_sort(out.begin(), out.end(),
+                   [](const CategoryCost& lhs, const CategoryCost& rhs) {
+                     if (lhs.flops != rhs.flops) return lhs.flops > rhs.flops;
+                     return static_cast<uint8_t>(lhs.category) <
+                            static_cast<uint8_t>(rhs.category);
+                   });
+  return out;
+}
+
 // Public API: build the cost report for graphs[graph_index].
 CostReport compute_cost(const ir::Model& model, uint32_t graph_index) {
   // Table mode: has_graph == false or graph_index out of range.
