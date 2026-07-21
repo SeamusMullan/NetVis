@@ -78,4 +78,14 @@ CostTint cost_tint_for_display(App& app, int32_t display_id);
 // (App.view().cost_heatmap). Reads only App.view().cost + the current selection.
 void draw_cost_section(App& app);
 
+// Draw the sortable, virtualized per-node cost table (graph mode only). Columns:
+// op, name, FLOPs, params, weight bytes, activation bytes. The table sorts an
+// index vector over report->per_node (default FLOPs desc) and renders only the
+// visible rows via ImGuiListClipper (O(visible), safe at 100k nodes). Clicking a
+// row selects that IR node and flies the camera to it via nav_jump_to_ir_node.
+// Called from draw_cost_section under a collapsed CollapsingHeader; no-op when
+// there is no graph-mode cost report. Reads only App.view().cost + ir::Model
+// structure — never a tensor payload.
+void draw_cost_table(App& app);
+
 }  // namespace netvis

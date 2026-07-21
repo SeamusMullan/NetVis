@@ -33,6 +33,7 @@
 #include "engine/CostModel.h"
 #include "ir/IR.h"
 #include "view/App.h"
+#include "view/GraphNav.h"
 #include "view/PanelHelpers.h"
 
 namespace netvis {
@@ -503,6 +504,13 @@ void draw_cost_section(App& app) {
     ImGui::Text("Size vs fp32: %.2f×", vs_fp32);
   }
 
+  // --- Per-node cost table (graph mode only; collapsed so it doesn't dominate) -
+  if (report->from_graph) {
+    if (ImGui::CollapsingHeader("Per-node cost table")) {
+      draw_cost_table(app);
+    }
+  }
+
   // --- Copy-to-clipboard ------------------------------------------------------
   ImGui::Separator();
   if (ImGui::Button("Copy cost summary")) {
@@ -620,6 +628,189 @@ void draw_cost_section(App& app) {
   }
 
   if (dirty) app.save_prefs();
+}
+
+void draw_cost_table(App& app) {
+  ViewState& vs = app.view();
+  ModelSession& s = app.session();
+
+  const ir::Model* model = s.model();
+  if (!model) return;
+  const CostReport* report = vs.cost.get();
+  if (!report || !report->from_graph) return;  // graph mode only
+
+  const uint32_t gi = s.current_graph();
+  if (gi >= model->graphs.size()) return;
+  const ir::Graph& g = model->graphs[gi];
+  const CollapseTree& collapse = s.collapse();
+
+  // per_node is 1:1 with graphs[gi].nodes, but clamp to the min and bounds-check
+  // every access — a pathological mismatch must never index out of range.
+  const size_t row_count = std::min(report->per_node.size(), g.nodes.size());
+  if (row_count == 0) {
+    ImGui::TextDisabled("(no nodes)");
+    return;
+  }
+
+  // Sorted index order over [0, row_count). Cached across frames (single-panel
+  // usage): re-sort only when the sort spec is dirty OR the underlying data
+  // changed. The data signature includes generation (model reload), graph index
+  // (subgraph dive), enrich_generation (shape inference resolves FLOPs and thus
+  // reorders), and row_count (guards a stale order against a shrunk model).
+  static std::vector<uint32_t> order;
+  static uint64_t key_gen = UINT64_MAX;
+  static uint64_t key_enrich = UINT64_MAX;
+  static uint32_t key_graph = UINT32_MAX;
+  static size_t key_count = 0;
+
+  const uint64_t gen = s.generation();
+  const uint64_t enrich = s.enrich_generation();
+  bool need_sort = false;
+  if (gen != key_gen || enrich != key_enrich || gi != key_graph ||
+      row_count != key_count || order.size() != row_count) {
+    key_gen = gen;
+    key_enrich = enrich;
+    key_graph = gi;
+    key_count = row_count;
+    need_sort = true;
+  }
+
+  const ImGuiTableFlags flags =
+      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+      ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable |
+      ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+
+  // Bounded height so ScrollY + the clipper virtualize the (up to 100k) rows.
+  const ImVec2 table_size(0.0f, 260.0f);
+  if (ImGui::BeginTable("per_node_cost", 6, flags, table_size)) {
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("op", ImGuiTableColumnFlags_WidthFixed, 90.0f, 0);
+    ImGui::TableSetupColumn(
+        "name", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthStretch,
+        0.0f, 1);
+    ImGui::TableSetupColumn("FLOPs",
+                            ImGuiTableColumnFlags_DefaultSort |
+                                ImGuiTableColumnFlags_PreferSortDescending |
+                                ImGuiTableColumnFlags_WidthFixed,
+                            80.0f, 2);
+    ImGui::TableSetupColumn("params",
+                            ImGuiTableColumnFlags_PreferSortDescending |
+                                ImGuiTableColumnFlags_WidthFixed,
+                            80.0f, 3);
+    ImGui::TableSetupColumn("weights",
+                            ImGuiTableColumnFlags_PreferSortDescending |
+                                ImGuiTableColumnFlags_WidthFixed,
+                            80.0f, 4);
+    ImGui::TableSetupColumn("act",
+                            ImGuiTableColumnFlags_PreferSortDescending |
+                                ImGuiTableColumnFlags_WidthFixed,
+                            80.0f, 5);
+    ImGui::TableHeadersRow();
+
+    // Active sort spec: default to FLOPs (col 2) descending.
+    int sort_col = 2;
+    bool sort_asc = false;
+    if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+      if (specs->SpecsCount > 0) {
+        sort_col = specs->Specs[0].ColumnIndex;
+        sort_asc =
+            (specs->Specs[0].SortDirection != ImGuiSortDirection_Descending);
+      }
+      if (specs->SpecsDirty) {
+        need_sort = true;
+        specs->SpecsDirty = false;
+      }
+    }
+
+    if (need_sort) {
+      order.resize(row_count);
+      for (size_t i = 0; i < row_count; ++i)
+        order[i] = static_cast<uint32_t>(i);
+
+      // One-directional comparator; the sort flips operands for descending so
+      // equal keys keep their stable order. FLOPs of a !flops_known node sort as
+      // 0 (they sink to the bottom on the default descending order).
+      auto less = [&](uint32_t a, uint32_t b) -> bool {
+        const NodeCost& na = report->per_node[a];
+        const NodeCost& nb = report->per_node[b];
+        switch (sort_col) {
+          case 0:  // op
+            return model->str(g.nodes[a].op_type) <
+                   model->str(g.nodes[b].op_type);
+          case 1:  // name (NoSort column; handled defensively)
+            return model->str(g.nodes[a].name) < model->str(g.nodes[b].name);
+          case 3:  // params
+            return na.params < nb.params;
+          case 4:  // weight bytes
+            return na.weight_bytes < nb.weight_bytes;
+          case 5:  // activation bytes
+            return na.act_bytes < nb.act_bytes;
+          case 2:  // FLOPs (default)
+          default: {
+            uint64_t fa = na.flops_known ? na.flops : 0;
+            uint64_t fb = nb.flops_known ? nb.flops : 0;
+            return fa < fb;
+          }
+        }
+      };
+      std::stable_sort(order.begin(), order.end(),
+                       [&](uint32_t a, uint32_t b) {
+                         return sort_asc ? less(a, b) : less(b, a);
+                       });
+    }
+
+    const int32_t sel = vs.selected_display;
+
+    // Virtualize: submit only the visible rows (O(visible), safe at 100k nodes).
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(order.size()));
+    while (clipper.Step()) {
+      for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+        if (r < 0 || static_cast<size_t>(r) >= order.size()) continue;
+        const uint32_t ni = order[static_cast<size_t>(r)];
+        if (ni >= row_count) continue;  // defensive bounds check
+        const ir::Node& node = g.nodes[ni];
+        const NodeCost& nc = report->per_node[ni];
+
+        ImGui::TableNextRow();
+        ImGui::PushID(static_cast<int>(ni));
+
+        // Column 0 (op): a row-spanning selectable — click flies the camera.
+        ImGui::TableSetColumnIndex(0);
+        std::string op(model->str(node.op_type));
+        if (op.empty()) op = "(op?)";
+        bool selected = (sel >= 0) &&
+                        (panel_detail::display_index_for_node(collapse, ni) == sel);
+        if (ImGui::Selectable(op.c_str(), selected,
+                              ImGuiSelectableFlags_SpanAllColumns)) {
+          nav_jump_to_ir_node(app, ni);
+        }
+
+        ImGui::TableSetColumnIndex(1);
+        std::string nm(model->str(node.name));
+        ImGui::TextUnformatted(nm.empty() ? "(anon)" : nm.c_str());
+
+        ImGui::TableSetColumnIndex(2);
+        if (nc.flops_known)
+          ImGui::TextUnformatted(human_flops(nc.flops).c_str());
+        else
+          ImGui::TextDisabled("?");
+
+        ImGui::TableSetColumnIndex(3);
+        ImGui::TextUnformatted(
+            grouped_count(static_cast<int64_t>(nc.params)).c_str());
+
+        ImGui::TableSetColumnIndex(4);
+        ImGui::TextUnformatted(human_bytes(nc.weight_bytes).c_str());
+
+        ImGui::TableSetColumnIndex(5);
+        ImGui::TextUnformatted(human_bytes(nc.act_bytes).c_str());
+
+        ImGui::PopID();
+      }
+    }
+    ImGui::EndTable();
+  }
 }
 
 // Build the tab-separated "copy summary" text: model totals + quant table.
