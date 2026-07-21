@@ -128,6 +128,17 @@ std::string format_metric_value(double v, HeatmapMetric m) {
   return human_flops(static_cast<uint64_t>(v));
 }
 
+// Format a roofline latency (SECONDS from estimate_latency_s) as milliseconds
+// with ~3 significant figures. A negative input is the kLatencyUnknown sentinel
+// -> "(unknown)" (honest, never a fabricated 0). Deterministic.
+std::string format_latency_ms(double seconds) {
+  if (seconds < 0.0) return "(unknown)";  // kLatencyUnknown
+  double ms = seconds * 1000.0;
+  char buf[48];
+  std::snprintf(buf, sizeof(buf), "%.3g ms", ms);
+  return buf;
+}
+
 // Human label for a roofline preset (the ridge presets are datasheet estimates,
 // not measurements — the panel labels the whole roofline "approximate").
 const char* roofline_preset_name(RooflinePreset p) {
@@ -539,6 +550,40 @@ void draw_cost_section(App& app) {
       ImGui::SetTooltip(
           "Approximate: node intensity vs the ridge FLOP/byte of the selected "
           "machine balance (datasheet estimates, not measurements).");
+
+    // Roofline latency ESTIMATE (issue #23), driven by the SAME roof_preset.
+    // time = max(flops / peak_flops, bytes_moved / bandwidth). Order-of-magnitude
+    // only — datasheet peaks, not a measurement.
+    ImGui::Separator();
+    double model_lat = estimate_model_latency_s(*report, roof_preset);
+    ImGui::Text("Est. latency (model): %s",
+                format_latency_ms(model_lat).c_str());
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "ORDER-OF-MAGNITUDE estimate: max(known FLOPs / peak FLOP/s, bytes "
+          "moved / bandwidth) at the selected machine balance. Derived from "
+          "datasheet peaks, NOT a measurement — expect optimism vs. a real run.");
+
+    // If a node/group is selected, estimate its latency too (mirror the selected
+    // NodeCost obtained above via sum_node_costs).
+    if (has_selection) {
+      std::vector<uint32_t> sel_nodes;
+      ir_nodes_for_display(s, sel, sel_nodes);
+      if (!sel_nodes.empty()) {
+        NodeCost sel_nc = sum_node_costs(*report, sel_nodes);
+        // Gate on knownness: an unknown-FLOPs selection has no honest estimate.
+        double sel_lat = sel_nc.flops_known
+                             ? estimate_latency_s(sel_nc.flops,
+                                                  sel_nc.bytes_moved(), roof_preset)
+                             : kLatencyUnknown;
+        ImGui::Text("Est. latency (selected): %s",
+                    format_latency_ms(sel_lat).c_str());
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip(
+              "ORDER-OF-MAGNITUDE estimate for the selected node/group at the "
+              "selected machine balance. Datasheet peaks, not a measurement.");
+      }
+    }
   }
 
   // --- Cost by op category (graph-mode only) ----------------------------------
@@ -980,6 +1025,19 @@ static std::string cost_summary_text(App& app, const CostReport& report) {
   std::snprintf(line, sizeof(line), "peak activation bytes\t%llu\n",
                 static_cast<unsigned long long>(report.peak_activation_bytes));
   out += line;
+  // Roofline latency ESTIMATE (issue #23) at the Generic machine-balance preset;
+  // note the preset in the label so the copied number is unambiguous. Order-of-
+  // magnitude only (datasheet peaks, not a measurement).
+  if (report.from_graph) {
+    double lat = estimate_model_latency_s(report, RooflinePreset::Generic);
+    if (lat < 0.0) {
+      out += "est latency (ms) [Generic]\t(unknown)\n";
+    } else {
+      std::snprintf(line, sizeof(line), "est latency (ms) [Generic]\t%.3g\n",
+                    lat * 1000.0);
+      out += line;
+    }
+  }
   std::snprintf(line, sizeof(line), "effective bits/param\t%.3f\n",
                 report.effective_bits_per_param());
   out += line;
