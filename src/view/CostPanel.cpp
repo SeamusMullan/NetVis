@@ -424,6 +424,85 @@ void draw_cost_section(App& app) {
     }
   }
 
+  // --- Activation memory timeline (#28) ---------------------------------------
+  // The full liveness curve behind peak_activation_bytes: resident activation
+  // bytes at each node's high-water point in exec (topological) order. Graph-mode
+  // only; skipped when the curve is empty (table mode / no nodes). Recomputed per
+  // frame — cheap O(V+E) for modest graphs; huge graphs are DOWNSAMPLED for the
+  // plotted array only (the true peak + peak-node index still come from the full
+  // curve). max(curve) == peak_activation_bytes by construction (engine invariant).
+  if (report->from_graph) {
+    std::vector<uint64_t> curve =
+        activation_liveness_curve(*model, s.current_graph());
+    if (!curve.empty()) {
+      ImGui::SeparatorText("Activation memory timeline");
+
+      // True peak + its node index from the FULL curve (before any downsample).
+      uint64_t peak_bytes = 0;
+      size_t peak_node = 0;
+      for (size_t i = 0; i < curve.size(); ++i) {
+        if (curve[i] > peak_bytes) {
+          peak_bytes = curve[i];
+          peak_node = i;
+        }
+      }
+      const double kMB = 1024.0 * 1024.0;
+      auto to_mb = [kMB](uint64_t bytes) -> float {
+        return static_cast<float>(static_cast<double>(bytes) / kMB);
+      };
+
+      // Build the plotted float array (in MB). For very large graphs, downsample
+      // to ~kMaxPlotPoints buckets, taking the MAX live-bytes within each bucket so
+      // the visual peak is preserved (never averaged away). Small graphs plot 1:1.
+      constexpr size_t kDownsampleThreshold = 20000;
+      constexpr size_t kMaxPlotPoints = 2000;
+      std::vector<float> plot;
+      bool downsampled = false;
+      if (curve.size() > kDownsampleThreshold) {
+        downsampled = true;
+        plot.reserve(kMaxPlotPoints);
+        // Ceil-divide the node count into kMaxPlotPoints buckets; each plotted
+        // point is the bucket's max (guards against hiding the peak).
+        const size_t bucket = (curve.size() + kMaxPlotPoints - 1) / kMaxPlotPoints;
+        for (size_t start = 0; start < curve.size(); start += bucket) {
+          uint64_t bmax = 0;
+          for (size_t j = start; j < start + bucket && j < curve.size(); ++j) {
+            if (curve[j] > bmax) bmax = curve[j];
+          }
+          plot.push_back(to_mb(bmax));
+        }
+      } else {
+        plot.reserve(curve.size());
+        for (uint64_t v : curve) plot.push_back(to_mb(v));
+      }
+
+      const float peak_mb = to_mb(peak_bytes);
+      // scale_max = peak so the curve fills the plot height; a hair of headroom
+      // keeps the peak from clipping exactly at the top edge.
+      const float scale_max = (peak_mb > 0.0f) ? peak_mb * 1.02f : 1.0f;
+      ImGui::PlotLines("##act_liveness", plot.data(),
+                       static_cast<int>(plot.size()), 0, nullptr, 0.0f,
+                       scale_max, ImVec2(0.0f, 60.0f));
+
+      ImGui::Text("peak %s (%.2f MB) at node %zu of %zu",
+                  human_bytes(peak_bytes).c_str(), peak_mb, peak_node,
+                  curve.size());
+      // Estimate note: pure over shapes, unresolved shapes contribute 0.
+      ImGui::SameLine();
+      ImGui::TextDisabled("(?)");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Estimate from ValueInfo shapes/dtypes (no tensor payloads read).\n"
+            "Live activation bytes at each node in execution order; unresolved\n"
+            "shapes contribute 0. Curve max equals the reported peak activations.");
+      }
+      if (downsampled) {
+        ImGui::TextDisabled("(plot downsampled to %d buckets; peak is exact)",
+                            static_cast<int>(plot.size()));
+      }
+    }
+  }
+
   // --- Efficiency / roofline (approximate) ------------------------------------
   if (report->from_graph && report->nodes_flops_known > 0) {
     ImGui::SeparatorText("Efficiency (approximate)");

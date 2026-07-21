@@ -1266,3 +1266,117 @@ TEST_CASE("Cost: metric_value ArithIntensity clamps saturated flops (no UB)") {
   CHECK(ai.known);
   CHECK(ai.value == UINT64_MAX);
 }
+
+// =============================================================================
+//  #28 — activation-memory / liveness timeline curve over exec order.
+//  The curve is the FULL walk behind the single peak_activation_bytes scalar:
+//  live activation bytes at each node's high-water (post-outputs, pre-frees)
+//  point. Its max MUST equal peak_activation_bytes by construction.
+// =============================================================================
+
+TEST_CASE("Cost: liveness curve size + max equals peak (pre-free high-water)") {
+  // Same graph as "Peak activation with multiple consumers": the peak (1600) is
+  // reached at node 2 BEFORE b,c are freed. This graph specifically distinguishes
+  // the correct pre-free sample (1600) from a wrong post-free sample (800), so it
+  // proves max(curve) == peak is the true high-water, not the residual.
+  // start = a(400)+c(400) = 800.
+  //   Node0 Relu: +b -> 1200 (curve[0]); free a -> 800.
+  //   Node1 Add:  +d -> 1200 (curve[1]); nothing freed (b,c live to node2).
+  //   Node2 Mul:  +e -> 1600 (curve[2]); free b,c -> 800.
+  // curve = {1200,1200,1600}, max = 1600 = peak.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::F32, {100});
+  uint32_t b = add_value(m, g, "b", ir::DType::F32, {100});
+  uint32_t c = add_value(m, g, "c", ir::DType::F32, {100});
+  uint32_t d = add_value(m, g, "d", ir::DType::F32, {100});
+  uint32_t e = add_value(m, g, "e", ir::DType::F32, {100});
+  g.graph_inputs.push_back(a);
+  g.graph_inputs.push_back(c);
+  g.graph_outputs.push_back(d);
+  g.graph_outputs.push_back(e);
+  add_node(m, g, "Relu", {a}, {b});    // node 0
+  add_node(m, g, "Add", {b, c}, {d});  // node 1
+  add_node(m, g, "Mul", {b, c}, {e});  // node 2
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+  std::vector<uint64_t> curve = activation_liveness_curve(m, 0);
+
+  // One point per node, in node index order.
+  REQUIRE(curve.size() == g.nodes.size());
+  CHECK(curve.size() == 3);
+  CHECK(curve[0] == 1200);  // 3 * 400
+  CHECK(curve[1] == 1200);
+  CHECK(curve[2] == 1600);  // 4 * 400 (pre-free high-water)
+
+  // The key invariant: max of the curve == the existing scalar peak.
+  uint64_t max_v = *std::max_element(curve.begin(), curve.end());
+  CHECK(max_v == r.peak_activation_bytes);
+  CHECK(r.peak_activation_bytes == 4 * 400);  // 1600
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("Cost: liveness curve — unresolved shape contributes 0, no crash") {
+  // b has a dynamic dim (-1) -> value_bytes(b) == 0, so producing it adds nothing.
+  // a[10] fp32 = 40 bytes (graph input). c[10] fp32 = 40 bytes (graph output).
+  //   Node0 Op1(a->b): +b(0) -> live=40 (curve[0]=40); free a -> 0.
+  //   Node1 Op2(b->c): +c(40) -> live=40 (curve[1]=40); b freeable but 0 bytes.
+  // Peak = 40. No underflow / crash from the 0-byte value.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::F32, {10});
+  uint32_t b = add_value(m, g, "b", ir::DType::F32, {-1, 10});  // unresolved
+  uint32_t c = add_value(m, g, "c", ir::DType::F32, {10});
+  g.graph_inputs.push_back(a);
+  g.graph_outputs.push_back(c);
+  add_node(m, g, "Relu", {a}, {b});
+  add_node(m, g, "Sqrt", {b}, {c});
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+  std::vector<uint64_t> curve = activation_liveness_curve(m, 0);
+
+  REQUIRE(curve.size() == 2);
+  CHECK(curve[0] == 40);  // a live, b(unresolved) adds 0
+  CHECK(curve[1] == 40);  // c live
+  uint64_t max_v = *std::max_element(curve.begin(), curve.end());
+  CHECK(max_v == r.peak_activation_bytes);
+  CHECK(r.peak_activation_bytes == 40);
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("Cost: liveness curve empty in table mode / out-of-range graph_index") {
+  // Table mode (has_graph=false): no compute graph -> empty curve.
+  {
+    ir::Model m;
+    m.format_name = m.intern("GGUF");
+    m.has_graph = false;
+    ByteReader::payload_read_counter() = 0;
+    std::vector<uint64_t> curve = activation_liveness_curve(m, 0);
+    CHECK(curve.empty());
+    CHECK(ByteReader::payload_read_counter() == 0);
+  }
+  // has_graph=true but graph_index out of range -> empty curve (no crash).
+  {
+    ir::Model m;
+    m.format_name = m.intern("ONNX");
+    m.has_graph = true;
+    m.graphs.emplace_back();  // only index 0 exists
+    ir::Graph& g = m.graphs[0];
+    uint32_t a = add_value(m, g, "a", ir::DType::F32, {4});
+    uint32_t o = add_value(m, g, "o", ir::DType::F32, {4});
+    add_node(m, g, "Relu", {a}, {o});
+
+    ByteReader::payload_read_counter() = 0;
+    std::vector<uint64_t> curve = activation_liveness_curve(m, 999);
+    CHECK(curve.empty());
+    CHECK(ByteReader::payload_read_counter() == 0);
+  }
+}
