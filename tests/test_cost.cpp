@@ -13,6 +13,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -1517,4 +1518,98 @@ TEST_CASE("Cost: rollup_by_category empty / table-mode report returns empty") {
   std::vector<CategoryCost> cats2 = rollup_by_category(m, 999, r);
   CHECK(cats2.empty());
   CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+// --- issue #23: roofline latency estimate --------------------------------------
+
+TEST_CASE("Cost: peak_flops_per_s positive for all presets") {
+  // All five presets must return a positive order-of-magnitude datasheet peak.
+  CHECK(peak_flops_per_s(RooflinePreset::Generic) > 0.0);
+  CHECK(peak_flops_per_s(RooflinePreset::CpuServer) > 0.0);
+  CHECK(peak_flops_per_s(RooflinePreset::GpuFp32) > 0.0);
+  CHECK(peak_flops_per_s(RooflinePreset::GpuTensor) > 0.0);
+  CHECK(peak_flops_per_s(RooflinePreset::MobileNpu) > 0.0);
+}
+
+TEST_CASE("Cost: bandwidth derived self-consistently from peak / ridge") {
+  // bandwidth_bytes_per_s == peak_flops_per_s / ridge_flop_per_byte per preset.
+  for (int i = 0; i < 5; ++i) {
+    auto p = static_cast<RooflinePreset>(i);
+    double bw = bandwidth_bytes_per_s(p);
+    CHECK(bw > 0.0);
+    double expect = peak_flops_per_s(p) / ridge_flop_per_byte(p);
+    CHECK(bw == doctest::Approx(expect));
+  }
+}
+
+TEST_CASE("Cost: estimate_latency_s is the max of the compute and memory terms") {
+  // Compute-bound: pick flops/bytes so flops/peak > bytes/bandwidth on Generic.
+  const RooflinePreset p = RooflinePreset::Generic;
+  const double peak = peak_flops_per_s(p);
+  const double bw = bandwidth_bytes_per_s(p);
+
+  // flops = peak (=> 1s compute), bytes = bw/2 (=> 0.5s memory) -> max = 1s.
+  {
+    uint64_t flops = static_cast<uint64_t>(peak);
+    uint64_t bytes = static_cast<uint64_t>(bw / 2.0);
+    double lat = estimate_latency_s(flops, bytes, p);
+    double t_c = static_cast<double>(flops) / peak;
+    double t_m = static_cast<double>(bytes) / bw;
+    CHECK(lat == doctest::Approx(std::max(t_c, t_m)));
+    CHECK(lat == doctest::Approx(t_c));  // compute-bound
+  }
+  // Memory-bound: flops = peak/4 (=> 0.25s), bytes = bw (=> 1s) -> max = 1s.
+  {
+    uint64_t flops = static_cast<uint64_t>(peak / 4.0);
+    uint64_t bytes = static_cast<uint64_t>(bw);
+    double lat = estimate_latency_s(flops, bytes, p);
+    double t_c = static_cast<double>(flops) / peak;
+    double t_m = static_cast<double>(bytes) / bw;
+    CHECK(lat == doctest::Approx(std::max(t_c, t_m)));
+    CHECK(lat == doctest::Approx(t_m));  // memory-bound
+  }
+}
+
+TEST_CASE("Cost: estimate_latency_s honest-unknown / div-by-zero guards") {
+  const RooflinePreset p = RooflinePreset::GpuTensor;
+
+  // Nothing to estimate from (flops==0 && bytes==0) -> kLatencyUnknown.
+  CHECK(estimate_latency_s(0, 0, p) == kLatencyUnknown);
+
+  // Pure-memory op (flops==0, bytes>0) -> timed by bytes alone, NOT unknown.
+  double mem_only = estimate_latency_s(0, 1024, p);
+  CHECK(mem_only > 0.0);
+  CHECK(mem_only == doctest::Approx(1024.0 / bandwidth_bytes_per_s(p)));
+
+  // Pure-compute op (flops>0, bytes==0) -> timed by flops alone, NOT unknown.
+  double compute_only = estimate_latency_s(1000000, 0, p);
+  CHECK(compute_only > 0.0);
+  CHECK(compute_only == doctest::Approx(1000000.0 / peak_flops_per_s(p)));
+}
+
+TEST_CASE("Cost: estimate_latency_s saturated UINT64_MAX bytes has no UB") {
+  // A saturated bytes_moved must be handled in double arithmetic (no integer
+  // overflow / UB) and yield a large but finite, positive latency.
+  double lat = estimate_latency_s(0, UINT64_MAX, RooflinePreset::Generic);
+  CHECK(lat > 0.0);
+  CHECK(std::isfinite(lat));
+  // And with saturated flops too.
+  double lat2 = estimate_latency_s(UINT64_MAX, UINT64_MAX, RooflinePreset::CpuServer);
+  CHECK(lat2 > 0.0);
+  CHECK(std::isfinite(lat2));
+}
+
+TEST_CASE("Cost: estimate_model_latency_s unknown when no FLOPs known") {
+  // Empty report: total_flops==0 and bytes_moved_flops_known==0 -> unknown.
+  CostReport empty;
+  CHECK(estimate_model_latency_s(empty, RooflinePreset::Generic) == kLatencyUnknown);
+
+  // A report with known totals -> a positive estimate = max(flops/peak, bytes/bw).
+  CostReport r;
+  r.total_flops = 2000000000ULL;          // 2 GFLOP
+  r.bytes_moved_flops_known = 1000000ULL;  // 1 MB
+  double lat = estimate_model_latency_s(r, RooflinePreset::GpuFp32);
+  double t_c = 2000000000.0 / peak_flops_per_s(RooflinePreset::GpuFp32);
+  double t_m = 1000000.0 / bandwidth_bytes_per_s(RooflinePreset::GpuFp32);
+  CHECK(lat == doctest::Approx(std::max(t_c, t_m)));
 }

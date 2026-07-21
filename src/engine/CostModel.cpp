@@ -903,6 +903,60 @@ RooflineSummary compute_roofline(const CostReport& report,
   return s;
 }
 
+// --- issue #23: roofline latency estimate ---------------------------------
+
+double peak_flops_per_s(RooflinePreset p) {
+  // Representative order-of-magnitude DATASHEET estimates (FLOP/s, MAC=2),
+  // chosen to sit coherently with the ridge presets — NOT measurements.
+  switch (p) {
+    case RooflinePreset::Generic:   return 10.0e12;   // ~10 TFLOP/s mixed accel
+    case RooflinePreset::CpuServer: return 1.0e12;    // ~1  TFLOP/s server CPU
+    case RooflinePreset::GpuFp32:   return 15.0e12;   // ~15 TFLOP/s desktop GPU
+    case RooflinePreset::GpuTensor: return 300.0e12;  // ~300 TFLOP/s tensor path
+    case RooflinePreset::MobileNpu: return 5.0e12;    // ~5  TFLOP/s mobile NPU
+  }
+  return 10.0e12;  // fall back to the Generic estimate
+}
+
+double bandwidth_bytes_per_s(RooflinePreset p) {
+  // Derive bandwidth from the SAME machine balance used for the roofline verdict
+  // so latency stays coherent with the ridge: byte/s = (FLOP/s) / (FLOP/byte).
+  double ridge = ridge_flop_per_byte(p);
+  if (ridge <= 0.0) return 0.0;  // defensive; presets are all > 0
+  return peak_flops_per_s(p) / ridge;
+}
+
+double estimate_latency_s(uint64_t flops, uint64_t bytes_moved, RooflinePreset p) {
+  // Nothing to estimate from -> honest unknown (never fabricate a 0-second time).
+  if (flops == 0 && bytes_moved == 0) return kLatencyUnknown;
+
+  double peak = peak_flops_per_s(p);
+  double bw = bandwidth_bytes_per_s(p);
+
+  // Each term is 0 when its numerator is 0 (a pure-memory or pure-compute op is
+  // timed by its non-zero side alone). Guard the denominators against a
+  // non-positive peak/bandwidth -> that term simply doesn't constrain the max.
+  // double arithmetic makes bytes_moved == UINT64_MAX well-defined (no UB).
+  double t_compute = 0.0;
+  if (flops > 0) {
+    if (peak <= 0.0) return kLatencyUnknown;  // can't time compute
+    t_compute = static_cast<double>(flops) / peak;
+  }
+  double t_memory = 0.0;
+  if (bytes_moved > 0) {
+    if (bw <= 0.0) return kLatencyUnknown;  // can't time memory traffic
+    t_memory = static_cast<double>(bytes_moved) / bw;
+  }
+  return t_compute > t_memory ? t_compute : t_memory;
+}
+
+double estimate_model_latency_s(const CostReport& report, RooflinePreset p) {
+  // Use the flops-known aggregates (matched numerator/denominator), mirroring
+  // overall_arithmetic_intensity. When no node has known FLOPs both are 0 and
+  // estimate_latency_s returns kLatencyUnknown.
+  return estimate_latency_s(report.total_flops, report.bytes_moved_flops_known, p);
+}
+
 MetricValue metric_value(const NodeCost& nc, HeatmapMetric m) {
   switch (m) {
     case HeatmapMetric::Flops:

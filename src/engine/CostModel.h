@@ -184,6 +184,56 @@ RooflineClass classify_node(const NodeCost& nc, double ridge_flop_per_byte);
 // again with ridge_flop_per_byte(preset) at draw time without rebuilding the report.
 RooflineSummary compute_roofline(const CostReport& report, double ridge_flop_per_byte);
 
+// --- issue #23: roofline-based per-node/model LATENCY estimate --------------
+// A first-order, ORDER-OF-MAGNITUDE time estimate from the roofline model:
+//   time = max(flops / peak_flops_per_s, bytes_moved / bandwidth_bytes_per_s).
+// This is NOT a measurement — it assumes perfect overlap of compute and memory
+// and a fixed datasheet peak, so it will be optimistic vs. a real run. Label it
+// an estimate in any UI. All functions are PURE over shapes/dtypes already in the
+// CostReport (zero payload reads) and never throw / never divide by zero.
+
+// Sentinel returned by estimate_latency_s when latency is UNKNOWN (no FLOPs AND
+// no bytes to estimate from, or a non-positive machine peak). Negative so callers
+// gate with `(lat < 0.0)` — a real latency is always >= 0.
+constexpr double kLatencyUnknown = -1.0;
+
+// Absolute datasheet-ESTIMATE peak compute for a preset, in FLOP/s under the
+// MAC=2 convention (a multiply-accumulate = 2 FLOPs), consistent with the ridge
+// presets and the FLOP formula table. These are representative order-of-magnitude
+// datasheet numbers, NOT measurements:
+//   Generic   ~10 TFLOP/s  (a mixed-precision accelerator, matches ridge 40)
+//   CpuServer ~1  TFLOP/s  (a many-core server CPU, fp32)
+//   GpuFp32   ~15 TFLOP/s  (a desktop GPU, fp32 lanes)
+//   GpuTensor ~300 TFLOP/s (a datacenter GPU, tensor/low-precision path)
+//   MobileNpu ~5  TFLOP/s  (a mobile NPU, low precision)
+// Always > 0; pure; never throws.
+double peak_flops_per_s(RooflinePreset p);
+
+// Peak memory bandwidth for a preset, in bytes/s. Derived SELF-CONSISTENTLY from
+// the existing machine balance so it stays coherent with the ridge used
+// everywhere else: bandwidth = peak_flops_per_s(p) / ridge_flop_per_byte(p).
+// (The ridge is FLOP/byte, so FLOP/s ÷ FLOP/byte = byte/s.) Always > 0; pure.
+double bandwidth_bytes_per_s(RooflinePreset p);
+
+// Estimate the latency (SECONDS) of a workload of `flops` FLOPs that moves
+// `bytes_moved` bytes on machine `p`, via the roofline max-of-two:
+//   max(flops / peak_flops_per_s(p), bytes_moved / bandwidth_bytes_per_s(p)).
+// CONTRACT: a term whose numerator is 0 contributes 0 (not unknown) — e.g. a
+// pure-memory op with flops==0 is timed by its bytes alone. When BOTH flops==0
+// and bytes_moved==0 there is nothing to estimate -> returns kLatencyUnknown.
+// Also returns kLatencyUnknown if the preset peak/bandwidth is non-positive
+// (defensive; the presets are always > 0). Uses double arithmetic, so a
+// saturated bytes_moved == UINT64_MAX is well-defined (no integer overflow/UB).
+// The CALLER decides whether the inputs are trustworthy (e.g. flops_known) — this
+// function only guards div-by-zero and the empty case.
+double estimate_latency_s(uint64_t flops, uint64_t bytes_moved, RooflinePreset p);
+
+// Whole-model convenience: estimate latency over the flops-known set, using
+// report.total_flops (flops-known sum) and report.bytes_moved_flops_known (the
+// matched byte denominator). Returns kLatencyUnknown when no node has known FLOPs
+// (total_flops == 0 && bytes_moved_flops_known == 0). Pure; never throws.
+double estimate_model_latency_s(const CostReport& report, RooflinePreset p);
+
 // --- v0.4.0: selectable heatmap metric extractor --------------------------
 // The SINGLE source the heatmap range, per-node tint, and legend all read, so
 // they cannot diverge (the v0.3.1 group-scale bug was exactly such a divergence).
