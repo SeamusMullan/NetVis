@@ -20,8 +20,10 @@
 #include "engine/CostModel.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -144,6 +146,37 @@ std::vector<int64_t> get_ints_attr(const ir::Model& model, const ir::Graph& g,
   return {};
 }
 
+// Read a string attribute (e.g. Einsum "equation", RNN "direction"); returns
+// default_val if the attribute is absent or not a String.
+std::string_view get_string_attr(const ir::Model& model, const ir::Graph& g,
+                                 const ir::Node& node, std::string_view attr_name,
+                                 std::string_view default_val) {
+  for (uint32_t i = 0; i < node.attributes.count; ++i) {
+    uint32_t aidx = node.attributes.begin + i;
+    if (aidx >= g.attributes.size()) continue;
+    const ir::Attribute& attr = g.attributes[aidx];
+    if (model.str(attr.name) == attr_name) {
+      if (attr.value.kind == ir::AttrValue::Kind::String) {
+        return model.str(attr.value.s);
+      }
+      return default_val;
+    }
+  }
+  return default_val;
+}
+
+// Normalize an op string for the explicit v0.4.0 handlers: strip any domain
+// prefix (keep the last dot-segment) and lowercase it. So "com.microsoft.
+// QLinearConv" -> "qlinearconv". The existing category branches still compare
+// raw strings; only the new handlers use this.
+std::string norm_op(std::string_view op) {
+  std::size_t dot = op.find_last_of('.');
+  std::string_view tail = (dot == std::string_view::npos) ? op : op.substr(dot + 1);
+  std::string out(tail);
+  for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return out;
+}
+
 // True if every declared input slot of `node` resolves to an in-range value. A
 // node with a corrupt/out-of-range input edge_ref is structurally invalid, so we
 // refuse to estimate its FLOPs (flops_known stays false) rather than guessing
@@ -188,6 +221,266 @@ void compute_flops(const ir::Model& model, const ir::Graph& g,
 
   // Structurally invalid node (corrupt input edge_ref) => refuse to estimate.
   if (!all_inputs_resolve(g, node)) return;
+
+  // --- v0.4.0 explicit op-name handlers (run FIRST, RETURN on match) ---------
+  // Matched on the NORMALIZED op string (lowercase, last dot-segment) so contrib
+  // ops like "com.microsoft.QLinearConv" route. Each sets flops/flops_known and
+  // returns; unresolved shapes / hostile dims => leave flops_known=false.
+  const std::string nop = norm_op(op);
+
+  // Einsum: constrained 2-operand resolver. macs = product over the union of all
+  // LHS labels' dims; flops = 2*macs. Empty equation OR any unsupported feature
+  // (ellipsis, multi-char/non-alpha labels, intra-operand repeat, >2 operands,
+  // rank mismatch, dim conflict, dynamic dim) => honest-unknown.
+  if (nop == "einsum") {
+    std::string_view eq = get_string_attr(model, g, node, "equation", "");
+    if (eq.empty()) return;
+    if (eq.find('.') != std::string_view::npos) return;  // ellipsis unsupported
+    std::size_t arrow = eq.find("->");
+    std::string_view lhs = (arrow == std::string_view::npos) ? eq
+                                                             : eq.substr(0, arrow);
+    // Split LHS on ',' into (at most) two operand label strings.
+    std::string_view operands[2];
+    int nops = 0;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= lhs.size(); ++i) {
+      if (i == lhs.size() || lhs[i] == ',') {
+        if (nops >= 2) return;  // more than 2 operands
+        operands[nops++] = lhs.substr(start, i - start);
+        start = i + 1;
+      }
+    }
+    if (nops != 2) return;
+    std::unordered_map<char, int64_t> dims;  // union of all LHS labels -> dim
+    for (int o = 0; o < 2; ++o) {
+      const ir::ValueInfo* in = get_input_value(g, node, static_cast<uint32_t>(o));
+      if (!in) return;
+      std::string_view labels = operands[o];
+      if (labels.size() != in->shape.size()) return;  // label-count != rank
+      for (std::size_t a = 0; a < labels.size(); ++a) {
+        char c = labels[a];
+        if (!std::isalpha(static_cast<unsigned char>(c))) return;
+        for (std::size_t b = a + 1; b < labels.size(); ++b) {
+          if (labels[b] == c) return;  // intra-operand repeat unsupported
+        }
+        int64_t d = in->shape[a];
+        if (d < 1) return;  // dynamic/unresolved dim
+        auto it = dims.find(c);
+        if (it == dims.end()) dims[c] = d;
+        else if (it->second != d) return;  // shared-label dim conflict
+      }
+    }
+    uint64_t macs = 1;
+    for (const auto& [c, d] : dims) macs = safe_mul(macs, static_cast<uint64_t>(d));
+    nc.flops = safe_mul(macs, 2);
+    nc.flops_known = true;
+    return;
+  }
+
+  // Attention (fused com.microsoft.Attention): input[0]=[B,S,input_hidden],
+  // weights=input[1]=[input_hidden, proj_out] (QKV packed => proj_out%3==0).
+  // macs = B*S*input_hidden*proj_out (QKV proj) + 2*B*S*S*v_hidden (QK^T + PV),
+  // v_hidden = proj_out/3; flops = 2*macs.
+  if (nop == "attention") {
+    const ir::ValueInfo* in0 = get_input_value(g, node, 0);
+    const ir::ValueInfo* w = get_input_value(g, node, 1);
+    if (!in0 || !w) return;
+    if (in0->shape.size() != 3 || w->shape.size() != 2) return;
+    int64_t B = in0->shape[0], S = in0->shape[1], in_hidden = in0->shape[2];
+    int64_t proj_out = w->shape[1];
+    if (B < 1 || S < 1 || in_hidden < 1 || proj_out < 1) return;
+    if (proj_out % 3 != 0) return;  // no coherent QKV split => honest-unknown
+    uint64_t v_hidden = static_cast<uint64_t>(proj_out) / 3;
+    uint64_t proj_macs = safe_mul(static_cast<uint64_t>(B), static_cast<uint64_t>(S));
+    proj_macs = safe_mul(proj_macs, static_cast<uint64_t>(in_hidden));
+    proj_macs = safe_mul(proj_macs, static_cast<uint64_t>(proj_out));
+    uint64_t core_macs = safe_mul(2, static_cast<uint64_t>(B));
+    core_macs = safe_mul(core_macs, static_cast<uint64_t>(S));
+    core_macs = safe_mul(core_macs, static_cast<uint64_t>(S));
+    core_macs = safe_mul(core_macs, v_hidden);
+    uint64_t macs = safe_add(proj_macs, core_macs);
+    nc.flops = safe_mul(macs, 2);
+    nc.flops_known = true;
+    return;
+  }
+
+  // MultiHeadAttention (pre-projected): query=input[0], key=input[1]. hidden_q
+  // from query rank3 shape[2] or rank4 [B,S,H,d] shape[2]*shape[3]; S_kv from key
+  // rank3 shape[1] else S_q. macs = 2*B*S_q*S_kv*hidden_q; flops = 2*macs (head
+  // dim cancels because inputs are already projected).
+  if (nop == "multiheadattention") {
+    const ir::ValueInfo* q = get_input_value(g, node, 0);
+    if (!q) return;
+    int64_t B, S_q, hidden_q;
+    if (q->shape.size() == 3) {
+      B = q->shape[0];
+      S_q = q->shape[1];
+      hidden_q = q->shape[2];
+    } else if (q->shape.size() == 4) {
+      B = q->shape[0];
+      S_q = q->shape[1];
+      int64_t H = q->shape[2], d = q->shape[3];
+      if (H < 1 || d < 1) return;
+      hidden_q = static_cast<int64_t>(safe_mul(static_cast<uint64_t>(H),
+                                               static_cast<uint64_t>(d)));
+    } else {
+      return;  // query rank not in {3,4}
+    }
+    if (B < 1 || S_q < 1 || hidden_q < 1) return;
+    int64_t S_kv = S_q;  // self-attention fallback
+    const ir::ValueInfo* k = get_input_value(g, node, 1);
+    if (k && k->shape.size() == 3 && k->shape[1] >= 1) S_kv = k->shape[1];
+    uint64_t macs = safe_mul(2, static_cast<uint64_t>(B));
+    macs = safe_mul(macs, static_cast<uint64_t>(S_q));
+    macs = safe_mul(macs, static_cast<uint64_t>(S_kv));
+    macs = safe_mul(macs, static_cast<uint64_t>(hidden_q));
+    nc.flops = safe_mul(macs, 2);
+    nc.flops_known = true;
+    return;
+  }
+
+  // Recurrent LSTM/GRU/RNN: X=input[0]=[seq,batch,input_size]; gates=4/3/1.
+  // macs = seq*num_directions*batch*gates*hidden*(input_size+hidden); flops=2*macs.
+  if (nop == "lstm" || nop == "gru" || nop == "rnn") {
+    const int64_t gates = (nop == "lstm") ? 4 : (nop == "gru") ? 3 : 1;
+    const ir::ValueInfo* X = get_input_value(g, node, 0);
+    if (!X || X->shape.size() != 3) return;
+    int64_t seq = X->shape[0], batch = X->shape[1], input_size = X->shape[2];
+    if (seq < 1 || batch < 1 || input_size < 1) return;  // dynamic seq common
+
+    const ir::ValueInfo* W = get_input_value(g, node, 1);
+    const ir::ValueInfo* R = get_input_value(g, node, 2);
+
+    // num_directions: direction attr, else W.shape[0] (rank3), else 1.
+    int64_t num_dir;
+    std::string_view dir = get_string_attr(model, g, node, "direction", "");
+    if (dir == "bidirectional") {
+      num_dir = 2;
+    } else if (W && W->shape.size() == 3 && W->shape[0] >= 1) {
+      num_dir = W->shape[0];
+    } else {
+      num_dir = 1;
+    }
+
+    // hidden: hidden_size attr if >0, else R.shape[2] (rank3), else W.shape[1]/gates.
+    int64_t hidden = get_int_attr(model, g, node, "hidden_size", 0);
+    if (hidden <= 0) {
+      if (R && R->shape.size() == 3 && R->shape[2] >= 1) {
+        hidden = R->shape[2];
+      } else if (W && W->shape.size() >= 2 && W->shape[1] >= 1) {
+        hidden = W->shape[1] / gates;
+      }
+    }
+    if (hidden < 1) return;  // unresolvable hidden
+
+    uint64_t inp_plus_hidden = safe_add(static_cast<uint64_t>(input_size),
+                                        static_cast<uint64_t>(hidden));
+    uint64_t macs = safe_mul(static_cast<uint64_t>(seq),
+                             static_cast<uint64_t>(num_dir));
+    macs = safe_mul(macs, static_cast<uint64_t>(batch));
+    macs = safe_mul(macs, static_cast<uint64_t>(gates));
+    macs = safe_mul(macs, static_cast<uint64_t>(hidden));
+    macs = safe_mul(macs, inp_plus_hidden);
+    nc.flops = safe_mul(macs, 2);
+    nc.flops_known = true;
+    return;
+  }
+
+  // QLinearConv (weight=in[3]) / ConvInteger (weight=in[1]): Conv math over
+  // output[0]. macs = |O| * weight.shape[1] * prod(weight.shape[2..]); flops=2*macs.
+  if (nop == "qlinearconv" || nop == "convinteger") {
+    uint32_t wslot = (nop == "qlinearconv") ? 3 : 1;
+    const ir::ValueInfo* weight = get_input_value(g, node, wslot);
+    const ir::ValueInfo* out = get_output_value(g, node, 0);
+    if (!weight || !out || weight->shape.size() < 3) return;
+    int64_t chan_per_g = weight->shape[1];
+    if (chan_per_g < 1) return;
+    uint64_t kernel_prod = partial_shape_product(
+        weight->shape, 2, static_cast<uint32_t>(weight->shape.size() - 2));
+    if (kernel_prod == 0) return;
+    uint64_t out_elems = elem_count_from_shape(out->shape);
+    if (out_elems == 0) return;
+    uint64_t macs = safe_mul(out_elems, static_cast<uint64_t>(chan_per_g));
+    macs = safe_mul(macs, kernel_prod);
+    nc.flops = safe_mul(macs, 2);
+    nc.flops_known = true;
+    return;
+  }
+
+  // QLinearMatMul (A=in[0],B=in[3]) / MatMulInteger (A=in[0],B=in[1]) / QGemm
+  // (A=in[0],B=in[3], K respects transA). macs = |O| * K (K from A); flops=2*macs.
+  if (nop == "qlinearmatmul" || nop == "matmulinteger" || nop == "qgemm") {
+    const ir::ValueInfo* A = get_input_value(g, node, 0);
+    const ir::ValueInfo* out = get_output_value(g, node, 0);
+    if (!A || !out || A->shape.empty()) return;
+    int64_t K;
+    if (nop == "qgemm") {
+      if (A->shape.size() < 2) return;  // Gemm operands are 2D
+      int64_t transA = get_int_attr(model, g, node, "transA", 0);
+      K = (transA != 0) ? A->shape[0] : A->shape.back();
+    } else {
+      K = A->shape.back();
+    }
+    if (K < 1) return;
+    uint64_t out_elems = elem_count_from_shape(out->shape);
+    if (out_elems == 0) return;
+    uint64_t macs = safe_mul(out_elems, static_cast<uint64_t>(K));
+    nc.flops = safe_mul(macs, 2);
+    nc.flops_known = true;
+    return;
+  }
+
+  // QLinearAdd / QLinearMul: elementwise => |O|.
+  if (nop == "qlinearadd" || nop == "qlinearmul") {
+    const ir::ValueInfo* out = get_output_value(g, node, 0);
+    if (!out) return;
+    uint64_t e = elem_count_from_shape(out->shape);
+    if (e == 0) return;
+    nc.flops = e;
+    nc.flops_known = true;
+    return;
+  }
+
+  // QLinearGlobalAveragePool: one pass over input => |input0|.
+  if (nop == "qlinearglobalaveragepool") {
+    const ir::ValueInfo* in0 = get_input_value(g, node, 0);
+    if (!in0) return;
+    uint64_t e = elem_count_from_shape(in0->shape);
+    if (e == 0) return;
+    nc.flops = e;
+    nc.flops_known = true;
+    return;
+  }
+
+  // QLinearAveragePool: |O| * prod(kernel_shape).
+  if (nop == "qlinearaveragepool") {
+    const ir::ValueInfo* out = get_output_value(g, node, 0);
+    if (!out) return;
+    uint64_t out_elems = elem_count_from_shape(out->shape);
+    if (out_elems == 0) return;
+    std::vector<int64_t> kernel = get_ints_attr(model, g, node, "kernel_shape");
+    if (kernel.empty()) return;
+    uint64_t kernel_prod = 1;
+    for (int64_t k : kernel) {
+      if (k < 1) return;
+      kernel_prod = safe_mul(kernel_prod, static_cast<uint64_t>(k));
+    }
+    nc.flops = safe_mul(out_elems, kernel_prod);
+    nc.flops_known = true;
+    return;
+  }
+
+  // QuantizeLinear / DequantizeLinear / DynamicQuantizeLinear: pointwise => |O|.
+  if (nop == "quantizelinear" || nop == "dequantizelinear" ||
+      nop == "dynamicquantizelinear") {
+    const ir::ValueInfo* out = get_output_value(g, node, 0);
+    if (!out) return;
+    uint64_t e = elem_count_from_shape(out->shape);
+    if (e == 0) return;
+    nc.flops = e;
+    nc.flops_known = true;
+    return;
+  }
 
   // MatMul: macs = |O| * K, K = last dim of input[0]. Einsum shares the MatMul
   // category (for coloring) but its FLOPs depend on the contraction pattern in
@@ -339,6 +632,22 @@ void compute_act_bytes(const ir::Graph& g, const ir::Node& node, NodeCost& nc) {
   }
 }
 
+// Compute input_act_bytes = sum over the node's INPUT values that are NOT graph
+// initializers (weights) of elem_count * dtype_size. Weight inputs are covered by
+// weight_bytes; this is the activation-read term of bytes_moved(). Mirrors
+// compute_act_bytes but over input slots.
+void compute_input_act_bytes(
+    const ir::Graph& g, const ir::Node& node,
+    const std::unordered_map<StringId, uint32_t, StringIdHash>& init_idx,
+    NodeCost& nc) {
+  for (uint32_t slot = 0; slot < node.inputs.count; ++slot) {
+    const ir::ValueInfo* vi = get_input_value(g, node, slot);
+    if (!vi) continue;
+    if (init_idx.find(vi->name) != init_idx.end()) continue;  // weight -> weight_bytes
+    nc.input_act_bytes = safe_add(nc.input_act_bytes, value_bytes(*vi));
+  }
+}
+
 // Compute per-node costs for all nodes in a graph. Returns per_node vector,
 // nodes_flops_known count, and totals for flops/params/weight_bytes.
 struct GraphCostSummary {
@@ -363,6 +672,7 @@ GraphCostSummary compute_graph_costs(const ir::Model& model, const ir::Graph& g)
     compute_flops(model, g, node, nc);
     compute_params(g, node, init_idx, nc);
     compute_act_bytes(g, node, nc);
+    compute_input_act_bytes(g, node, init_idx, nc);
 
     if (nc.flops_known) {
       summary.total_flops = safe_add(summary.total_flops, nc.flops);
@@ -528,6 +838,76 @@ CostReport build_table_report(const ir::Model& model) {
 
 }  // namespace
 
+// --- v0.4.0: roofline / efficiency free functions -------------------------
+
+// Saturating denominator (both buckets can reach UINT64_MAX -> a raw add would
+// wrap and yield a >100% fraction). Guard 0 -> 0.0.
+double RooflineSummary::compute_bound_fraction() const {
+  uint64_t denom = safe_add(compute_bound_flops, memory_bound_flops);
+  if (denom == 0) return 0.0;
+  return static_cast<double>(compute_bound_flops) / static_cast<double>(denom);
+}
+
+double ridge_flop_per_byte(RooflinePreset p) {
+  switch (p) {
+    case RooflinePreset::Generic:   return 40.0;
+    case RooflinePreset::CpuServer: return 8.0;
+    case RooflinePreset::GpuFp32:   return 13.0;
+    case RooflinePreset::GpuTensor: return 200.0;
+    case RooflinePreset::MobileNpu: return 30.0;
+  }
+  return kDefaultRidgeFlopPerByte;
+}
+
+RooflineClass classify_node(const NodeCost& nc, double ridge_flop_per_byte) {
+  if (!nc.intensity_known()) return RooflineClass::Unknown;
+  double ai = nc.arithmetic_intensity();
+  // ridge itself is compute-bound (conventional).
+  return (ai >= ridge_flop_per_byte) ? RooflineClass::ComputeBound
+                                     : RooflineClass::MemoryBound;
+}
+
+RooflineSummary compute_roofline(const CostReport& report,
+                                 double ridge_flop_per_byte) {
+  RooflineSummary s;
+  s.ridge_flop_per_byte = ridge_flop_per_byte;
+  for (const NodeCost& nc : report.per_node) {
+    RooflineClass rc = classify_node(nc, ridge_flop_per_byte);
+    if (rc == RooflineClass::ComputeBound) {
+      s.compute_bound_flops = safe_add(s.compute_bound_flops, nc.flops);
+      s.compute_bound_nodes++;
+    } else if (rc == RooflineClass::MemoryBound) {
+      s.memory_bound_flops = safe_add(s.memory_bound_flops, nc.flops);
+      s.memory_bound_nodes++;
+    }
+  }
+  return s;
+}
+
+MetricValue metric_value(const NodeCost& nc, HeatmapMetric m) {
+  switch (m) {
+    case HeatmapMetric::Flops:
+      return {nc.flops, nc.flops_known};
+    case HeatmapMetric::Params:
+      return {nc.params, true};  // 0 params is a real value -> cold, not gray
+    case HeatmapMetric::ActBytes:
+      return {nc.act_bytes, nc.act_bytes != 0};  // 0 => unresolved -> honest unknown
+    case HeatmapMetric::ArithIntensity: {
+      uint64_t bm = nc.bytes_moved();
+      if (!nc.flops_known || bm == 0) return {0, false};
+      double ai = static_cast<double>(nc.flops) / static_cast<double>(bm);
+      // Clamp BEFORE the float round (flops can be UINT64_MAX from saturation;
+      // llround past LLONG_MAX is UB).
+      if (ai >= static_cast<double>(UINT64_MAX) /
+                    static_cast<double>(kArithIntensityScale)) {
+        return {UINT64_MAX, true};
+      }
+      return {static_cast<uint64_t>(ai * kArithIntensityScale + 0.5), true};
+    }
+  }
+  return {0, false};
+}
+
 // Public API: build the cost report for graphs[graph_index].
 CostReport compute_cost(const ir::Model& model, uint32_t graph_index) {
   // Table mode: has_graph == false or graph_index out of range.
@@ -558,6 +938,18 @@ CostReport compute_cost(const ir::Model& model, uint32_t graph_index) {
     report.total_weight_bytes =
         safe_add(report.total_weight_bytes, initializer_bytes(t));
   }
+
+  // v0.4.0 efficiency aggregates: total forward-pass traffic (all nodes, upper
+  // bound) and the flops-known-restricted subset (matched AI denominator).
+  for (const NodeCost& nc : report.per_node) {
+    report.total_bytes_moved = safe_add(report.total_bytes_moved, nc.bytes_moved());
+    if (nc.flops_known) {
+      report.bytes_moved_flops_known =
+          safe_add(report.bytes_moved_flops_known, nc.bytes_moved());
+    }
+  }
+  // Roofline snapshot at the default ridge (view recomputes at a selected preset).
+  report.roofline = compute_roofline(report, kDefaultRidgeFlopPerByte);
 
   // Compute peak activation liveness.
   report.peak_activation_bytes = compute_peak_activation_bytes(g);

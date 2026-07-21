@@ -77,6 +77,21 @@ void add_attr_int(ir::Model& m, ir::Graph& g, const std::string& name,
   node.attributes.count++;
 }
 
+void add_attr_str(ir::Model& m, ir::Graph& g, const std::string& name,
+                  const std::string& val) {
+  ir::Attribute a;
+  a.name = m.intern(name);
+  a.value.kind = ir::AttrValue::Kind::String;
+  a.value.s = m.intern(val);
+  uint32_t idx = static_cast<uint32_t>(g.attributes.size());
+  g.attributes.push_back(std::move(a));
+  ir::Node& node = g.nodes.back();
+  if (node.attributes.count == 0) {
+    node.attributes.begin = idx;
+  }
+  node.attributes.count++;
+}
+
 void add_attr_ints(ir::Model& m, ir::Graph& g, const std::string& name,
                    const std::vector<int64_t>& vals) {
   ir::Attribute a;
@@ -820,4 +835,434 @@ TEST_CASE("Cost: peak does not double-count a graph_input re-emitted as an outpu
   // a counted once (400) + b produced at node 1 (400). Peak = 800, not 1200.
   CHECK(r.peak_activation_bytes == 2 * 400);  // 800
   CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+// =============================================================================
+//  v0.4.0 — wider FLOP coverage (Attention / Recurrent / Quantized / gap-fill)
+//  + efficiency metrics (arithmetic intensity, roofline, metric_value).
+// =============================================================================
+
+TEST_CASE("Cost: MatMulInteger gets the same |O|*K as dense MatMul") {
+  // MatMulInteger: A=in[0], B=in[1]; macs=|O|*K, K=A.shape.back(). Identical
+  // arithmetic to a dense MatMul of the same shapes. A=[8,16], B=[16,32],
+  // out=[8,32] (I32). K=16, |O|=256, macs=4096, flops=8192.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::I8, {8, 16});
+  uint32_t b = add_value(m, g, "b", ir::DType::I8, {16, 32});
+  uint32_t out = add_value(m, g, "out", ir::DType::I32, {8, 32});
+  add_node(m, g, "MatMulInteger", {a, b}, {out});
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 2 * (8 * 32) * 16);  // 8192, same as dense MatMul
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("Cost: QLinearMatMul gets |O|*K with B at input slot 3") {
+  // QLinearMatMul inputs: a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp.
+  // A=in[0], B=in[3]. K=A.shape.back(). Same |O|*K as dense MatMul.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::U8, {8, 16});
+  uint32_t asc = add_value(m, g, "a_scale", ir::DType::F32, {1});
+  uint32_t azp = add_value(m, g, "a_zp", ir::DType::U8, {1});
+  uint32_t b = add_value(m, g, "b", ir::DType::U8, {16, 32});
+  uint32_t bsc = add_value(m, g, "b_scale", ir::DType::F32, {1});
+  uint32_t bzp = add_value(m, g, "b_zp", ir::DType::U8, {1});
+  uint32_t ysc = add_value(m, g, "y_scale", ir::DType::F32, {1});
+  uint32_t yzp = add_value(m, g, "y_zp", ir::DType::U8, {1});
+  uint32_t out = add_value(m, g, "out", ir::DType::U8, {8, 32});
+  add_node(m, g, "QLinearMatMul", {a, asc, azp, b, bsc, bzp, ysc, yzp}, {out});
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 2 * (8 * 32) * 16);  // 8192
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("Cost: QLinearConv gets a real Conv number (weight at slot 3)") {
+  // QLinearConv inputs: x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp[, bias].
+  // Weight = in[3] = [Cout, Cin/g, kh, kw]. macs = |O| * weight.shape[1] *
+  // prod(weight.shape[2..]). Same numbers as the fp32 Conv test:
+  // out [1,64,28,28], weight [64,32,3,3], group=1.
+  // |O|=50176, chan=32, kernel=9 -> macs=14450688, flops=28901376.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t x = add_value(m, g, "x", ir::DType::U8, {1, 32, 30, 30});
+  uint32_t xsc = add_value(m, g, "x_scale", ir::DType::F32, {1});
+  uint32_t xzp = add_value(m, g, "x_zp", ir::DType::U8, {1});
+  uint32_t w = add_value(m, g, "w", ir::DType::U8, {64, 32, 3, 3});
+  uint32_t wsc = add_value(m, g, "w_scale", ir::DType::F32, {1});
+  uint32_t wzp = add_value(m, g, "w_zp", ir::DType::U8, {1});
+  uint32_t ysc = add_value(m, g, "y_scale", ir::DType::F32, {1});
+  uint32_t yzp = add_value(m, g, "y_zp", ir::DType::U8, {1});
+  uint32_t out = add_value(m, g, "out", ir::DType::U8, {1, 64, 28, 28});
+  add_node(m, g, "QLinearConv", {x, xsc, xzp, w, wsc, wzp, ysc, yzp}, {out});
+  add_attr_int(m, g, "group", 1);
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  int64_t O = 1 * 64 * 28 * 28;   // 50176
+  int64_t macs = O * 32 * 9;      // 14450688
+  CHECK(r.per_node[0].flops == 2 * macs);  // 28901376
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("Cost: contrib domain prefix (com.microsoft.QLinearConv) routes") {
+  // The new handlers must normalize the op string so a domain-prefixed contrib op
+  // routes to the same handler as the bare name. Reuse the QLinearConv shapes.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t x = add_value(m, g, "x", ir::DType::U8, {1, 32, 30, 30});
+  uint32_t xsc = add_value(m, g, "x_scale", ir::DType::F32, {1});
+  uint32_t xzp = add_value(m, g, "x_zp", ir::DType::U8, {1});
+  uint32_t w = add_value(m, g, "w", ir::DType::U8, {64, 32, 3, 3});
+  uint32_t wsc = add_value(m, g, "w_scale", ir::DType::F32, {1});
+  uint32_t wzp = add_value(m, g, "w_zp", ir::DType::U8, {1});
+  uint32_t ysc = add_value(m, g, "y_scale", ir::DType::F32, {1});
+  uint32_t yzp = add_value(m, g, "y_zp", ir::DType::U8, {1});
+  uint32_t out = add_value(m, g, "out", ir::DType::U8, {1, 64, 28, 28});
+  add_node(m, g, "com.microsoft.QLinearConv",
+           {x, xsc, xzp, w, wsc, wzp, ysc, yzp}, {out});
+  add_attr_int(m, g, "group", 1);
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  int64_t macs = (1 * 64 * 28 * 28) * 32 * 9;
+  CHECK(r.per_node[0].flops == 2 * macs);
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("Cost: bidirectional LSTM counts BOTH directions (2x unidirectional)") {
+  // LSTM: X=in[0]=[seq,batch,input]; W=in[1]; R=in[2]; gates=4.
+  // hidden from hidden_size attr; num_directions=2 for direction=bidirectional.
+  // per_step_per_dir = batch*gates*hidden*(input+hidden).
+  // macs = seq*num_directions*per_step_per_dir; flops = 2*macs.
+  // seq=5, batch=2, input=8, hidden=4:
+  //   per_step_per_dir = 2*4*4*(8+4) = 384.
+  //   bidi: macs = 5*2*384 = 3840 -> flops = 7680.
+  //   uni : macs = 5*1*384 = 1920 -> flops = 3840. (bidi == 2*uni)
+  auto build_lstm = [](const std::string& direction) -> uint64_t {
+    ir::Model m;
+    m.format_name = m.intern("ONNX");
+    m.graphs.emplace_back();
+    ir::Graph& g = m.graphs[0];
+    int64_t dirs = (direction == "bidirectional") ? 2 : 1;
+    uint32_t x = add_value(m, g, "x", ir::DType::F32, {5, 2, 8});        // seq,batch,input
+    uint32_t w = add_value(m, g, "w", ir::DType::F32, {dirs, 16, 8});    // [dirs,4h,input]
+    uint32_t rr = add_value(m, g, "r", ir::DType::F32, {dirs, 16, 4});  // [dirs,4h,hidden]
+    uint32_t y = add_value(m, g, "y", ir::DType::F32, {5, dirs, 2, 4});
+    add_node(m, g, "LSTM", {x, w, rr}, {y});
+    add_attr_int(m, g, "hidden_size", 4);
+    add_attr_str(m, g, "direction", direction);
+    CostReport r = compute_cost(m, 0);
+    REQUIRE(r.per_node.size() == 1);
+    CHECK(r.per_node[0].flops_known);
+    return r.per_node[0].flops;
+  };
+
+  uint64_t uni = build_lstm("forward");
+  uint64_t bidi = build_lstm("bidirectional");
+  int64_t per_step_per_dir = 2 * 4 * 4 * (8 + 4);  // 384
+  CHECK(uni == static_cast<uint64_t>(2 * (5 * 1 * per_step_per_dir)));   // 3840
+  CHECK(bidi == static_cast<uint64_t>(2 * (5 * 2 * per_step_per_dir)));  // 7680
+  CHECK(bidi == 2 * uni);
+}
+
+TEST_CASE("Cost: LSTM with dynamic seq stays honestly unknown") {
+  // A dynamic sequence length (-1 in X's seq dim) is unresolvable -> flops_known
+  // must be false (never fabricated).
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t x = add_value(m, g, "x", ir::DType::F32, {-1, 2, 8});  // dynamic seq
+  uint32_t w = add_value(m, g, "w", ir::DType::F32, {1, 16, 8});
+  uint32_t rr = add_value(m, g, "r", ir::DType::F32, {1, 16, 4});
+  uint32_t y = add_value(m, g, "y", ir::DType::F32, {});
+  add_node(m, g, "LSTM", {x, w, rr}, {y});
+  add_attr_int(m, g, "hidden_size", 4);
+  add_attr_str(m, g, "direction", "forward");
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK_FALSE(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 0);
+}
+
+TEST_CASE("Cost: fused Attention uses proj_out/3 for the core term") {
+  // Attention: input[0]=[B,S,input_hidden], weights=input[1]=[input_hidden,proj_out].
+  // proj_out = weights.back(); v_hidden = proj_out/3 (require %3==0).
+  // proj_MACs = B*S*input_hidden*proj_out; core_MACs = 2*B*S*S*v_hidden.
+  // macs = proj + core; flops = 2*macs.
+  // B=1,S=4,input_hidden=8,proj_out=24 -> v_hidden=8.
+  //   proj = 1*4*8*24 = 768; core = 2*1*4*4*8 = 256; macs=1024; flops=2048.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in0 = add_value(m, g, "in0", ir::DType::F32, {1, 4, 8});   // [B,S,in_hidden]
+  uint32_t wt = add_value(m, g, "wt", ir::DType::F32, {8, 24});       // [in_hidden,proj_out]
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {1, 4, 8});
+  add_node(m, g, "com.microsoft.Attention", {in0, wt}, {out});
+
+  ByteReader::payload_read_counter() = 0;
+  CostReport r = compute_cost(m, 0);
+
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  int64_t proj = 1 * 4 * 8 * 24;  // 768
+  int64_t core = 2 * 1 * 4 * 4 * 8;  // 256 (v_hidden = 24/3 = 8)
+  CHECK(r.per_node[0].flops == static_cast<uint64_t>(2 * (proj + core)));  // 2048
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("Cost: Attention with proj_out not divisible by 3 is honest-unknown") {
+  // proj_out = 25 is not divisible by 3 -> no coherent v_hidden -> flops_known=false.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in0 = add_value(m, g, "in0", ir::DType::F32, {1, 4, 8});
+  uint32_t wt = add_value(m, g, "wt", ir::DType::F32, {8, 25});  // proj_out=25
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {1, 4, 8});
+  add_node(m, g, "com.microsoft.Attention", {in0, wt}, {out});
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK_FALSE(r.per_node[0].flops_known);
+}
+
+TEST_CASE("Cost: gap-fill Erf gets |O| (elementwise)") {
+  // Erf is in the Elementwise category -> generic |O| fallback (no compute_flops
+  // edit). [10] -> flops = 10.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::F32, {10});
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {10});
+  add_node(m, g, "Erf", {a}, {out});
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 10);
+}
+
+TEST_CASE("Cost: gap-fill ReduceL2 gets |input0|") {
+  // ReduceL2 is in the Reduce category -> flops = |input[0]|. [4,8] -> 32.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t inp = add_value(m, g, "inp", ir::DType::F32, {4, 8});
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {4});
+  add_node(m, g, "ReduceL2", {inp}, {out});
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 4 * 8);  // 32
+}
+
+TEST_CASE("Cost: unhandled quant op with no formula stays flops_known=false") {
+  // MatMulNBits is out-of-scope for v0.4.0 (no explicit handler, not in a generic
+  // category) -> honest unknown, never fabricated.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t a = add_value(m, g, "a", ir::DType::F32, {8, 16});
+  uint32_t b = add_value(m, g, "b", ir::DType::U8, {16, 32});
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {8, 32});
+  add_node(m, g, "com.microsoft.MatMulNBits", {a, b}, {out});
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK_FALSE(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 0);
+}
+
+// --- efficiency: arithmetic intensity / roofline / metric_value ---------------
+
+TEST_CASE("Cost: NodeCost::arithmetic_intensity = flops / bytes_moved") {
+  NodeCost nc;
+  nc.flops = 1000;
+  nc.flops_known = true;
+  nc.weight_bytes = 60;
+  nc.input_act_bytes = 20;
+  nc.act_bytes = 20;  // bytes_moved = 100
+  CHECK(nc.bytes_moved() == 100);
+  CHECK(nc.intensity_known());
+  CHECK(nc.arithmetic_intensity() == doctest::Approx(10.0));
+
+  // Flops-unknown node: intensity undefined -> intensity_known()==false.
+  NodeCost unknown;
+  unknown.flops_known = false;
+  unknown.weight_bytes = 100;
+  CHECK_FALSE(unknown.intensity_known());
+  CHECK(unknown.arithmetic_intensity() == 0.0);
+
+  // Known flops but zero bytes moved -> intensity undefined too.
+  NodeCost nobytes;
+  nobytes.flops = 1000;
+  nobytes.flops_known = true;
+  CHECK(nobytes.bytes_moved() == 0);
+  CHECK_FALSE(nobytes.intensity_known());
+}
+
+TEST_CASE("Cost: classify_node and compute_roofline") {
+  // High-AI node: flops=10000 over 10 bytes -> AI=1000 >= ridge 40 -> ComputeBound.
+  NodeCost hi;
+  hi.flops = 10000;
+  hi.flops_known = true;
+  hi.weight_bytes = 10;  // bytes_moved = 10, AI = 1000
+  // Low-AI node: flops=10 over 1000 bytes -> AI=0.01 -> MemoryBound.
+  NodeCost lo;
+  lo.flops = 10;
+  lo.flops_known = true;
+  lo.act_bytes = 1000;  // AI = 0.01
+  // Flops-unknown node -> Unknown (never forced into a bucket).
+  NodeCost unk;
+  unk.flops_known = false;
+  unk.weight_bytes = 500;
+
+  const double ridge = kDefaultRidgeFlopPerByte;  // 40
+  CHECK(classify_node(hi, ridge) == RooflineClass::ComputeBound);
+  CHECK(classify_node(lo, ridge) == RooflineClass::MemoryBound);
+  CHECK(classify_node(unk, ridge) == RooflineClass::Unknown);
+
+  CostReport report;
+  report.per_node = {hi, lo, unk};
+  RooflineSummary rs = compute_roofline(report, ridge);
+  CHECK(rs.compute_bound_nodes == 1);
+  CHECK(rs.memory_bound_nodes == 1);
+  CHECK(rs.compute_bound_flops == 10000);
+  CHECK(rs.memory_bound_flops == 10);
+  double frac = rs.compute_bound_fraction();
+  CHECK(frac >= 0.0);
+  CHECK(frac <= 1.0);
+  CHECK(frac == doctest::Approx(10000.0 / (10000.0 + 10.0)));
+}
+
+TEST_CASE("Cost: compute_bound_fraction guards div-by-zero -> 0.0") {
+  RooflineSummary rs;  // both buckets zero
+  CHECK(rs.compute_bound_fraction() == 0.0);
+}
+
+TEST_CASE("Cost: ridge_flop_per_byte presets") {
+  CHECK(ridge_flop_per_byte(RooflinePreset::Generic) == doctest::Approx(40.0));
+  CHECK(ridge_flop_per_byte(RooflinePreset::CpuServer) == doctest::Approx(8.0));
+  CHECK(ridge_flop_per_byte(RooflinePreset::GpuFp32) == doctest::Approx(13.0));
+  CHECK(ridge_flop_per_byte(RooflinePreset::GpuTensor) == doctest::Approx(200.0));
+  CHECK(ridge_flop_per_byte(RooflinePreset::MobileNpu) == doctest::Approx(30.0));
+}
+
+TEST_CASE("Cost: metric_value for each HeatmapMetric") {
+  NodeCost nc;
+  nc.flops = 5000;
+  nc.flops_known = true;
+  nc.params = 42;
+  nc.act_bytes = 800;
+  nc.weight_bytes = 200;
+  nc.input_act_bytes = 300;  // bytes_moved = 200+300+800 = 1300
+
+  MetricValue f = metric_value(nc, HeatmapMetric::Flops);
+  CHECK(f.known);
+  CHECK(f.value == 5000);
+
+  MetricValue p = metric_value(nc, HeatmapMetric::Params);
+  CHECK(p.known);
+  CHECK(p.value == 42);
+
+  MetricValue ab = metric_value(nc, HeatmapMetric::ActBytes);
+  CHECK(ab.known);
+  CHECK(ab.value == 800);
+
+  // AI = 5000 / 1300 ~= 3.846; scaled by kArithIntensityScale (1000) -> ~3846.
+  MetricValue ai = metric_value(nc, HeatmapMetric::ArithIntensity);
+  CHECK(ai.known);
+  double expect = 5000.0 / 1300.0 * static_cast<double>(kArithIntensityScale);
+  CHECK(ai.value == static_cast<uint64_t>(expect + 0.5));
+}
+
+TEST_CASE("Cost: metric_value Params reports 0 as a KNOWN cold value") {
+  // 0 params is a real value (a paramless op) -> known=true (tints cold, not gray).
+  NodeCost nc;
+  nc.flops = 100;
+  nc.flops_known = true;
+  nc.params = 0;
+  MetricValue p = metric_value(nc, HeatmapMetric::Params);
+  CHECK(p.known);
+  CHECK(p.value == 0);
+}
+
+TEST_CASE("Cost: metric_value ActBytes on unresolved shape is honest-unknown") {
+  // act_bytes==0 (unresolved/dynamic shape) -> known=false (gray, not "cheapest").
+  NodeCost nc;
+  nc.flops = 100;
+  nc.flops_known = true;
+  nc.act_bytes = 0;
+  MetricValue ab = metric_value(nc, HeatmapMetric::ActBytes);
+  CHECK_FALSE(ab.known);
+}
+
+TEST_CASE("Cost: metric_value ArithIntensity honest-unknown when flops unknown") {
+  NodeCost nc;
+  nc.flops_known = false;
+  nc.weight_bytes = 100;
+  MetricValue ai = metric_value(nc, HeatmapMetric::ArithIntensity);
+  CHECK_FALSE(ai.known);
+
+  // Known flops but zero bytes moved -> also unknown (no divide-by-zero).
+  NodeCost zb;
+  zb.flops = 100;
+  zb.flops_known = true;
+  MetricValue ai2 = metric_value(zb, HeatmapMetric::ArithIntensity);
+  CHECK_FALSE(ai2.known);
+}
+
+TEST_CASE("Cost: metric_value ArithIntensity clamps saturated flops (no UB)") {
+  // A saturated flops (UINT64_MAX from safe_mul overflow) over tiny bytes yields
+  // an AI past LLONG_MAX; metric_value must clamp BEFORE the float->int cast and
+  // return {UINT64_MAX, true} rather than invoking UB / a wrap.
+  NodeCost nc;
+  nc.flops = UINT64_MAX;
+  nc.flops_known = true;
+  nc.weight_bytes = 1;  // bytes_moved = 1 -> AI ~= 1.8e19 * scale (huge)
+  MetricValue ai = metric_value(nc, HeatmapMetric::ArithIntensity);
+  CHECK(ai.known);
+  CHECK(ai.value == UINT64_MAX);
 }

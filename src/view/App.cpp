@@ -516,7 +516,12 @@ ImU32 App::category_color(OpCategory c, bool dark) {
       {/*Pool*/ 90, 179, 90},     {/*Elementwise*/ 224, 108, 118},
       {/*Shape*/ 120, 130, 148},  {/*Reduce*/ 210, 120, 200},
       {/*Tensor*/ 150, 160, 90},  {/*ControlFlow*/ 200, 90, 130},
-      {/*IO*/ 96, 172, 214},      {/*Other*/ 128, 128, 136},
+      {/*IO*/ 96, 172, 214},
+      // v0.4.0 categories — MUST stay index-aligned with the OpCategory enum,
+      // inserted before Other (see OpCategory.h). Distinct hues from the above.
+      {/*Attention*/ 216, 100, 208}, {/*Recurrent*/ 96, 190, 150},
+      {/*Quantize*/ 214, 178, 72},
+      {/*Other*/ 128, 128, 136},
   };
   int idx = static_cast<int>(c);
   if (idx < 0 || idx >= static_cast<int>(sizeof(kPalette) / sizeof(kPalette[0])))
@@ -650,6 +655,7 @@ void App::save_prefs() {
   j["show_minimap"] = view_.show_minimap;
   j["cost_heatmap"] = view_.cost_heatmap;
   j["heatmap_log_scale"] = view_.heatmap_log_scale;
+  j["heatmap_metric"] = heatmap_metric_name(view_.heatmap_metric);
   j["gradient_preset"] = gradient_preset_name(g.preset);
   j["gradient_reverse"] = g.reverse;
   j["gradient_low"] = rgba_to_json(g.low);
@@ -675,6 +681,9 @@ void App::load_prefs() {
       view_.cost_heatmap = j["cost_heatmap"].get<bool>();
     if (j.contains("heatmap_log_scale") && j["heatmap_log_scale"].is_boolean())
       view_.heatmap_log_scale = j["heatmap_log_scale"].get<bool>();
+    if (j.contains("heatmap_metric") && j["heatmap_metric"].is_string())
+      view_.heatmap_metric =
+          heatmap_metric_from_name(j["heatmap_metric"].get<std::string>().c_str());
 
     HeatmapGradient& g = view_.heatmap_gradient;
     if (j.contains("gradient_preset") && j["gradient_preset"].is_string()) {

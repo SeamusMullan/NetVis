@@ -6,6 +6,7 @@
 #include <doctest/doctest.h>
 
 #include <initializer_list>
+#include <string>
 
 #include "engine/HeatmapGradient.h"
 
@@ -93,4 +94,37 @@ TEST_CASE("Gradient: set_preset(Custom) keeps existing stops") {
   CHECK(g.low == lo);   // unchanged
   CHECK(g.mid == mid);
   CHECK(g.high == hi);
+}
+
+// --- v0.4.0: heatmap metric name round-trip -----------------------------------
+// heatmap_metric_name/heatmap_metric_from_name are the persistence path for the
+// selected metric (view_prefs.json string key). A save->load round-trip must be
+// stable for all 4 metrics; an unknown/null string falls back to Flops.
+
+TEST_CASE("Gradient: heatmap metric name round-trips for all 4 metrics") {
+  for (int i = 0; i < kHeatmapMetricCount; ++i) {
+    auto m = static_cast<HeatmapMetric>(i);
+    const char* name = heatmap_metric_name(m);
+    CHECK(name != nullptr);
+    CHECK(name[0] != '\0');
+    // name -> enum -> name is stable.
+    CHECK(heatmap_metric_from_name(name) == m);
+  }
+}
+
+TEST_CASE("Gradient: unknown/null metric name falls back to Flops") {
+  CHECK(heatmap_metric_from_name("not-a-metric") == HeatmapMetric::Flops);
+  CHECK(heatmap_metric_from_name("") == HeatmapMetric::Flops);
+  CHECK(heatmap_metric_from_name(nullptr) == HeatmapMetric::Flops);
+}
+
+TEST_CASE("Gradient: heatmap metric names are distinct") {
+  // Distinctness guarantees the round-trip above cannot alias two metrics.
+  for (int i = 0; i < kHeatmapMetricCount; ++i) {
+    for (int j = i + 1; j < kHeatmapMetricCount; ++j) {
+      std::string a = heatmap_metric_name(static_cast<HeatmapMetric>(i));
+      std::string b = heatmap_metric_name(static_cast<HeatmapMetric>(j));
+      CHECK(a != b);
+    }
+  }
 }

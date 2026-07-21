@@ -78,6 +78,10 @@ NodeCost sum_node_costs(const CostReport& report,
       sum.params += nc.params;
       sum.weight_bytes += nc.weight_bytes;
       sum.act_bytes += nc.act_bytes;
+      // Activation-read bytes must roll up too, else a collapsed group's
+      // arithmetic intensity (flops / bytes_moved) is computed against a
+      // too-small denominator and reads artificially compute-bound.
+      sum.input_act_bytes += nc.input_act_bytes;
       // A group has flops_known=true iff at least one member does.
       if (nc.flops_known) sum.flops_known = true;
     }
@@ -100,6 +104,42 @@ std::string human_flops(uint64_t f) {
     std::snprintf(buf, sizeof(buf), "%.1f %s", v, unit);
   return buf;
 }
+
+// Format a metric value for the legend, keyed on which metric it is. FLOPs use
+// the F/KF/MF/GF ladder; Params are a grouped count; ActBytes are human bytes;
+// ArithIntensity is the fixed-point value divided back out to FLOP/byte. Labeling
+// bytes as "MF" (or intensity as a count) would be a category error, so each
+// metric formats in its own unit.
+std::string format_metric_value(double v, HeatmapMetric m) {
+  char buf[64];
+  switch (m) {
+    case HeatmapMetric::Flops:
+      return human_flops(static_cast<uint64_t>(v));
+    case HeatmapMetric::Params:
+      return grouped_count(static_cast<int64_t>(v)) + " params";
+    case HeatmapMetric::ActBytes:
+      return human_bytes(static_cast<uint64_t>(v));
+    case HeatmapMetric::ArithIntensity:
+      std::snprintf(buf, sizeof(buf), "%.2f F/B",
+                    v / static_cast<double>(kArithIntensityScale));
+      return buf;
+  }
+  return human_flops(static_cast<uint64_t>(v));
+}
+
+// Human label for a roofline preset (the ridge presets are datasheet estimates,
+// not measurements — the panel labels the whole roofline "approximate").
+const char* roofline_preset_name(RooflinePreset p) {
+  switch (p) {
+    case RooflinePreset::Generic:    return "Generic (~40)";
+    case RooflinePreset::CpuServer:  return "CPU server (~8)";
+    case RooflinePreset::GpuFp32:    return "GPU fp32 (~13)";
+    case RooflinePreset::GpuTensor:  return "GPU tensor (~200)";
+    case RooflinePreset::MobileNpu:  return "Mobile NPU (~30)";
+  }
+  return "Generic (~40)";
+}
+constexpr int kRooflinePresetCount = 5;
 
 }  // namespace
 
@@ -145,24 +185,25 @@ void ensure_cost(App& app) {
   recompute_heatmap_range(app);
 }
 
-// Normalize a FLOPs value into [0,1] across [min,max] using the chosen scale.
+// Normalize a metric value into [0,1] across [min,max] using the chosen scale.
+// Metric-agnostic: the selected heatmap metric (FLOPs/Params/ActBytes/AI) is
+// already reduced to a scalar by metric_value before this is called.
 // log_scale: interpolate in log10 space (clamped to >=1 to avoid log10(0)), the
-// default — model FLOPs span orders of magnitude. Otherwise linear. Both guard the
+// default — magnitudes span orders of magnitude. Otherwise linear. Both guard the
 // degenerate min==max case (single distinct value) to 0.
-float normalize_flops(uint64_t flops, uint64_t min_flops, uint64_t max_flops,
-                      bool log_scale) {
-  if (flops < min_flops) flops = min_flops;
-  if (flops > max_flops) flops = max_flops;
+float normalize_metric_value(double value, double min_value, double max_value,
+                             bool log_scale) {
+  if (value < min_value) value = min_value;
+  if (value > max_value) value = max_value;
   float t = 0.0f;
   if (log_scale) {
-    double lmin = std::log10(static_cast<double>(min_flops < 1 ? 1 : min_flops));
-    double lmax = std::log10(static_cast<double>(max_flops < 1 ? 1 : max_flops));
-    double lf = std::log10(static_cast<double>(flops < 1 ? 1 : flops));
+    double lmin = std::log10(min_value < 1.0 ? 1.0 : min_value);
+    double lmax = std::log10(max_value < 1.0 ? 1.0 : max_value);
+    double lf = std::log10(value < 1.0 ? 1.0 : value);
     if (lmax > lmin) t = static_cast<float>((lf - lmin) / (lmax - lmin));
   } else {
-    if (max_flops > min_flops) {
-      t = static_cast<float>(static_cast<double>(flops - min_flops) /
-                             static_cast<double>(max_flops - min_flops));
+    if (max_value > min_value) {
+      t = static_cast<float>((value - min_value) / (max_value - min_value));
     }
   }
   return std::clamp(t, 0.0f, 1.0f);
@@ -184,28 +225,38 @@ static void recompute_heatmap_range(App& app) {
   if (!vs.cost) return;
   ModelSession& s = app.session();
   const auto& disp = s.collapse().display_nodes();
-  uint64_t min_flops = UINT64_MAX, max_flops = 0;
+  double min_value = 0.0, max_value = 0.0;
+  bool any = false;
   std::vector<uint32_t> scale_nodes;
   for (int32_t d = 0; d < static_cast<int32_t>(disp.size()); ++d) {
     ir_nodes_for_display(s, d, scale_nodes);
     if (scale_nodes.empty()) continue;
     NodeCost agg = sum_node_costs(*vs.cost, scale_nodes);
-    if (!agg.flops_known || agg.flops == 0) continue;
-    if (agg.flops < min_flops) min_flops = agg.flops;
-    if (agg.flops > max_flops) max_flops = agg.flops;
+    MetricValue mv = metric_value(agg, vs.heatmap_metric);
+    // Include KNOWN values even when 0: for Params/ActBytes a 0 is a real value
+    // that must tint at the cold end, not render gray (the honest-unknown color).
+    // Skipping known-0 made an all-zero graph (e.g. a Params heatmap over a graph
+    // with no initializers) produce an invalid range -> every node gray, which
+    // reads as "unknown" for a value that is known to be zero. (For the FLOPs
+    // metric flops_known implies flops>0, so this changes nothing there.)
+    if (!mv.known) continue;
+    double v = static_cast<double>(mv.value);
+    if (!any || v < min_value) min_value = v;
+    if (!any || v > max_value) max_value = v;
+    any = true;
   }
-  if (max_flops == 0 || min_flops == UINT64_MAX) return;  // no known FLOPs
+  if (!any) return;  // no display node yields a known metric value
   vs.heatmap_range_valid = true;
-  vs.heatmap_range_min = min_flops;
-  vs.heatmap_range_max = max_flops;
+  vs.heatmap_range_min = min_value;
+  vs.heatmap_range_max = max_value;
 }
 
 HeatmapRange heatmap_range(App& app) {
   ViewState& vs = app.view();
   HeatmapRange r;
   r.valid = vs.heatmap_range_valid;
-  r.min_flops = vs.heatmap_range_min;
-  r.max_flops = vs.heatmap_range_max;
+  r.min_value = vs.heatmap_range_min;
+  r.max_value = vs.heatmap_range_max;
   return r;
 }
 
@@ -225,10 +276,13 @@ CostTint cost_tint_for_display(App& app, int32_t display_id) {
   ir_nodes_for_display(s, display_id, nodes);
   if (nodes.empty()) return out;
 
-  // Aggregate cost over those nodes.
+  // Aggregate cost over those nodes, then extract the SELECTED metric — the gray
+  // gate keys on that metric's known-ness, not always flops_known (e.g. an
+  // unresolved ActBytes node is honestly gray even if its FLOPs are known).
   NodeCost nc = sum_node_costs(*vs.cost, nodes);
-  if (!nc.flops_known) {
-    // Unknown FLOPs -> neutral gray tint.
+  MetricValue mv = metric_value(nc, vs.heatmap_metric);
+  if (!mv.known) {
+    // Honest unknown for the selected metric -> neutral gray tint.
     out.active = true;
     out.color = kColNeutral;
     return out;
@@ -241,8 +295,9 @@ CostTint cost_tint_for_display(App& app, int32_t display_id) {
     return out;
   }
 
-  float t = normalize_flops(nc.flops, range.min_flops, range.max_flops,
-                            vs.heatmap_log_scale);
+  float t = normalize_metric_value(static_cast<double>(mv.value),
+                                   range.min_value, range.max_value,
+                                   vs.heatmap_log_scale);
   out.active = true;
   out.color = cost_ramp(vs.heatmap_gradient, t);
   return out;
@@ -369,6 +424,43 @@ void draw_cost_section(App& app) {
     }
   }
 
+  // --- Efficiency / roofline (approximate) ------------------------------------
+  if (report->from_graph && report->nodes_flops_known > 0) {
+    ImGui::SeparatorText("Efficiency (approximate)");
+    ImGui::Text("Arithmetic intensity: %.2f FLOP/byte",
+                report->overall_arithmetic_intensity());
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "Total known FLOPs / bytes moved (weight + activation reads + writes).");
+
+    // Roofline verdict at a user-selectable machine-balance preset. Recomputed at
+    // draw time (cheap O(V)); the stored CostReport::roofline is the default-ridge
+    // snapshot. The preset need not persist — a local static is enough.
+    static RooflinePreset roof_preset = RooflinePreset::Generic;
+    ImGui::SetNextItemWidth(180.0f);
+    if (ImGui::BeginCombo("Machine balance",
+                          roofline_preset_name(roof_preset))) {
+      for (int i = 0; i < kRooflinePresetCount; ++i) {
+        auto p = static_cast<RooflinePreset>(i);
+        bool is_sel = (roof_preset == p);
+        if (ImGui::Selectable(roofline_preset_name(p), is_sel)) roof_preset = p;
+        if (is_sel) ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
+    }
+    RooflineSummary roof =
+        compute_roofline(*report, ridge_flop_per_byte(roof_preset));
+    double cbf = roof.compute_bound_fraction() * 100.0;
+    ImGui::Text("Roofline: %.0f%% compute-bound (%u nodes), %.0f%% memory-bound "
+                "(%u nodes)",
+                cbf, roof.compute_bound_nodes, 100.0 - cbf,
+                roof.memory_bound_nodes);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "Approximate: node intensity vs the ridge FLOP/byte of the selected "
+          "machine balance (datasheet estimates, not measurements).");
+  }
+
   // --- Quant-coverage table ---------------------------------------------------
   if (!report->dtype_usage.empty()) {
     ImGui::SeparatorText("Quantization profile");
@@ -434,6 +526,24 @@ void draw_cost_section(App& app) {
 
   if (vs.cost_heatmap) {
     HeatmapGradient& grad = vs.heatmap_gradient;
+
+    // Metric selector: which scalar the gradient ramps across (FLOPs / Params /
+    // Act bytes / Arith intensity). Changing it invalidates the cached range,
+    // which self-heals next frame via recompute_heatmap_range in ensure_cost.
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::BeginCombo("Metric",
+                          heatmap_metric_name(vs.heatmap_metric))) {
+      for (int i = 0; i < kHeatmapMetricCount; ++i) {
+        auto m = static_cast<HeatmapMetric>(i);
+        bool is_sel = (vs.heatmap_metric == m);
+        if (ImGui::Selectable(heatmap_metric_name(m), is_sel)) {
+          vs.heatmap_metric = m;
+          dirty = true;
+        }
+        if (is_sel) ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
+    }
 
     // Preset dropdown.
     ImGui::SetNextItemWidth(160.0f);
@@ -585,7 +695,8 @@ void draw_heatmap_legend(App& app) {
     dl->AddText(ImVec2(at.x + 1, at.y + 1), shadow, txt);
     dl->AddText(at, text_col, txt);
   };
-  label(ImVec2(win_min.x + kPad, win_min.y + kPad), "FLOPs");
+  label(ImVec2(win_min.x + kPad, win_min.y + kPad),
+        heatmap_metric_name(vs.heatmap_metric));
 
   // Gradient bar (respects the active gradient + reverse).
   const int segs = 64;
@@ -600,9 +711,9 @@ void draw_heatmap_legend(App& app) {
   }
   dl->AddRect(p0, ImVec2(p0.x + bar_w, p0.y + bar_h), IM_COL32(90, 90, 90, 255));
 
-  // Min/max labels under the bar ends.
-  std::string lo = human_flops(range.min_flops);
-  std::string hi = human_flops(range.max_flops);
+  // Min/max labels under the bar ends (formatted in the selected metric's unit).
+  std::string lo = format_metric_value(range.min_value, vs.heatmap_metric);
+  std::string hi = format_metric_value(range.max_value, vs.heatmap_metric);
   ImVec2 lbl_pos(p0.x, p0.y + bar_h + 2.0f);
   label(lbl_pos, lo.c_str());
   float hi_w = ImGui::CalcTextSize(hi.c_str()).x;

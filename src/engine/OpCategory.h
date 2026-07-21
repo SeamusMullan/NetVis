@@ -11,18 +11,27 @@
 
 namespace netvis {
 
+// NOTE: Other MUST remain the LAST enumerator — GraphNav's legend/filter loop
+// iterates `c <= static_cast<int>(OpCategory::Other)` and App::category_color
+// indexes a palette array by enum value with an Other-clamp. New categories are
+// inserted BEFORE Other (v0.4.0 added Attention/Recurrent/Quantize). No code
+// serializes OpCategory (not in LayoutCache/prefs), so Other's numeric shift is
+// safe; category_mask is uint32 so up to 32 categories fit.
 enum class OpCategory : uint8_t {
-  Conv,        // Conv, ConvTranspose, ...
-  MatMul,      // MatMul, Gemm, Linear, Einsum
+  Conv,        // Conv, ConvTranspose, QLinearConv, ConvInteger
+  MatMul,      // MatMul, Gemm, Linear, Einsum, QLinearMatMul, MatMulInteger, QGemm
   Activation,  // Relu, Gelu, Sigmoid, Tanh, Softmax, ...
   Norm,        // BatchNorm, LayerNorm, GroupNorm, RMSNorm, ...
-  Pool,        // MaxPool, AveragePool, GlobalAveragePool, ...
-  Elementwise, // Add, Mul, Sub, Div, Pow, Sqrt, ...
+  Pool,        // MaxPool, AveragePool, GlobalAveragePool, QLinear*Pool
+  Elementwise, // Add, Mul, Sub, Div, Pow, Sqrt, QLinearAdd/Mul, ...
   Shape,       // Reshape, Transpose, Concat, Slice, Gather, Squeeze, ...
-  Reduce,      // ReduceSum, ReduceMean, ...
+  Reduce,      // ReduceSum, ReduceMean, ReduceL1/L2, ArgMax/ArgMin, CumSum, ...
   Tensor,      // Constant, Cast, initializer-ish
   ControlFlow, // If, Loop, Scan
   IO,          // graph input/output markers
+  Attention,   // (v0.4.0) Attention, MultiHeadAttention
+  Recurrent,   // (v0.4.0) LSTM, GRU, RNN
+  Quantize,    // (v0.4.0) QuantizeLinear/DequantizeLinear/DynamicQuantizeLinear markers
   Other,
 };
 

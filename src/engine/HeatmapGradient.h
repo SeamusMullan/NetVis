@@ -71,4 +71,25 @@ void gradient_preset_stops(GradientPreset preset, Rgba8& low, Rgba8& mid,
 // deterministic. Alpha is interpolated too (stops are normally opaque).
 Rgba8 gradient_sample(const HeatmapGradient& gradient, float t);
 
+// --- v0.4.0: selectable heatmap metric ------------------------------------
+// The scalar the cost heatmap ramps its gradient across. The display-axis
+// companion to GradientPreset: GradientPreset is HOW it colors, HeatmapMetric is
+// WHAT it colors by. Kept engine-side (ImGui-free) so the metric extractor
+// (CostModel.h metric_value) stays headless-testable; the view owns the combo UI.
+// Flops == 0 preserves the v0.3.x default (log-FLOPs heatmap).
+enum class HeatmapMetric : uint8_t {
+  Flops = 0,      // node FLOPs (honest-unknown -> neutral gray, unchanged)
+  Params,         // weight/initializer element count feeding the node
+  ActBytes,       // output activation bytes
+  ArithIntensity, // FLOP per byte moved (roofline arithmetic intensity)
+};
+constexpr int kHeatmapMetricCount = 4;
+
+// Stable human label for the combo/legend ("FLOPs"/"Params"/"Act bytes"/
+// "Arith intensity"). Unknown enum -> "FLOPs".
+const char* heatmap_metric_name(HeatmapMetric m);
+// Parse a persisted metric name back to the enum; unknown/null -> Flops (so a
+// missing or hostile view_prefs.json key falls back to the default, not a crash).
+HeatmapMetric heatmap_metric_from_name(const char* s);
+
 }  // namespace netvis

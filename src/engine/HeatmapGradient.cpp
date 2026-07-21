@@ -2,6 +2,7 @@
 #include "engine/HeatmapGradient.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace netvis {
 
@@ -91,6 +92,28 @@ Rgba8 gradient_sample(const HeatmapGradient& gradient, float t) {
     return lerp_rgba(gradient.low, gradient.mid, t * 2.0f);
   }
   return lerp_rgba(gradient.mid, gradient.high, (t - 0.5f) * 2.0f);
+}
+
+// --- v0.4.0: heatmap metric names -----------------------------------------
+// Stable labels used by the metric combo, the legend title, and view_prefs.json
+// persistence. from_name is the inverse (unknown/null -> Flops), so a missing or
+// hostile persisted key falls back to the default rather than crashing.
+const char* heatmap_metric_name(HeatmapMetric m) {
+  switch (m) {
+    case HeatmapMetric::Flops: return "FLOPs";
+    case HeatmapMetric::Params: return "Params";
+    case HeatmapMetric::ActBytes: return "Act bytes";
+    case HeatmapMetric::ArithIntensity: return "Arith intensity";
+  }
+  return "FLOPs";
+}
+
+HeatmapMetric heatmap_metric_from_name(const char* s) {
+  if (s == nullptr) return HeatmapMetric::Flops;
+  if (std::strcmp(s, "Params") == 0) return HeatmapMetric::Params;
+  if (std::strcmp(s, "Act bytes") == 0) return HeatmapMetric::ActBytes;
+  if (std::strcmp(s, "Arith intensity") == 0) return HeatmapMetric::ArithIntensity;
+  return HeatmapMetric::Flops;  // "FLOPs" and any unknown string
 }
 
 }  // namespace netvis

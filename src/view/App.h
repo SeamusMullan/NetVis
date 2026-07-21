@@ -134,14 +134,23 @@ struct ViewState {
   HeatmapGradient heatmap_gradient;
   bool heatmap_log_scale = true;  // false => linear FLOPs normalization
 
-  // Cached heatmap FLOPs range, recomputed once per frame in ensure_cost() (not
-  // per visible node — cost_tint_for_display and the legend both read this). The
-  // valid flag is cleared when there is no cost report or no known FLOPs.
+  // Cached heatmap value range for the SELECTED metric, recomputed once per frame
+  // in ensure_cost() (not per visible node — cost_tint_for_display and the legend
+  // both read this). The valid flag is cleared when there is no cost report or no
+  // display node yields a known non-zero metric value.
   // Type is engine/CostPanel's HeatmapRange; forward use only via the fields below
-  // to keep App.h free of that include — stored as plain scalars.
+  // to keep App.h free of that include — stored as plain scalars. Held as double
+  // (v0.4.0) so arithmetic-intensity (a fractional FLOP/byte) is representable.
   bool heatmap_range_valid = false;
-  uint64_t heatmap_range_min = 0;
-  uint64_t heatmap_range_max = 0;
+  double heatmap_range_min = 0.0;
+  double heatmap_range_max = 0.0;
+
+  // --- v0.4.0 additions (append-only) ----------------------------------------
+  // Which scalar the cost heatmap tints by (FLOPs / Params / Act bytes / Arith
+  // intensity). Persisted to view_prefs.json under key "heatmap_metric"; a missing
+  // key loads as Flops (backward compatible with pre-0.4.0 pref files). Enum lives
+  // in engine/HeatmapGradient.h, already included by this header.
+  HeatmapMetric heatmap_metric = HeatmapMetric::Flops;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather

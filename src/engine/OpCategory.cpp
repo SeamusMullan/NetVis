@@ -56,6 +56,15 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"hardsigmoid", OpCategory::Activation},
       {"swish", OpCategory::Activation},
       {"silu", OpCategory::Activation},
+      {"softplus", OpCategory::Activation},
+      {"softsign", OpCategory::Activation},
+      {"hardswish", OpCategory::Activation},
+      {"mish", OpCategory::Activation},
+      {"logsoftmax", OpCategory::Activation},
+      {"celu", OpCategory::Activation},
+      {"thresholdedrelu", OpCategory::Activation},
+      {"shrink", OpCategory::Activation},
+      {"quickgelu", OpCategory::Activation},
       // Norm — both the ONNX "*Normalization" op names and the bare short forms
       // common in PyTorch/exported/custom graphs (e.g. "LayerNorm", "BatchNorm").
       {"batchnormalization", OpCategory::Norm},
@@ -93,6 +102,37 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"less", OpCategory::Elementwise},
       {"and", OpCategory::Elementwise},
       {"or", OpCategory::Elementwise},
+      {"sin", OpCategory::Elementwise},
+      {"cos", OpCategory::Elementwise},
+      {"tan", OpCategory::Elementwise},
+      {"asin", OpCategory::Elementwise},
+      {"acos", OpCategory::Elementwise},
+      {"atan", OpCategory::Elementwise},
+      {"sinh", OpCategory::Elementwise},
+      {"cosh", OpCategory::Elementwise},
+      {"asinh", OpCategory::Elementwise},
+      {"acosh", OpCategory::Elementwise},
+      {"atanh", OpCategory::Elementwise},
+      {"erf", OpCategory::Elementwise},
+      {"reciprocal", OpCategory::Elementwise},
+      {"floor", OpCategory::Elementwise},
+      {"ceil", OpCategory::Elementwise},
+      {"round", OpCategory::Elementwise},
+      {"sign", OpCategory::Elementwise},
+      {"mod", OpCategory::Elementwise},
+      {"not", OpCategory::Elementwise},
+      {"xor", OpCategory::Elementwise},
+      {"bitwiseand", OpCategory::Elementwise},
+      {"bitwiseor", OpCategory::Elementwise},
+      {"bitwisexor", OpCategory::Elementwise},
+      {"bitwisenot", OpCategory::Elementwise},
+      {"bitshift", OpCategory::Elementwise},
+      {"isnan", OpCategory::Elementwise},
+      {"isinf", OpCategory::Elementwise},
+      {"sum", OpCategory::Elementwise},
+      {"mean", OpCategory::Elementwise},
+      {"greaterorequal", OpCategory::Elementwise},
+      {"lessorequal", OpCategory::Elementwise},
       // Tensor
       {"constant", OpCategory::Tensor},
       {"cast", OpCategory::Tensor},
@@ -116,10 +156,40 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"reducemax", OpCategory::Reduce},
       {"reducemin", OpCategory::Reduce},
       {"reduceprod", OpCategory::Reduce},
+      {"reducel1", OpCategory::Reduce},
+      {"reducel2", OpCategory::Reduce},
+      {"reducelogsum", OpCategory::Reduce},
+      {"reducelogsumexp", OpCategory::Reduce},
+      {"reducesumsquare", OpCategory::Reduce},
+      {"argmax", OpCategory::Reduce},
+      {"argmin", OpCategory::Reduce},
+      {"cumsum", OpCategory::Reduce},
       // ControlFlow
       {"if", OpCategory::ControlFlow},
       {"loop", OpCategory::ControlFlow},
       {"scan", OpCategory::ControlFlow},
+      // Attention
+      {"attention", OpCategory::Attention},
+      {"multiheadattention", OpCategory::Attention},
+      // Recurrent
+      {"lstm", OpCategory::Recurrent},
+      {"gru", OpCategory::Recurrent},
+      {"rnn", OpCategory::Recurrent},
+      // Quantize — QDQ marker ops only. Quant COMPUTE ops are colored like their
+      // float sibling (mapped to Conv/MatMul/Elementwise/Pool below).
+      {"quantizelinear", OpCategory::Quantize},
+      {"dequantizelinear", OpCategory::Quantize},
+      {"dynamicquantizelinear", OpCategory::Quantize},
+      // Quantized compute ops -> float-sibling category (spec §8.1 nuance).
+      {"qlinearconv", OpCategory::Conv},
+      {"convinteger", OpCategory::Conv},
+      {"qlinearmatmul", OpCategory::MatMul},
+      {"matmulinteger", OpCategory::MatMul},
+      {"qgemm", OpCategory::MatMul},
+      {"qlinearadd", OpCategory::Elementwise},
+      {"qlinearmul", OpCategory::Elementwise},
+      {"qlinearaveragepool", OpCategory::Pool},
+      {"qlinearglobalaveragepool", OpCategory::Pool},
   };
   return t;
 }
@@ -149,6 +219,9 @@ const char* category_name(OpCategory c) {
     case OpCategory::Tensor: return "Tensor";
     case OpCategory::ControlFlow: return "ControlFlow";
     case OpCategory::IO: return "IO";
+    case OpCategory::Attention: return "Attention";
+    case OpCategory::Recurrent: return "Recurrent";
+    case OpCategory::Quantize: return "Quantize";
     case OpCategory::Other: return "Other";
   }
   return "Other";

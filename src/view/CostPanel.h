@@ -30,13 +30,15 @@ inline Rgba8 imu32_to_rgba8(ImU32 c) {
                static_cast<uint8_t>((c >> IM_COL32_A_SHIFT) & 0xFF)};
 }
 
-// Normalized [min,max] FLOPs the heatmap maps its gradient across, computed over
-// the SAME aggregation unit the tint uses (per display node), so a collapsed group
-// and a leaf share one scale. valid==false when no display node has known FLOPs.
+// [min,max] range of the SELECTED heatmap metric (v0.4.0: FLOPs/Params/ActBytes/
+// ArithIntensity, not just FLOPs) the gradient maps across, computed over the SAME
+// aggregation unit the tint uses (per display node), so a collapsed group and a
+// leaf share one scale. valid==false when no display node yields a known non-zero
+// metric value. Held as double so fractional arithmetic-intensity is representable.
 struct HeatmapRange {
   bool valid = false;
-  uint64_t min_flops = 0;
-  uint64_t max_flops = 0;
+  double min_value = 0.0;
+  double max_value = 0.0;
 };
 // Compute the heatmap range for the current model/report/collapse state. Cheap
 // (O(display nodes)); used by both cost_tint_for_display and the legend so they

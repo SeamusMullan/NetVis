@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/MappedFile.h"
+#include "engine/OpCategory.h"
 #include "parsers/Parser.h"
 
 using namespace netvis;
@@ -102,4 +103,47 @@ TEST_CASE("detect Unknown on random bytes") {
   std::vector<uint8_t> b = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
   b.resize(32, 0);
   CHECK(detect_bytes("junk", b, "") == Format::Unknown);
+}
+
+// --- v0.4.0: OpCategory coverage (color routing) ------------------------------
+// categorize_op maps an op string to a coloring category. New v0.4.0 categories
+// (Attention/Recurrent/Quantize) plus gap-fill entries must land in the right
+// bucket, and com.microsoft.* domain prefixes must be tolerated.
+
+TEST_CASE("OpCategory: v0.4.0 new-op categories") {
+  // Quantized compute ops keep their float-analogue COLOR category (Conv/MatMul),
+  // per the plan (category owns color; FLOP routing is separate).
+  CHECK(categorize_op("QLinearConv") == OpCategory::Conv);
+  CHECK(categorize_op("MatMulInteger") == OpCategory::MatMul);
+  CHECK(categorize_op("Attention") == OpCategory::Attention);
+  CHECK(categorize_op("LSTM") == OpCategory::Recurrent);
+  // Pure quant markers -> Quantize.
+  CHECK(categorize_op("QuantizeLinear") == OpCategory::Quantize);
+
+  // Domain prefix tolerated (contrib ops).
+  CHECK(categorize_op("com.microsoft.Attention") == OpCategory::Attention);
+  CHECK(categorize_op("com.microsoft.QuantizeLinear") == OpCategory::Quantize);
+}
+
+TEST_CASE("OpCategory: gap-fill samples") {
+  // Erf is elementwise math (Elementwise per the plan's gap-fill table).
+  CHECK(categorize_op("Erf") == OpCategory::Elementwise);
+  // ReduceL2 is a reduction.
+  CHECK(categorize_op("ReduceL2") == OpCategory::Reduce);
+  // Mish is an activation.
+  CHECK(categorize_op("Mish") == OpCategory::Activation);
+}
+
+TEST_CASE("OpCategory: category_name is non-empty for every category") {
+  // Exhaustive over Conv..Other (Other is last). category_name must return a
+  // stable non-empty label for each, including the three new v0.4.0 ones.
+  for (int c = 0; c <= static_cast<int>(OpCategory::Other); ++c) {
+    const char* name = category_name(static_cast<OpCategory>(c));
+    CHECK(name != nullptr);
+    CHECK(name[0] != '\0');
+  }
+  // Spot-check the new names route through the switch (not the default).
+  CHECK(std::string(category_name(OpCategory::Attention)) != "Other");
+  CHECK(std::string(category_name(OpCategory::Recurrent)) != "Other");
+  CHECK(std::string(category_name(OpCategory::Quantize)) != "Other");
 }

@@ -306,3 +306,69 @@ Quality-of-life pass on the analyzer, headlined by a configurable cost heatmap.
   published report — still zero payload reads.
 
 Suite: 92 cases / 651 assertions, GUI + ASan/UBSan clean.
+
+## v0.4.0 — op-coverage + efficiency (wider FLOPs, arithmetic intensity, roofline, selectable heatmap metrics)
+
+Milestone: "support as many operations as possible to make graph heatmaps better
+and efficiency calculation better." Built with the established frozen-contract +
+parallel-agent method (design workflow → adversarial critique → lead freezes
+headers → 5 disjoint-file impl agents each verified → clean integration build →
+cross-file adversarial review sweep). Full spec: `docs/v0.4.0-plan.md`.
+
+- **FLOP routing decoupled from category (the one design decision that mattered).**
+  `OpCategory` had been driving BOTH node color AND FLOP routing. v0.4.0 freezes
+  the rule: **category owns color only; FLOP correctness is owned by an explicit
+  op-name dispatch that runs FIRST in `compute_flops` and returns on match**, with
+  the category-driven generic formulas (`Activation|Norm|Elementwise ⇒ |O|`,
+  `Reduce ⇒ |input0|`, `Pool ⇒ |O|·∏kernel`, `MatMul ⇒ |O|·K`) as the fallback.
+  The new `Quantize` category has NO generic fallback, so a `QLinearConv` (weight
+  at input slot 3, not 1) can never be mis-fed an elementwise `|O|` number. Adding
+  an op to a color category never implies its FLOP formula.
+- **New FLOP handlers** (all MAC=2, all saturating `safe_mul`/`safe_add`, all
+  honest-unknown on any unresolved dim): Attention (`v_hidden = proj_out/3`, QKV
+  proj + `2·B·S·S·v_hidden` core), MultiHeadAttention (`2·B·Sq·Skv·hidden_q`, head
+  dim cancels), LSTM/GRU/RNN (gates 4/3/1 **×num_directions** — bidirectional was
+  the critique catch), QLinearConv/ConvInteger, QLinearMatMul/MatMulInteger/QGemm
+  (QGemm honors transA), QLinearAdd/Mul, QLinear*Pool, QDQ markers, and a
+  constrained 2-operand Einsum resolver (empty equation stays honest-unknown,
+  preserving the v0.3.0 "Einsum not fabricated" regression test).
+- **Gap-fill via OpCategory table only.** ~50 elementwise/activation/reduce
+  primitives (Sin/Cos/Erf/Softplus/Mish/LogSoftmax/ReduceL2/ArgMax/CumSum/…) get
+  `|O|` or `|input0|` for free through the generic fallback — a pure `OpCategory`
+  table change, zero `compute_flops` edits. Their FLOP coverage is contingent on
+  shape inference resolving the output shape, so `ShapeInferenceExt` gained matching
+  unary/variadic handlers (the cross-file review caught 9 comparison/bitwise/isnan
+  ops that were categorized but had no shape handler → silently unresolved; added).
+- **Efficiency metrics.** `NodeCost.input_act_bytes` (append-only) completes
+  `bytes_moved() = weight + input_act + output_act`; `arithmetic_intensity() =
+  flops / bytes_moved()` (FLOP/byte) gated on `intensity_known()`. `RooflineSummary`
+  + `classify_node`/`compute_roofline` bucket flops-known nodes against a ridge
+  FLOP/byte (`RooflinePreset` Generic/CpuServer/GpuFp32/GpuTensor/MobileNpu);
+  `CostReport` gains `total_bytes_moved` (all-node traffic upper bound),
+  `bytes_moved_flops_known` (matched denom), and `overall_arithmetic_intensity()`.
+  All estimates, labeled approximate.
+- **Selectable heatmap metric.** One extractor `metric_value(NodeCost,
+  HeatmapMetric)` feeds range + tint + legend so they cannot diverge (the v0.3.1
+  group-scale bug class). Modes: FLOPs / Params / ActBytes / ArithIntensity
+  (fixed-point `kArithIntensityScale` so it rides the one uint64 range/normalize
+  path; **clamp before the float→int cast** so a saturated `flops==UINT64_MAX`
+  can't UB `llround` — the critique catch). ActBytes returns `known=false` on a
+  0/unresolved shape (honest gray, not a "cheapest" lie). Group AI is ratio-of-sums
+  (`sum_node_costs` sums `input_act_bytes` too). New `HeatmapMetric` enum in the
+  engine-leaf `HeatmapGradient.h`; `heatmap_metric` persisted to `view_prefs.json`
+  (missing key → Flops). No `LayoutCache::kVersion` bump — tint isn't
+  layout-affecting.
+- **Enum growth.** `OpCategory` gained Attention/Recurrent/Quantize inserted
+  **before Other** (Other must stay last — `GraphNav` loops `c <= Other`, `App.cpp`
+  indexes `kPalette` by enum value); the palette got 3 matching entries in the same
+  freeze. No serialized `OpCategory` anywhere, so the numeric shift is safe.
+- **Integration catches** (fixed by the lead): a partition gap left
+  `heatmap_metric_name`/`from_name` declared-but-undefined (assigned to no agent →
+  link error; defined in `HeatmapGradient.cpp`); QGemm output-dtype read slot 7
+  (y_scale) instead of slot 8 (y_zero_point — the optional C at slot 6 shifts it).
+  Cross-file review confirmed the two v0.3.0-class high-risk targets (cache-keying
+  staleness, enum/palette misalignment) were clean, and refuted a proposed
+  group-AI "bug" as documented-intended fused-region semantics.
+
+Suite: 126 cases / 835 assertions, GUI + ASan/UBSan clean. Version is tag-driven
+(CI `-DNETVIS_VERSION`), no hardcoded string to bump.

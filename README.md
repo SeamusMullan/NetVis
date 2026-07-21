@@ -20,6 +20,18 @@ panel, minimap bottom-right.*
 *Tensor-table mode (SafeTensors / GGUF / PyTorch state-dicts) — virtualized,
 sortable table with a module hierarchy tree.*
 
+![Cost heatmap](docs/screenshot-densenet-analyzer-panel.png)
+
+*Analyzer mode on DenseNet-161 (ONNX) — cost heatmap tinting the graph by FLOPs,
+with the properties panel showing model totals, arithmetic intensity, a roofline
+memory-/compute-bound breakdown, and the quantization profile — all computed from
+shapes alone, no weights read.*
+
+![Arithmetic-intensity heatmap](docs/screenshot-densenet-arith-intensity.png)
+
+*Same model, heatmap switched to the arithmetic-intensity metric — compute-bound
+convolutions (green) stand out from memory-bound activations/pooling (purple).*
+
 ## Features
 
 - **Formats:** ONNX (`.onnx`), TFLite (`.tflite`), SafeTensors (`.safetensors`),
@@ -49,19 +61,31 @@ sortable table with a module hierarchy tree.*
   **FLOPs, parameter counts, weight bytes, and peak activation memory** computed
   from shapes alone (no weights read), plus a **quant-coverage** table (per-dtype
   params/bytes, effective bits/param, size-vs-fp32). Estimates are honest:
-  unsupported ops / unresolved shapes are reported as unknown, never faked. A
-  one-key **cost heatmap** tints the graph by FLOPs with a **customizable
-  gradient** (colorblind-safe Viridis / Magma / Cool→Hot / Grayscale presets or
-  your own low/mid/high stops, log or linear scale, on-canvas legend), and the
-  cost summary copies to the clipboard as TSV. View preferences persist across
-  sessions.
+  unsupported ops / unresolved shapes are reported as unknown, never faked.
+  FLOP coverage spans convolutions, matmuls/Gemm, **attention & multi-head
+  attention**, **recurrent LSTM/GRU/RNN**, **quantized** ops (QLinearConv /
+  QLinearMatMul / MatMulInteger / ConvInteger / QGemm and the QDQ markers), a
+  constrained Einsum resolver, and a broad set of elementwise / activation /
+  reduce primitives.
+- **Efficiency metrics (v0.4.0):** per-node **arithmetic intensity** (FLOP per byte
+  moved) and a **roofline** classification (memory-bound vs compute-bound against a
+  selectable machine-balance preset) with a model-level compute-bound fraction —
+  all pure over shapes, labeled as the estimates they are.
+- **Cost heatmap:** a one-key overlay that tints the graph by a **selectable metric**
+  — FLOPs, parameters, activation bytes, or arithmetic intensity — with a
+  **customizable gradient** (colorblind-safe Viridis / Magma / Cool→Hot / Grayscale
+  presets or your own low/mid/high stops, log or linear scale, metric-aware
+  on-canvas legend). The cost summary copies to the clipboard as TSV, and view
+  preferences persist across sessions.
 - **Weight inspector:** lazily decodes a tensor to streaming stats (min/max/mean/std,
   zero & NaN/Inf counts, 64-bucket histogram) without materializing a converted
   copy. Export to `.npy` or raw `.bin`.
 - **Shape inference (ONNX):** best-effort propagation over the common ops (incl.
-  constant-driven Reshape/Slice/Gather/Concat/Transpose/Split and dtype
-  propagation) fills in edge shape labels in the background. TFLite `If`/`While`/
-  `CallOnce` subgraphs are linked and divable.
+  constant-driven Reshape/Slice/Gather/Concat/Transpose/Split, attention,
+  recurrent LSTM/GRU/RNN multi-output, quantized QLinear*/Integer/QDQ, and dtype
+  propagation) fills in edge shape labels in the background — which in turn feed
+  the analyzer's FLOP estimates. TFLite `If`/`While`/`CallOnce` subgraphs are
+  linked and divable.
 - **Search:** fuzzy, case-insensitive substring/subsequence search over all names;
   Enter flies the camera to the hit.
 - **Tensor-table mode:** graph-less formats (GGUF/SafeTensors/PyTorch) show a
@@ -179,4 +203,6 @@ cd build && cpack        # generator auto-selected per OS
 ## Non-goals (v1)
 
 No model editing, no inference/execution, no dequantization of GGUF quant blocks,
-no TorchScript/FX graph reconstruction, no plugin system, no web build.
+no TorchScript/FX graph reconstruction, no web build. (A plugin system — declarative
+op definitions plus a sandboxed WASM tier for parsers/passes — is designed for a
+future release; see `docs/v0.5.0-plan.md`.)
