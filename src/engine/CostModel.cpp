@@ -683,9 +683,20 @@ GraphCostSummary compute_graph_costs(const ir::Model& model, const ir::Graph& g)
   return summary;
 }
 
-// Compute peak activation liveness via the topological pass in CostModel.h.
-// ONNX node order is topological; the pass is single-pass index order.
-uint64_t compute_peak_activation_bytes(const ir::Graph& g) {
+// Single-source activation-liveness walk (topological pass in CostModel.h). ONNX
+// node order is topological; the pass is single-pass index order. Returns the peak
+// live activation bytes. When out_curve != nullptr it is resized to g.nodes.size()
+// and out_curve[i] is set to the HIGH-WATER live bytes during node i (post its
+// outputs, PRE the frees for values whose last use is node i) — the same point the
+// peak is sampled, so *(max of out_curve) == the returned peak on any graph with
+// >=1 node. Both compute_peak_activation_bytes and activation_liveness_curve call
+// this, so the scalar and the curve share ONE implementation and cannot diverge.
+uint64_t walk_activation_liveness(const ir::Graph& g,
+                                  std::vector<uint64_t>* out_curve) {
+  if (out_curve) {
+    out_curve->clear();
+    out_curve->resize(g.nodes.size(), 0);
+  }
   auto init_idx = build_initializer_index(g);
 
   // Mark which values are activations (not initializers).
@@ -765,8 +776,11 @@ uint64_t compute_peak_activation_bytes(const ir::Graph& g) {
       live = safe_add(live, value_bytes(*vi));
     }
 
-    // Update peak after adding outputs.
+    // Update peak after adding outputs. This post-output/pre-free point is the
+    // high-water mark for node ni, so it is ALSO the curve sample — recording it
+    // here (not after the frees below) is what makes max(curve) == peak.
     if (live > peak) peak = live;
+    if (out_curve) (*out_curve)[ni] = live;
 
     // Free values whose last_use is this node (unless graph output). free_at[ni]
     // already excludes outputs/initializers/never-consumed values.
@@ -781,6 +795,11 @@ uint64_t compute_peak_activation_bytes(const ir::Graph& g) {
   }
 
   return peak;
+}
+
+// Peak activation liveness (scalar) — thin wrapper over the shared walk.
+uint64_t compute_peak_activation_bytes(const ir::Graph& g) {
+  return walk_activation_liveness(g, nullptr);
 }
 
 // Aggregate dtype_usage from a list of TensorRefs (either initializers or
@@ -958,6 +977,16 @@ CostReport compute_cost(const ir::Model& model, uint32_t graph_index) {
   report.dtype_usage = compute_dtype_usage(g.initializers);
 
   return report;
+}
+
+// Public API: the full activation-liveness curve for graphs[graph_index].
+std::vector<uint64_t> activation_liveness_curve(const ir::Model& model,
+                                                uint32_t graph_index) {
+  // Table mode / out-of-range graph_index: no compute graph -> empty curve.
+  if (!model.has_graph || graph_index >= model.graphs.size()) return {};
+  std::vector<uint64_t> curve;
+  walk_activation_liveness(model.graphs[graph_index], &curve);
+  return curve;
 }
 
 }  // namespace netvis

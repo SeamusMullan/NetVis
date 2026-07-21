@@ -294,4 +294,28 @@ MetricValue metric_value(const NodeCost& nc, HeatmapMetric m);
 // ---------------------------------------------------------------------------
 CostReport compute_cost(const ir::Model& model, uint32_t graph_index);
 
+// Live activation bytes at each node in execution (node index == topological)
+// order — the FULL curve behind the single peak_activation_bytes scalar.
+// liveness_curve[i] = the memory HIGH-WATER MARK during node i: live activation
+// bytes just after node i's outputs are produced but BEFORE the values whose
+// last use is node i are freed. That pre-free point is exactly where the peak
+// pass takes its max, so max(curve) EQUALS CostReport::peak_activation_bytes by
+// construction (this is a doctest-asserted invariant — the two cannot diverge).
+// Recording at the post-free point instead would UNDERSTATE the peak whenever the
+// peak node frees inputs (e.g. a Concat), so it is deliberately pre-free: this is
+// the true resident-memory pressure while node i runs, matching the peak marker
+// the view draws on the plot.
+//
+// Re-walks with the IDENTICAL accounting as compute_peak_activation_bytes (they
+// share one implementation): activation = value whose name is NOT a graph
+// initializer; bytes(v) = elem_count(v.shape) * dtype_size(v.dtype) (unresolved
+// shape or quant/unknown dtype => 0 bytes, never an error); last_use = largest
+// consumer node index; graph-output values are never freed; the graph_inputs seed
+// contributes to the running `live` but is not itself a recorded per-node point.
+// PURE, no payload reads, saturating, never throws. Returns an EMPTY curve in
+// table mode (no compute graph) or for an out-of-range graph_index. Its size,
+// when non-empty, equals graphs[graph_index].nodes.size().
+std::vector<uint64_t> activation_liveness_curve(const ir::Model& model,
+                                                uint32_t graph_index);
+
 }  // namespace netvis
