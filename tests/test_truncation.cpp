@@ -106,3 +106,8 @@ TEST_CASE("truncation: TFLite parser stays safe at every 1/8th") {
   truncation_sweep("tflite", fixture("model.tflite"),
                    [](const MappedFile& f, ProgressSink& p) { return tflite::parse(f, p); });
 }
+
+TEST_CASE("truncation: NumPy .npz parser stays safe at every 1/8th") {
+  truncation_sweep("npz", fixture("model.npz"),
+                   [](const MappedFile& f, ProgressSink& p) { return npz::parse(f, p); });
+}

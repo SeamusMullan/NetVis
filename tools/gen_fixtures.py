@@ -668,6 +668,78 @@ def build_tflite_ctrlflow():
 
 
 # ---------------------------------------------------------------------------
+# NumPy .npz (zip of .npy arrays)
+# ---------------------------------------------------------------------------
+
+def build_npz_npy(shape, dtype_descr, values):
+    """Build a single .npy array: magic, version, header dict, payload.
+    shape: tuple of dims, e.g. (2, 3).
+    dtype_descr: NumPy descr string, e.g. '<f4'.
+    values: flat list of numeric values (will be packed per descr).
+    """
+    # Shape tuple string: "(2, 3)" for rank>=2, "(3,)" for rank 1, "()" for scalar.
+    if len(shape) == 0:
+        shape_str = "()"
+    elif len(shape) == 1:
+        shape_str = f"({shape[0]},)"
+    else:
+        shape_str = "(" + ", ".join(str(d) for d in shape) + ")"
+
+    # Header dict (Python literal).
+    dict_str = f"{{'descr': '{dtype_descr}', 'fortran_order': False, 'shape': {shape_str}, }}"
+
+    # Version 1.0: magic(6) + version(2) + u16 header_len + dict + padding to 64-byte boundary.
+    magic = b"\x93NUMPY"
+    version = b"\x01\x00"
+    preamble_size = 6 + 2 + 2  # magic + version + u16
+    dict_bytes = dict_str.encode("utf-8")
+    # Total before padding: preamble + dict + '\n'.
+    unpadded = preamble_size + len(dict_bytes) + 1
+    # Pad to 64-byte boundary.
+    total = ((unpadded + 63) // 64) * 64
+    pad = total - unpadded
+    dict_bytes += b" " * pad + b"\n"
+    header_len = len(dict_bytes)
+
+    # Payload: pack values according to dtype_descr.
+    payload = bytearray()
+    if dtype_descr == "<f4":
+        for v in values:
+            payload += struct.pack("<f", float(v))
+    elif dtype_descr == "<i4":
+        for v in values:
+            payload += struct.pack("<i", int(v))
+    else:
+        # Extend as needed; for the fixture we only need f4.
+        raise ValueError(f"unsupported dtype_descr: {dtype_descr}")
+
+    out = bytearray()
+    out += magic
+    out += version
+    out += struct.pack("<H", header_len)
+    out += dict_bytes
+    out += payload
+    return bytes(out)
+
+
+def build_npz(path):
+    """Build a .npz fixture: a ZIP (STORED) of two hand-written .npy arrays."""
+    # Two arrays: w (2,3) f32, b (3,) f32.
+    w_npy = build_npz_npy((2, 3), "<f4", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    b_npy = build_npz_npy((3,), "<f4", [0.1, 0.2, 0.3])
+
+    # Deterministic zip: STORED, fixed timestamps (spec §10, same as build_pytorch).
+    if os.path.exists(path):
+        os.remove(path)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        for arcname, data in (("w.npy", w_npy), ("b.npy", b_npy)):
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, data)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -685,6 +757,7 @@ def main():
     write("model.safetensors", build_safetensors())
     write("model.gguf", build_gguf())
     build_pytorch(os.path.join(out_dir, "model.pt"))
+    build_npz(os.path.join(out_dir, "model.npz"))
     tfl = build_tflite()
     # Self-check: the file_identifier must land at bytes 4..8 and the root
     # uoffset must point inside the buffer (spec §10 priorities).
