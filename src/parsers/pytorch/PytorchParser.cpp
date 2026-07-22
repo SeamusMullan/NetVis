@@ -66,6 +66,88 @@ std::string dir_prefix(const std::string& path) {
   return path.substr(0, slash + 1);
 }
 
+// --- TorchScript op inventory (best-effort, bounded) -------------------------
+// Extract method names and op identifiers from serialized TorchScript code
+// entries. This is a BOUNDED text scan — NOT a Python parser — that harvests
+// simple patterns (def <name>, torch.<op>, aten::<op>, ops.<op>) to surface an
+// op/method inventory. Hostile/huge code → truncated result, never crash/hang.
+
+constexpr size_t kMaxCodeBytesPerFile = 512 * 1024;  // cap per code entry
+constexpr size_t kMaxIdentifiers = 512;              // cap total ops harvested
+constexpr size_t kMaxIdentifierLen = 128;            // cap individual identifier
+
+struct OpInventory {
+  std::vector<std::string> methods;
+  std::vector<std::string> ops;
+};
+
+// Check if a character is valid for a Python identifier continuation.
+bool is_ident_char(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
+// Scan code text for method definitions and op calls. Bounded, non-executing.
+void scan_torchscript_code(const uint8_t* data, size_t len, OpInventory& inv) {
+  if (len > kMaxCodeBytesPerFile) len = kMaxCodeBytesPerFile;
+
+  std::unordered_set<std::string> methods_seen;
+  std::unordered_set<std::string> ops_seen;
+
+  size_t i = 0;
+  while (i < len && (methods_seen.size() + ops_seen.size()) < kMaxIdentifiers) {
+    // Look for "def <name>(" — method definition
+    if (i + 4 <= len && data[i] == 'd' && data[i+1] == 'e' &&
+        data[i+2] == 'f' && data[i+3] == ' ') {
+      i += 4;
+      // skip whitespace
+      while (i < len && (data[i] == ' ' || data[i] == '\t')) ++i;
+      // extract identifier
+      size_t start = i;
+      while (i < len && is_ident_char(data[i])) ++i;
+      size_t ident_len = i - start;
+      if (ident_len > 0 && ident_len <= kMaxIdentifierLen) {
+        std::string method(reinterpret_cast<const char*>(data + start), ident_len);
+        if (methods_seen.insert(method).second &&
+            inv.methods.size() < kMaxIdentifiers) {
+          inv.methods.push_back(method);
+        }
+      }
+      continue;
+    }
+
+    // Look for op patterns: "torch.", "aten::", "prim::", "ops."
+    const char* patterns[] = {"torch.", "aten::", "prim::", "ops."};
+    size_t pattern_lens[] = {6, 6, 6, 4};
+    bool found_pattern = false;
+
+    for (size_t p = 0; p < 4; ++p) {
+      size_t plen = pattern_lens[p];
+      if (i + plen <= len &&
+          std::memcmp(data + i, patterns[p], plen) == 0) {
+        i += plen;
+        // extract identifier after pattern
+        size_t start = i;
+        while (i < len && is_ident_char(data[i])) ++i;
+        size_t ident_len = i - start;
+        if (ident_len > 0 && ident_len <= kMaxIdentifierLen) {
+          // reconstruct full op name (pattern + identifier)
+          std::string op = std::string(patterns[p]) +
+                          std::string(reinterpret_cast<const char*>(data + start),
+                                     ident_len);
+          if (ops_seen.insert(op).second && ops_seen.size() <= kMaxIdentifiers) {
+            inv.ops.push_back(op);
+          }
+        }
+        found_pattern = true;
+        break;
+      }
+    }
+
+    if (!found_pattern) ++i;
+  }
+}
+
 // --- state_dict walking -------------------------------------------------------
 // Recursively collect (name -> TensorRef) from the unpickled value tree. Keys
 // are joined with '.' so nested modules read like "encoder.layers.0.weight".
@@ -250,9 +332,51 @@ Result<ir::Model> parse_zip(const MappedFile& file, ProgressSink& progress) {
   collect_tensors(sd, "", model);
 
   if (has_constants || has_code) {
-    model.metadata.emplace_back(
-        model.intern("torchscript"),
-        model.intern("graph view not supported; showing parameters"));
+    // TorchScript archive: scan code entries for best-effort op/method listing
+    OpInventory inv;
+    if (has_code) {
+      for (mz_uint i = 0; i < num; ++i) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+        if (st.m_is_directory) continue;
+        std::string name = st.m_filename;
+        // Look for code/ entries (typically code/*.py)
+        if (name.find("/code/") != std::string::npos ||
+            name.rfind("code/", 0) == 0) {
+          // Extract ONLY the small code file (structural text, not payload)
+          size_t code_size = 0;
+          void* code_mem = mz_zip_reader_extract_to_heap(&zip, i, &code_size, 0);
+          if (code_mem && code_size > 0) {
+            scan_torchscript_code(reinterpret_cast<const uint8_t*>(code_mem),
+                                 code_size, inv);
+            mz_free(code_mem);
+          }
+        }
+      }
+    }
+
+    // Emit best-effort metadata
+    std::string note = "best-effort op inventory (heuristic scan); parameter table below";
+    if (!inv.methods.empty()) {
+      std::string methods_str;
+      for (size_t i = 0; i < inv.methods.size(); ++i) {
+        if (i > 0) methods_str += ", ";
+        methods_str += inv.methods[i];
+      }
+      model.metadata.emplace_back(model.intern("torchscript.methods"),
+                                  model.intern(methods_str));
+    }
+    if (!inv.ops.empty()) {
+      std::string ops_str;
+      for (size_t i = 0; i < inv.ops.size(); ++i) {
+        if (i > 0) ops_str += ", ";
+        ops_str += inv.ops[i];
+      }
+      model.metadata.emplace_back(model.intern("torchscript.ops"),
+                                  model.intern(ops_str));
+    }
+    model.metadata.emplace_back(model.intern("torchscript"),
+                                model.intern(note));
   }
   model.metadata.emplace_back(model.intern("tensors"),
                               model.intern(std::to_string(model.flat_tensors.size())));

@@ -99,10 +99,29 @@ TEST_CASE("detect PyTorch legacy pickle by protocol-2 opcode") {
   CHECK((f == Format::PyTorchLegacy || f == Format::Unknown));
 }
 
+TEST_CASE("detect CoreML by .mlmodel extension tiebreaker") {
+  // A bare CoreML Model protobuf begins with field 1 (specificationVersion,
+  // varint), which structurally looks like ONNX's ir_version. The .mlmodel
+  // extension is the decisive tiebreaker and must route to CoreML, not ONNX.
+  std::vector<uint8_t> b = {0x08, 0x04};  // specificationVersion = 4
+  // Add a neuralNetwork field (500, length-delimited): tag=(500<<3)|2=4002.
+  b.push_back(0xa2);
+  b.push_back(0x1f);
+  b.push_back(0x00);  // zero-length body
+  CHECK(detect_bytes("coreml", b, "mlmodel") == Format::CoreML);
+}
+
 TEST_CASE("detect Unknown on random bytes") {
   std::vector<uint8_t> b = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
   b.resize(32, 0);
   CHECK(detect_bytes("junk", b, "") == Format::Unknown);
+}
+
+TEST_CASE("detect Keras HDF5 by superblock signature") {
+  // HDF5 superblock magic at offset 0 -> Format::Keras (raw .h5).
+  std::vector<uint8_t> b = {0x89, 'H', 'D', 'F', '\r', '\n', 0x1a, '\n'};
+  b.resize(64, 0);
+  CHECK(detect_bytes("h5", b, "h5") == Format::Keras);
 }
 
 // --- v0.4.0: OpCategory coverage (color routing) ------------------------------

@@ -135,6 +135,8 @@ def build_onnx():
     init_w = onnx_tensor_rawdata("W", [2, 2], [1.0, 2.0, 3.0, 4.0])
     init_b = onnx_tensor_external("B", [2, 2], "weights.bin",
                                   5000000000, 16)  # 5e9 bytes > 2GB
+    # Add a small resolvable external initializer: offset 8, length 8 (2 floats).
+    init_c = onnx_tensor_external("C", [2], "weights.bin", 8, 8)
 
     graph = bytearray()
     graph += pb_len(1, conv)          # node
@@ -143,6 +145,7 @@ def build_onnx():
     graph += pb_string(2, "test_graph")  # graph name
     graph += pb_len(5, init_w)        # initializer (repeated)
     graph += pb_len(5, init_b)
+    graph += pb_len(5, init_c)
 
     model = bytearray()
     model += pb_varint(1, 1)          # ir_version
@@ -351,6 +354,49 @@ def build_pytorch(path):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
         for arcname, data in (("archive/data.pkl", pickle_bytes),
                               ("archive/data/0", storage_bytes)):
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, data)
+
+
+def build_torchscript_constants():
+    """Minimal protocol-2 pickle for constants.pkl (allowlist-safe)."""
+    p = Pickler()
+    p.proto()
+    # Empty tuple — allowlist-safe, exercises constants.pkl path
+    p.empty_tuple()
+    p.stop()
+    return bytes(p.b)
+
+
+def build_torchscript(path):
+    """TorchScript archive: data.pkl + constants.pkl + code/*.py entries."""
+    pickle_bytes = build_pytorch_pickle()
+    storage_bytes = b"".join(struct.pack("<f", float(i)) for i in range(6))  # 24 bytes
+    constants_bytes = build_torchscript_constants()
+
+    # Synthesized TorchScript code with method definitions and op calls
+    code_py = b"""
+def forward(self, x):
+    y = torch.relu(x)
+    z = torch.add(y, x)
+    return aten::matmul(z, z)
+
+def helper(a, b):
+    return ops.custom_op(a, b)
+"""
+
+    if os.path.exists(path):
+        os.remove(path)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        entries = [
+            ("archive/data.pkl", pickle_bytes),
+            ("archive/data/0", storage_bytes),
+            ("archive/constants.pkl", constants_bytes),
+            ("archive/code/model.py", code_py),
+        ]
+        for arcname, data in entries:
             info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_STORED
             info.external_attr = 0o600 << 16
@@ -668,6 +714,377 @@ def build_tflite_ctrlflow():
 
 
 # ---------------------------------------------------------------------------
+# OpenVINO IR (.xml topology + sibling .bin weight blob)  — issue #39
+# ---------------------------------------------------------------------------
+
+def build_openvino_xml():
+    """A tiny OpenVINO IR v11 net: Parameter -> Convolution(Const weight) ->
+    ReLU -> Result. The Const's <data offset="0" size="16" ...> points into the
+    16-byte model.bin sibling, exercising the external-data resolution path. Hand
+    written as text so the fixture documents the XML subset the reader accepts."""
+    return (
+        '<?xml version="1.0"?>\n'
+        '<net name="tiny_ov" version="11">\n'
+        '  <layers>\n'
+        '    <layer id="0" name="in" type="Parameter">\n'
+        '      <data shape="1,1,2,2" element_type="f32"/>\n'
+        '      <output>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="1" name="weights" type="Const">\n'
+        '      <data offset="0" size="16" element_type="f32" shape="2,2"/>\n'
+        '      <output>\n'
+        '        <port id="1" precision="FP32">\n'
+        '          <dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="2" name="conv" type="Convolution">\n'
+        '      <data strides="1,1" pads_begin="0,0" pads_end="0,0" dilations="1,1"/>\n'
+        '      <input>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '        <port id="1" precision="FP32">\n'
+        '          <dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </input>\n'
+        '      <output>\n'
+        '        <port id="2" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="3" name="relu" type="ReLU">\n'
+        '      <input>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </input>\n'
+        '      <output>\n'
+        '        <port id="1" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="4" name="out" type="Result">\n'
+        '      <input>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </input>\n'
+        '    </layer>\n'
+        '  </layers>\n'
+        '  <edges>\n'
+        '    <edge from-layer="0" from-port="0" to-layer="2" to-port="0"/>\n'
+        '    <edge from-layer="1" from-port="1" to-layer="2" to-port="1"/>\n'
+        '    <edge from-layer="2" from-port="2" to-layer="3" to-port="0"/>\n'
+        '    <edge from-layer="3" from-port="1" to-layer="4" to-port="0"/>\n'
+        '  </edges>\n'
+        '  <rt_info/>\n'
+        '</net>\n'
+    ).encode("utf-8")
+
+
+def build_openvino_bin():
+    """The sibling weight blob: 16 bytes = four F32 (a 2x2 Const)."""
+    return b"".join(struct.pack("<f", f) for f in (1.0, 2.0, 3.0, 4.0))
+
+
+# ---------------------------------------------------------------------------
+# NumPy .npz (zip of .npy arrays)
+# ---------------------------------------------------------------------------
+
+def build_npz_npy(shape, dtype_descr, values):
+    """Build a single .npy array: magic, version, header dict, payload.
+    shape: tuple of dims, e.g. (2, 3).
+    dtype_descr: NumPy descr string, e.g. '<f4'.
+    values: flat list of numeric values (will be packed per descr).
+    """
+    # Shape tuple string: "(2, 3)" for rank>=2, "(3,)" for rank 1, "()" for scalar.
+    if len(shape) == 0:
+        shape_str = "()"
+    elif len(shape) == 1:
+        shape_str = f"({shape[0]},)"
+    else:
+        shape_str = "(" + ", ".join(str(d) for d in shape) + ")"
+
+    # Header dict (Python literal).
+    dict_str = f"{{'descr': '{dtype_descr}', 'fortran_order': False, 'shape': {shape_str}, }}"
+
+    # Version 1.0: magic(6) + version(2) + u16 header_len + dict + padding to 64-byte boundary.
+    magic = b"\x93NUMPY"
+    version = b"\x01\x00"
+    preamble_size = 6 + 2 + 2  # magic + version + u16
+    dict_bytes = dict_str.encode("utf-8")
+    # Total before padding: preamble + dict + '\n'.
+    unpadded = preamble_size + len(dict_bytes) + 1
+    # Pad to 64-byte boundary.
+    total = ((unpadded + 63) // 64) * 64
+    pad = total - unpadded
+    dict_bytes += b" " * pad + b"\n"
+    header_len = len(dict_bytes)
+
+    # Payload: pack values according to dtype_descr.
+    payload = bytearray()
+    if dtype_descr == "<f4":
+        for v in values:
+            payload += struct.pack("<f", float(v))
+    elif dtype_descr == "<i4":
+        for v in values:
+            payload += struct.pack("<i", int(v))
+    else:
+        # Extend as needed; for the fixture we only need f4.
+        raise ValueError(f"unsupported dtype_descr: {dtype_descr}")
+
+    out = bytearray()
+    out += magic
+    out += version
+    out += struct.pack("<H", header_len)
+    out += dict_bytes
+    out += payload
+    return bytes(out)
+
+
+def build_npz(path):
+    """Build a .npz fixture: a ZIP (STORED) of two hand-written .npy arrays."""
+    # Two arrays: w (2,3) f32, b (3,) f32.
+    w_npy = build_npz_npy((2, 3), "<f4", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    b_npy = build_npz_npy((3,), "<f4", [0.1, 0.2, 0.3])
+
+    # Deterministic zip: STORED, fixed timestamps (spec §10, same as build_pytorch).
+    if os.path.exists(path):
+        os.remove(path)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        for arcname, data in (("w.npy", w_npy), ("b.npy", b_npy)):
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, data)
+
+
+# ---------------------------------------------------------------------------
+# CoreML .mlmodel (protobuf Model / NeuralNetwork / NeuralNetworkLayer)
+# ---------------------------------------------------------------------------
+# Reuses the generic pb_* helpers above. Field numbers verified against Apple
+# coremltools mlmodel/format/{Model,NeuralNetwork}.proto:
+#   Model:              1 specificationVersion, 2 description, 500 neuralNetwork
+#   NeuralNetwork:      1 layers (repeated NeuralNetworkLayer)
+#   NeuralNetworkLayer: 1 name, 2 input(rep), 3 output(rep), 140 innerProduct
+#   InnerProductLayer:  ... 5 weights (WeightParams)
+#   WeightParams:       30 rawValue (bytes)  <- payload; parser records offset+len
+#   ModelDescription:   1 input, 10 output (repeated FeatureDescription)
+#   FeatureDescription: 1 name
+
+
+def coreml_weight_params_raw(raw):
+    """WeightParams with rawValue(30) bytes — the payload the parser records as a
+    TensorRef offset+len and never decodes."""
+    return pb_len(30, raw)
+
+
+def coreml_inner_product(weight_raw):
+    """InnerProductLayer with a weights(5) WeightParams sub-message."""
+    return pb_len(5, coreml_weight_params_raw(weight_raw))
+
+
+def coreml_layer(name, inputs, outputs, kind_field, kind_body):
+    """NeuralNetworkLayer: name(1), input(2)*, output(3)*, oneof layer(kind_field)."""
+    b = bytearray()
+    b += pb_string(1, name)
+    for i in inputs:
+        b += pb_string(2, i)
+    for o in outputs:
+        b += pb_string(3, o)
+    b += pb_len(kind_field, kind_body)   # oneof layer (e.g. 140 = innerProduct)
+    return bytes(b)
+
+
+def coreml_feature(name):
+    """FeatureDescription: name(1)."""
+    return pb_string(1, name)
+
+
+def build_coreml_mlmodel():
+    # One innerProduct layer: input "data" -> output "fc_out", with a rawValue
+    # weight of four F32 (16 bytes). The parser records the rawValue sub-range as
+    # a TensorRef offset+len (never read) and wires data->fc_out edges.
+    weight_raw = b"".join(struct.pack("<f", f) for f in (1.0, 2.0, 3.0, 4.0))
+    ip = coreml_inner_product(weight_raw)
+    layer = coreml_layer("fc1", ["data"], ["fc_out"], 140, ip)
+
+    neural_network = pb_len(1, layer)     # NeuralNetwork.layers (repeated)
+
+    description = bytearray()
+    description += pb_len(1, coreml_feature("data"))     # input FeatureDescription
+    description += pb_len(10, coreml_feature("fc_out"))  # output FeatureDescription
+
+    model = bytearray()
+    model += pb_varint(1, 4)              # specificationVersion = 4
+    model += pb_len(2, bytes(description))  # description (ModelDescription)
+    model += pb_len(500, neural_network)  # neuralNetwork (oneof Type)
+    return bytes(model)
+
+
+# ---------------------------------------------------------------------------
+# Keras / HDF5 (classic symbol-table form) — hand-encoded, matches the minimal
+# reader in src/parsers/keras/Hdf5Reader.cpp exactly.
+#
+# Layout (all 8-byte offsets/lengths, superblock v0, v1 object headers):
+#   superblock -> root-group symbol-table entry -> root-group object header
+#   (one Symbol Table Message giving B-tree + local-heap addresses) ->
+#   v1 B-tree "TREE" (1 leaf entry) -> "SNOD" (1 symbol "kernel") ->
+#   dataset object header (Dataspace [2,2] + Datatype F32 + contiguous Layout)
+#   -> 16 bytes of raw F32 data. The reader records only (offset,len).
+# ---------------------------------------------------------------------------
+
+def _h5_object_header(messages):
+    """v1 object header: 16-byte prefix (version, msg count, refcount, size,
+    pad) + concatenated messages. Each message's data is already 8-padded."""
+    body = b"".join(messages)
+    hdr = bytearray()
+    hdr += bytes([1, 0])                       # version 1, reserved
+    hdr += struct.pack("<H", len(messages))    # number of header messages
+    hdr += struct.pack("<I", 1)                # object reference count
+    hdr += struct.pack("<I", len(body))        # header size (all message bytes)
+    hdr += bytes(4)                            # pad prefix to 16 bytes
+    return bytes(hdr) + body
+
+
+def _h5_message(type_id, data):
+    """v1 header message: type(2), size(2), flags(1), reserved(3), then data.
+    Data is padded to a multiple of 8 as the format requires."""
+    pad = (-len(data)) % 8
+    data = data + bytes(pad)
+    return struct.pack("<H", type_id) + struct.pack("<H", len(data)) + bytes([0]) + bytes(3) + data
+
+
+def build_keras_h5():
+    U = 0xFFFFFFFFFFFFFFFF  # HDF5 "undefined address"
+
+    # --- fixed-size blocks; compute absolute addresses up front --------------
+    SB_LEN = 96
+    ROOT_OH_LEN = 16 + 24          # prefix + one 24-byte Symbol Table Message
+    HEAP_HDR_LEN = 32
+    HEAPDATA_LEN = 16
+    BTREE_LEN = 48
+    SNOD_LEN = 48
+    DSET_OH_LEN = 16 + 96          # prefix + 3 * (8 hdr + 24 data)
+    DATA_LEN = 16
+
+    a_root_oh = SB_LEN
+    a_heap = a_root_oh + ROOT_OH_LEN
+    a_heapdata = a_heap + HEAP_HDR_LEN
+    a_btree = a_heapdata + HEAPDATA_LEN
+    a_snod = a_btree + BTREE_LEN
+    a_dset_oh = a_snod + SNOD_LEN
+    a_data = a_dset_oh + DSET_OH_LEN
+    eof = a_data + DATA_LEN
+
+    # --- superblock v0 (96 bytes) -------------------------------------------
+    sb = bytearray()
+    sb += b"\x89HDF\r\n\x1a\n"                  # 0-7  signature
+    sb += bytes([0, 0, 0, 0, 0])               # 8-12 versions + reserved
+    sb += bytes([8])                           # 13   size of offsets
+    sb += bytes([8])                           # 14   size of lengths
+    sb += bytes([0])                           # 15   reserved
+    sb += struct.pack("<H", 4)                 # 16-17 group leaf node K
+    sb += struct.pack("<H", 16)                # 18-19 group internal node K
+    sb += struct.pack("<I", 0)                 # 20-23 consistency flags
+    sb += struct.pack("<Q", 0)                 # 24-31 base address
+    sb += struct.pack("<Q", U)                 # 32-39 free-space address
+    sb += struct.pack("<Q", eof)               # 40-47 end-of-file address
+    sb += struct.pack("<Q", U)                 # 48-55 driver info address
+    # root-group symbol-table entry (40 bytes) at offset 56
+    sb += struct.pack("<Q", 0)                 # 56-63 link name offset
+    sb += struct.pack("<Q", a_root_oh)         # 64-71 object header address
+    sb += struct.pack("<I", 1)                 # 72-75 cache type 1
+    sb += struct.pack("<I", 0)                 # 76-79 reserved
+    sb += struct.pack("<Q", a_btree)           # 80-87 scratch: B-tree addr
+    sb += struct.pack("<Q", a_heap)            # 88-95 scratch: heap addr
+    assert len(sb) == SB_LEN
+
+    # --- root group object header (Symbol Table Message: btree + heap) -------
+    stm = struct.pack("<Q", a_btree) + struct.pack("<Q", a_heap)   # 16 bytes
+    root_oh = _h5_object_header([_h5_message(0x0011, stm)])
+    assert len(root_oh) == ROOT_OH_LEN, (len(root_oh), ROOT_OH_LEN)
+
+    # --- local heap: header + data segment ("kernel\0" at offset 8) ----------
+    heap = bytearray()
+    heap += b"HEAP" + bytes([0]) + bytes(3)    # signature, version, reserved
+    heap += struct.pack("<Q", HEAPDATA_LEN)    # data segment size
+    heap += struct.pack("<Q", 0)               # free-list head offset
+    heap += struct.pack("<Q", a_heapdata)      # data segment address
+    assert len(heap) == HEAP_HDR_LEN
+    heapdata = bytearray(HEAPDATA_LEN)
+    name = b"kernel\x00"
+    heapdata[8:8 + len(name)] = name           # name offset 8
+
+    # --- v1 B-tree (group nodes, 1 leaf entry -> SNOD) -----------------------
+    bt = bytearray()
+    bt += b"TREE" + bytes([0]) + bytes([0]) + struct.pack("<H", 1)  # sig,type0,level0,entries1
+    bt += struct.pack("<Q", U) + struct.pack("<Q", U)               # left/right sibling
+    bt += struct.pack("<Q", 0)                 # key0 (heap offset)
+    bt += struct.pack("<Q", a_snod)            # child0 -> SNOD
+    bt += struct.pack("<Q", 0)                 # key1 (heap offset)
+    assert len(bt) == BTREE_LEN
+
+    # --- SNOD: one symbol "kernel" -> dataset object header ------------------
+    snod = bytearray()
+    snod += b"SNOD" + bytes([1]) + bytes([0]) + struct.pack("<H", 1)
+    snod += struct.pack("<Q", 8)               # name offset in heap -> "kernel"
+    snod += struct.pack("<Q", a_dset_oh)       # object header address
+    snod += struct.pack("<I", 0)               # cache type 0
+    snod += struct.pack("<I", 0)               # reserved
+    snod += bytes(16)                          # scratch pad
+    assert len(snod) == SNOD_LEN
+
+    # --- dataset object header: Dataspace + Datatype + Layout ---------------
+    # Dataspace v1: version, rank, flags, reserved(1), reserved(4), dims[2,2].
+    dspace = bytes([1, 2, 0, 0]) + bytes(4) + struct.pack("<Q", 2) + struct.pack("<Q", 2)
+    # Datatype v1: class=1 (float), size=4, IEEE-F32LE properties (ignored by reader).
+    dtype = bytes([0x11]) + bytes([0x20, 0x3f, 0x00]) + struct.pack("<I", 4)
+    dtype += struct.pack("<H", 0) + struct.pack("<H", 32) + bytes([23, 8, 0, 23]) + struct.pack("<I", 127)
+    # Data Layout v3: contiguous -> (address, size).
+    layout = bytes([3, 1]) + struct.pack("<Q", a_data) + struct.pack("<Q", DATA_LEN)
+    dset_oh = _h5_object_header([
+        _h5_message(0x0001, dspace),
+        _h5_message(0x0003, dtype),
+        _h5_message(0x0008, layout),
+    ])
+    assert len(dset_oh) == DSET_OH_LEN, (len(dset_oh), DSET_OH_LEN)
+
+    data = struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)
+
+    blob = bytes(sb) + root_oh + bytes(heap) + bytes(heapdata) + bytes(bt) + \
+        bytes(snod) + dset_oh + data
+    assert len(blob) == eof, (len(blob), eof)
+    return blob
+
+
+def build_keras_v3(out_dir):
+    """A Keras-v3 archive: config.json + metadata.json + model.weights.h5, STORED
+    so the embedded HDF5 payload offset is resolvable from the local file header."""
+    path = os.path.join(out_dir, "model.keras")
+    if os.path.exists(path):
+        os.remove(path)
+    config = b'{"module":"keras","class_name":"Sequential","config":{"name":"seq"}}'
+    metadata = b'{"keras_version":"3.0.0","date_saved":"2026-07-22"}'
+    weights = build_keras_h5()
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        for arcname, blob in (("config.json", config),
+                              ("metadata.json", metadata),
+                              ("model.weights.h5", weights)):
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, blob)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -682,9 +1099,15 @@ def main():
             f.write(data)
 
     write("model.onnx", build_onnx())
+    # Write sibling weights.bin for ONNX external-data resolution test.
+    # Layout: 8 bytes padding + 8 bytes resolvable data (2 F32: 5.0, 6.0).
+    weights_bin = b"\x00" * 8 + struct.pack("<f", 5.0) + struct.pack("<f", 6.0)
+    write("weights.bin", weights_bin)
     write("model.safetensors", build_safetensors())
     write("model.gguf", build_gguf())
     build_pytorch(os.path.join(out_dir, "model.pt"))
+    build_npz(os.path.join(out_dir, "model.npz"))
+    build_torchscript(os.path.join(out_dir, "model_ts.pt"))
     tfl = build_tflite()
     # Self-check: the file_identifier must land at bytes 4..8 and the root
     # uoffset must point inside the buffer (spec §10 priorities).
@@ -698,6 +1121,16 @@ def main():
     root_cf = struct.unpack_from("<I", tfl_cf, 0)[0]
     assert 0 < root_cf < len(tfl_cf), "TFLite ctrlflow root offset out of range"
     write("model_ctrlflow.tflite", tfl_cf)
+
+    # OpenVINO IR: .xml topology + sibling .bin weight blob (issue #39). The
+    # .bin MUST be a real sibling so external-data resolution is exercised.
+    write("model.xml", build_openvino_xml())
+    write("model.bin", build_openvino_bin())
+    write("model.mlmodel", build_coreml_mlmodel())
+    h5 = build_keras_h5()
+    assert h5[:8] == b"\x89HDF\r\n\x1a\n", "HDF5 signature misplaced"
+    write("model.h5", h5)
+    build_keras_v3(out_dir)
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):

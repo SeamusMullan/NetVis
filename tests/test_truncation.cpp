@@ -106,3 +106,25 @@ TEST_CASE("truncation: TFLite parser stays safe at every 1/8th") {
   truncation_sweep("tflite", fixture("model.tflite"),
                    [](const MappedFile& f, ProgressSink& p) { return tflite::parse(f, p); });
 }
+
+TEST_CASE("truncation: OpenVINO IR parser stays safe at every 1/8th") {
+  truncation_sweep("ovxml", fixture("model.xml"),
+                   [](const MappedFile& f, ProgressSink& p) { return openvino::parse(f, p); });
+}
+
+TEST_CASE("truncation: NumPy .npz parser stays safe at every 1/8th") {
+  truncation_sweep("npz", fixture("model.npz"),
+                   [](const MappedFile& f, ProgressSink& p) { return npz::parse(f, p); });
+}
+
+TEST_CASE("truncation: CoreML parser stays safe at every 1/8th") {
+  truncation_sweep("mlmodel", fixture("model.mlmodel"),
+                   [](const MappedFile& f, ProgressSink& p) { return coreml::parse(f, p); });
+}
+
+TEST_CASE("truncation: Keras HDF5 parser stays safe at every 1/8th") {
+  truncation_sweep("keras_h5", fixture("model.h5"),
+                   [](const MappedFile& f, ProgressSink& p) { return keras::parse(f, p); });
+  truncation_sweep("keras_v3", fixture("model.keras"),
+                   [](const MappedFile& f, ProgressSink& p) { return keras::parse(f, p); });
+}
