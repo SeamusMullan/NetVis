@@ -10,5 +10,7 @@ tests/fixtures/*.tflite
 tests/fixtures/*.safetensors
 tests/fixtures/*.gguf
 tests/fixtures/*.pt
+tests/fixtures/*.xml
+tests/fixtures/*.bin
 .wf/
 imgui.ini
