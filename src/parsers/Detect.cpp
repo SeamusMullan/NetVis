@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
+
+#include "core/ByteReader.h"
 
 namespace netvis {
 
@@ -19,6 +22,10 @@ const char* format_name(Format f) {
     case Format::GGUF:          return "GGUF";
     case Format::PyTorchZip:    return "PyTorch";
     case Format::PyTorchLegacy: return "PyTorch";
+    case Format::OpenVINO:      return "OpenVINO";
+    case Format::Npz:           return "NumPy npz";
+    case Format::Keras:         return "Keras";
+    case Format::CoreML:        return "CoreML";
     case Format::Unknown:       return "Unknown";
   }
   return "Unknown";
@@ -104,6 +111,111 @@ bool looks_like_onnx_proto(const uint8_t* d, uint64_t size) {
   return saw_signal;
 }
 
+// ---- ZIP central-directory peek (shared by .npz / .keras / PyTorch) --------
+// All three begin with the local-file-header magic "PK\x03\x04", so magic alone
+// cannot tell them apart. We locate the End Of Central Directory record and scan
+// the central directory filenames, testing each against a predicate. Everything
+// is bounds-checked; a truncated/absurd zip simply yields "no match" (never a
+// crash, never an over-read). This is a bounded structural scan, not a full zip
+// parse — enough to classify the archive.
+struct ZipFlags {
+  bool any_npy = false;         // an entry ends in ".npy"        -> npz
+  bool keras_config = false;    // has "config.json"             -> keras v3
+  bool keras_weights = false;   // has "model.weights.h5"        -> keras v3
+  bool pytorch_pkl = false;     // has "*/data.pkl" or "data.pkl" -> PyTorch
+};
+
+bool ends_with(std::string_view s, std::string_view suf) {
+  return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+}
+
+std::string_view basename_view(std::string_view s) {
+  auto sl = s.find_last_of('/');
+  return sl == std::string_view::npos ? s : s.substr(sl + 1);
+}
+
+// Scan the ZIP central directory for the filename signals above. Reads through
+// ByteReader so any malformed offset/length is caught, not fatal.
+ZipFlags scan_zip_names(const uint8_t* d, uint64_t size) {
+  ZipFlags fl;
+  constexpr uint32_t kEocdSig = 0x06054b50;   // "PK\x05\x06"
+  constexpr uint32_t kCenSig  = 0x02014b50;   // "PK\x01\x02"
+  // EOCD is within the last 64KiB+22 bytes; search backwards for its signature.
+  if (size < 22) return fl;
+  uint64_t max_back = size < (0x10000ULL + 22) ? size : (0x10000ULL + 22);
+  uint64_t start = size - max_back;
+  uint64_t eocd = UINT64_MAX;
+  for (uint64_t p = size - 22; p + 22 <= size && p + 1 >= start + 1; --p) {
+    uint32_t sig;
+    std::memcpy(&sig, d + p, 4);
+    if (sig == kEocdSig) { eocd = p; break; }
+    if (p == start) break;
+  }
+  if (eocd == UINT64_MAX) return fl;
+
+  ByteReader r(d, size);
+  if (!r.seek(eocd + 10)) return fl;
+  auto n_entries = r.u16le();
+  if (!n_entries) return fl;
+  if (!r.seek(eocd + 16)) return fl;
+  auto cd_off = r.u32le();
+  if (!cd_off) return fl;
+
+  uint64_t off = *cd_off;
+  uint32_t count = *n_entries;
+  // Cap the scan so a bogus entry count can't spin.
+  for (uint32_t i = 0; i < count && i < 4096; ++i) {
+    if (!r.seek(off)) break;
+    auto sig = r.u32le();
+    if (!sig || *sig != kCenSig) break;
+    if (!r.seek(off + 28)) break;
+    auto fn_len = r.u16le();
+    auto extra_len = r.u16le();
+    auto comment_len = r.u16le();
+    if (!fn_len || !extra_len || !comment_len) break;
+    if (!r.seek(off + 46)) break;
+    auto name = r.bytes(*fn_len);        // filename bytes are structural
+    if (!name) break;
+    std::string_view nm(*name);
+    std::string_view bn = basename_view(nm);
+    if (ends_with(nm, ".npy")) fl.any_npy = true;
+    if (bn == "config.json") fl.keras_config = true;
+    if (bn == "model.weights.h5") fl.keras_weights = true;
+    if (bn == "data.pkl") fl.pytorch_pkl = true;
+    off += 46ULL + *fn_len + *extra_len + *comment_len;
+  }
+  return fl;
+}
+
+// HDF5 superblock magic "\x89HDF\r\n\x1a\n". The superblock may sit at offset 0
+// or an aligned 2^k*512 boundary; we check a bounded set of aligned offsets.
+bool looks_like_hdf5(const uint8_t* d, uint64_t size) {
+  static const uint8_t kMagic[8] = {0x89, 'H', 'D', 'F', '\r', '\n', 0x1a, '\n'};
+  const uint64_t offs[] = {0, 512, 1024, 2048, 4096, 8192};
+  for (uint64_t o : offs) {
+    if (o + 8 <= size && std::memcmp(d + o, kMagic, 8) == 0) return true;
+  }
+  return false;
+}
+
+// OpenVINO IR sniff: XML text whose root element is <net ...> with a
+// version="10|11" attribute. Scans a bounded prefix; tolerant of a leading
+// <?xml?> declaration and whitespace/comments. Never a false positive on a bare
+// .xml that isn't an IR (the "<net" + version gate).
+bool looks_like_openvino_xml(const uint8_t* d, uint64_t size) {
+  uint64_t scan = size < 2048 ? size : 2048;
+  std::string_view sv(reinterpret_cast<const char*>(d), scan);
+  auto net = sv.find("<net");
+  if (net == std::string_view::npos) return false;
+  // Require a version attribute of 10 or 11 somewhere in the root tag region.
+  auto ver = sv.find("version=", net);
+  if (ver == std::string_view::npos) return false;
+  std::string_view rest = sv.substr(ver + 8);
+  // Skip an opening quote.
+  if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'')) rest = rest.substr(1);
+  return rest.rfind("10", 0) == 0 || rest.rfind("11", 0) == 0;
+}
+
 }  // namespace
 
 Format detect_format(const MappedFile& file, const std::string& ext_hint) {
@@ -131,15 +243,40 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint) {
     }
   }
 
-  // PyTorch zip-based (.pt/.pth/.bin): local file header magic "PK\x03\x04".
-  if (size >= 4 && std::memcmp(d, "PK\x03\x04", 4) == 0) return Format::PyTorchZip;
+  // ZIP-based formats all start with the local-file-header magic "PK\x03\x04":
+  // NumPy .npz, Keras v3 .keras, and PyTorch .pt/.pth. Disambiguate by scanning
+  // the central-directory filenames (bounded, bounds-checked).
+  if (size >= 4 && std::memcmp(d, "PK\x03\x04", 4) == 0) {
+    ZipFlags fl = scan_zip_names(d, size);
+    // PyTorch is the most specific signal (a data.pkl object graph); prefer it.
+    if (fl.pytorch_pkl) return Format::PyTorchZip;
+    if (fl.keras_config && fl.keras_weights) return Format::Keras;
+    if (fl.any_npy) return Format::Npz;
+    // Ambiguous zip: fall through to the extension tiebreaker below.
+    if (ext_hint == "npz") return Format::Npz;
+    if (ext_hint == "keras") return Format::Keras;
+    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin")
+      return Format::PyTorchZip;
+    // Unknown zip contents: default to PyTorch zip (its parser errors cleanly
+    // if there is no data.pkl) rather than mis-claiming a tensor format.
+    return Format::PyTorchZip;
+  }
+
+  // Keras legacy / raw HDF5 (.h5): superblock magic at an aligned offset.
+  if (looks_like_hdf5(d, size)) return Format::Keras;
+
+  // OpenVINO IR: XML text with a <net version="10|11"> root element.
+  if (looks_like_openvino_xml(d, size)) return Format::OpenVINO;
 
   // Legacy pickle: opcode PROTO (0x80) followed by protocol byte 2..5.
   if (size >= 2 && d[0] == 0x80 && d[1] >= 0x02 && d[1] <= 0x05) {
     return Format::PyTorchLegacy;
   }
 
-  // ONNX: plausible top-level protobuf ModelProto.
+  // ONNX: plausible top-level protobuf ModelProto. Runs before CoreML because a
+  // bare CoreML .mlmodel is also a protobuf and would otherwise be ambiguous;
+  // ONNX carries the ir_version/graph structural signal, CoreML falls to the
+  // .mlmodel extension tiebreaker below.
   if (looks_like_onnx_proto(d, size)) return Format::ONNX;
 
   // Extension tiebreaker for ambiguous content.
@@ -148,6 +285,11 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint) {
     if (ext_hint == "tflite") return Format::TFLite;
     if (ext_hint == "safetensors") return Format::SafeTensors;
     if (ext_hint == "gguf") return Format::GGUF;
+    if (ext_hint == "xml") return Format::OpenVINO;
+    if (ext_hint == "npz") return Format::Npz;
+    if (ext_hint == "keras" || ext_hint == "h5" || ext_hint == "hdf5")
+      return Format::Keras;
+    if (ext_hint == "mlmodel") return Format::CoreML;
     if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
       return Format::PyTorchZip;
     }
@@ -167,6 +309,10 @@ Result<ir::Model> parse_model(const MappedFile& file, const std::string& ext_hin
     case Format::GGUF:          return gguf::parse(file, progress);
     case Format::PyTorchZip:    return pytorch::parse_zip(file, progress);
     case Format::PyTorchLegacy: return pytorch::parse_legacy(file, progress);
+    case Format::OpenVINO:      return openvino::parse(file, progress);
+    case Format::Npz:           return npz::parse(file, progress);
+    case Format::Keras:         return keras::parse(file, progress);
+    case Format::CoreML:        return coreml::parse(file, progress);
     case Format::Unknown:
       return err("unrecognized model file format", UINT64_MAX);
   }

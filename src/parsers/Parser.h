@@ -25,6 +25,12 @@ enum class Format : uint8_t {
   GGUF,
   PyTorchZip,     // modern zip-based .pt/.pth/.bin
   PyTorchLegacy,  // standalone pickle
+  // v0.5.0 format-breadth additions. APPEND ONLY — detection & any persisted
+  // state key off the format NAME, but never renumber the existing values.
+  OpenVINO,       // .xml topology + sibling .bin weight blob
+  Npz,            // NumPy .npz — zip of .npy arrays
+  Keras,          // .h5 / .keras (HDF5, or keras-v3 zip)
+  CoreML,         // .mlmodel — CoreML Model protobuf
 };
 
 const char* format_name(Format f);
@@ -49,5 +55,10 @@ namespace pytorch {
 Result<ir::Model> parse_zip(const MappedFile&, ProgressSink&);
 Result<ir::Model> parse_legacy(const MappedFile&, ProgressSink&);
 }  // namespace pytorch
+// v0.5.0 format-breadth parsers (one TU each under parsers/<fmt>/).
+namespace openvino { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
+namespace npz { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
+namespace keras { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
+namespace coreml { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
 
 }  // namespace netvis

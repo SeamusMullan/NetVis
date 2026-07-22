@@ -205,4 +205,4 @@ cd build && cpack        # generator auto-selected per OS
 No model editing, no inference/execution, no dequantization of GGUF quant blocks,
 no TorchScript/FX graph reconstruction, no web build. (A plugin system — declarative
 op definitions plus a sandboxed WASM tier for parsers/passes — is designed for a
-future release; see `docs/v0.5.0-plan.md`.)
+future release; see `docs/v0.6.0-plan.md`.)
