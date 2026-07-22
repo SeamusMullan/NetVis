@@ -116,3 +116,8 @@ TEST_CASE("truncation: NumPy .npz parser stays safe at every 1/8th") {
   truncation_sweep("npz", fixture("model.npz"),
                    [](const MappedFile& f, ProgressSink& p) { return npz::parse(f, p); });
 }
+
+TEST_CASE("truncation: CoreML parser stays safe at every 1/8th") {
+  truncation_sweep("mlmodel", fixture("model.mlmodel"),
+                   [](const MappedFile& f, ProgressSink& p) { return coreml::parse(f, p); });
+}

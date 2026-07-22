@@ -12,5 +12,9 @@ tests/fixtures/*.gguf
 tests/fixtures/*.pt
 tests/fixtures/*.xml
 tests/fixtures/*.bin
+tests/fixtures/*.mlmodel
+tests/fixtures/*.npz
+tests/fixtures/*.h5
+tests/fixtures/*.keras
 .wf/
 imgui.ini

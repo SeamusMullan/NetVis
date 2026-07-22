@@ -867,6 +867,69 @@ def build_npz(path):
 
 
 # ---------------------------------------------------------------------------
+# CoreML .mlmodel (protobuf Model / NeuralNetwork / NeuralNetworkLayer)
+# ---------------------------------------------------------------------------
+# Reuses the generic pb_* helpers above. Field numbers verified against Apple
+# coremltools mlmodel/format/{Model,NeuralNetwork}.proto:
+#   Model:              1 specificationVersion, 2 description, 500 neuralNetwork
+#   NeuralNetwork:      1 layers (repeated NeuralNetworkLayer)
+#   NeuralNetworkLayer: 1 name, 2 input(rep), 3 output(rep), 140 innerProduct
+#   InnerProductLayer:  ... 5 weights (WeightParams)
+#   WeightParams:       30 rawValue (bytes)  <- payload; parser records offset+len
+#   ModelDescription:   1 input, 10 output (repeated FeatureDescription)
+#   FeatureDescription: 1 name
+
+
+def coreml_weight_params_raw(raw):
+    """WeightParams with rawValue(30) bytes — the payload the parser records as a
+    TensorRef offset+len and never decodes."""
+    return pb_len(30, raw)
+
+
+def coreml_inner_product(weight_raw):
+    """InnerProductLayer with a weights(5) WeightParams sub-message."""
+    return pb_len(5, coreml_weight_params_raw(weight_raw))
+
+
+def coreml_layer(name, inputs, outputs, kind_field, kind_body):
+    """NeuralNetworkLayer: name(1), input(2)*, output(3)*, oneof layer(kind_field)."""
+    b = bytearray()
+    b += pb_string(1, name)
+    for i in inputs:
+        b += pb_string(2, i)
+    for o in outputs:
+        b += pb_string(3, o)
+    b += pb_len(kind_field, kind_body)   # oneof layer (e.g. 140 = innerProduct)
+    return bytes(b)
+
+
+def coreml_feature(name):
+    """FeatureDescription: name(1)."""
+    return pb_string(1, name)
+
+
+def build_coreml_mlmodel():
+    # One innerProduct layer: input "data" -> output "fc_out", with a rawValue
+    # weight of four F32 (16 bytes). The parser records the rawValue sub-range as
+    # a TensorRef offset+len (never read) and wires data->fc_out edges.
+    weight_raw = b"".join(struct.pack("<f", f) for f in (1.0, 2.0, 3.0, 4.0))
+    ip = coreml_inner_product(weight_raw)
+    layer = coreml_layer("fc1", ["data"], ["fc_out"], 140, ip)
+
+    neural_network = pb_len(1, layer)     # NeuralNetwork.layers (repeated)
+
+    description = bytearray()
+    description += pb_len(1, coreml_feature("data"))     # input FeatureDescription
+    description += pb_len(10, coreml_feature("fc_out"))  # output FeatureDescription
+
+    model = bytearray()
+    model += pb_varint(1, 4)              # specificationVersion = 4
+    model += pb_len(2, bytes(description))  # description (ModelDescription)
+    model += pb_len(500, neural_network)  # neuralNetwork (oneof Type)
+    return bytes(model)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -908,6 +971,7 @@ def main():
     # .bin MUST be a real sibling so external-data resolution is exercised.
     write("model.xml", build_openvino_xml())
     write("model.bin", build_openvino_bin())
+    write("model.mlmodel", build_coreml_mlmodel())
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):
