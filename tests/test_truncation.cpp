@@ -111,3 +111,8 @@ TEST_CASE("truncation: OpenVINO IR parser stays safe at every 1/8th") {
   truncation_sweep("ovxml", fixture("model.xml"),
                    [](const MappedFile& f, ProgressSink& p) { return openvino::parse(f, p); });
 }
+
+TEST_CASE("truncation: NumPy .npz parser stays safe at every 1/8th") {
+  truncation_sweep("npz", fixture("model.npz"),
+                   [](const MappedFile& f, ProgressSink& p) { return npz::parse(f, p); });
+}
