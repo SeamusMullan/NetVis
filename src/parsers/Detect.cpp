@@ -273,10 +273,18 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint) {
     return Format::PyTorchLegacy;
   }
 
-  // ONNX: plausible top-level protobuf ModelProto. Runs before CoreML because a
-  // bare CoreML .mlmodel is also a protobuf and would otherwise be ambiguous;
-  // ONNX carries the ir_version/graph structural signal, CoreML falls to the
-  // .mlmodel extension tiebreaker below.
+  // CoreML .mlmodel is a bare `Model` protobuf whose first field
+  // (specificationVersion, a field-1 varint) structurally mimics ONNX's
+  // ir_version, so a bare .mlmodel also satisfies looks_like_onnx_proto. The
+  // two are otherwise ambiguous, so the `.mlmodel` extension is the decisive
+  // tiebreaker (spec §5): a file carrying it routes to CoreML before the ONNX
+  // structural sniff below could claim it.
+  if (ext_hint == "mlmodel") return Format::CoreML;
+
+  // ONNX: plausible top-level protobuf ModelProto. Runs after the .mlmodel
+  // guard because a bare CoreML protobuf would otherwise be misread as ONNX;
+  // ONNX carries the ir_version/graph structural signal for extension-less
+  // protobufs.
   if (looks_like_onnx_proto(d, size)) return Format::ONNX;
 
   // Extension tiebreaker for ambiguous content.
