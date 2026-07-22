@@ -360,6 +360,49 @@ def build_pytorch(path):
             zf.writestr(info, data)
 
 
+def build_torchscript_constants():
+    """Minimal protocol-2 pickle for constants.pkl (allowlist-safe)."""
+    p = Pickler()
+    p.proto()
+    # Empty tuple — allowlist-safe, exercises constants.pkl path
+    p.empty_tuple()
+    p.stop()
+    return bytes(p.b)
+
+
+def build_torchscript(path):
+    """TorchScript archive: data.pkl + constants.pkl + code/*.py entries."""
+    pickle_bytes = build_pytorch_pickle()
+    storage_bytes = b"".join(struct.pack("<f", float(i)) for i in range(6))  # 24 bytes
+    constants_bytes = build_torchscript_constants()
+
+    # Synthesized TorchScript code with method definitions and op calls
+    code_py = b"""
+def forward(self, x):
+    y = torch.relu(x)
+    z = torch.add(y, x)
+    return aten::matmul(z, z)
+
+def helper(a, b):
+    return ops.custom_op(a, b)
+"""
+
+    if os.path.exists(path):
+        os.remove(path)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        entries = [
+            ("archive/data.pkl", pickle_bytes),
+            ("archive/data/0", storage_bytes),
+            ("archive/constants.pkl", constants_bytes),
+            ("archive/code/model.py", code_py),
+        ]
+        for arcname, data in entries:
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, data)
+
+
 # ---------------------------------------------------------------------------
 # TFLite: a hand-built FlatBufferBuilder (bottom-up, vtables, alignment)
 # ---------------------------------------------------------------------------
@@ -846,6 +889,7 @@ def main():
     write("model.gguf", build_gguf())
     build_pytorch(os.path.join(out_dir, "model.pt"))
     build_npz(os.path.join(out_dir, "model.npz"))
+    build_torchscript(os.path.join(out_dir, "model_ts.pt"))
     tfl = build_tflite()
     # Self-check: the file_identifier must land at bytes 4..8 and the root
     # uoffset must point inside the buffer (spec §10 priorities).
