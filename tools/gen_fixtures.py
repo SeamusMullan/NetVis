@@ -671,6 +671,87 @@ def build_tflite_ctrlflow():
 
 
 # ---------------------------------------------------------------------------
+# OpenVINO IR (.xml topology + sibling .bin weight blob)  — issue #39
+# ---------------------------------------------------------------------------
+
+def build_openvino_xml():
+    """A tiny OpenVINO IR v11 net: Parameter -> Convolution(Const weight) ->
+    ReLU -> Result. The Const's <data offset="0" size="16" ...> points into the
+    16-byte model.bin sibling, exercising the external-data resolution path. Hand
+    written as text so the fixture documents the XML subset the reader accepts."""
+    return (
+        '<?xml version="1.0"?>\n'
+        '<net name="tiny_ov" version="11">\n'
+        '  <layers>\n'
+        '    <layer id="0" name="in" type="Parameter">\n'
+        '      <data shape="1,1,2,2" element_type="f32"/>\n'
+        '      <output>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="1" name="weights" type="Const">\n'
+        '      <data offset="0" size="16" element_type="f32" shape="2,2"/>\n'
+        '      <output>\n'
+        '        <port id="1" precision="FP32">\n'
+        '          <dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="2" name="conv" type="Convolution">\n'
+        '      <data strides="1,1" pads_begin="0,0" pads_end="0,0" dilations="1,1"/>\n'
+        '      <input>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '        <port id="1" precision="FP32">\n'
+        '          <dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </input>\n'
+        '      <output>\n'
+        '        <port id="2" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="3" name="relu" type="ReLU">\n'
+        '      <input>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </input>\n'
+        '      <output>\n'
+        '        <port id="1" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="4" name="out" type="Result">\n'
+        '      <input>\n'
+        '        <port id="0" precision="FP32">\n'
+        '          <dim>1</dim><dim>1</dim><dim>2</dim><dim>2</dim>\n'
+        '        </port>\n'
+        '      </input>\n'
+        '    </layer>\n'
+        '  </layers>\n'
+        '  <edges>\n'
+        '    <edge from-layer="0" from-port="0" to-layer="2" to-port="0"/>\n'
+        '    <edge from-layer="1" from-port="1" to-layer="2" to-port="1"/>\n'
+        '    <edge from-layer="2" from-port="2" to-layer="3" to-port="0"/>\n'
+        '    <edge from-layer="3" from-port="1" to-layer="4" to-port="0"/>\n'
+        '  </edges>\n'
+        '  <rt_info/>\n'
+        '</net>\n'
+    ).encode("utf-8")
+
+
+def build_openvino_bin():
+    """The sibling weight blob: 16 bytes = four F32 (a 2x2 Const)."""
+    return b"".join(struct.pack("<f", f) for f in (1.0, 2.0, 3.0, 4.0))
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -705,6 +786,11 @@ def main():
     root_cf = struct.unpack_from("<I", tfl_cf, 0)[0]
     assert 0 < root_cf < len(tfl_cf), "TFLite ctrlflow root offset out of range"
     write("model_ctrlflow.tflite", tfl_cf)
+
+    # OpenVINO IR: .xml topology + sibling .bin weight blob (issue #39). The
+    # .bin MUST be a real sibling so external-data resolution is exercised.
+    write("model.xml", build_openvino_xml())
+    write("model.bin", build_openvino_bin())
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):

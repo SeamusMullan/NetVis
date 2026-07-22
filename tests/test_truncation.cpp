@@ -106,3 +106,8 @@ TEST_CASE("truncation: TFLite parser stays safe at every 1/8th") {
   truncation_sweep("tflite", fixture("model.tflite"),
                    [](const MappedFile& f, ProgressSink& p) { return tflite::parse(f, p); });
 }
+
+TEST_CASE("truncation: OpenVINO IR parser stays safe at every 1/8th") {
+  truncation_sweep("ovxml", fixture("model.xml"),
+                   [](const MappedFile& f, ProgressSink& p) { return openvino::parse(f, p); });
+}
