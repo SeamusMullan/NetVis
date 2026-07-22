@@ -117,6 +117,13 @@ TEST_CASE("detect Unknown on random bytes") {
   CHECK(detect_bytes("junk", b, "") == Format::Unknown);
 }
 
+TEST_CASE("detect Keras HDF5 by superblock signature") {
+  // HDF5 superblock magic at offset 0 -> Format::Keras (raw .h5).
+  std::vector<uint8_t> b = {0x89, 'H', 'D', 'F', '\r', '\n', 0x1a, '\n'};
+  b.resize(64, 0);
+  CHECK(detect_bytes("h5", b, "h5") == Format::Keras);
+}
+
 // --- v0.4.0: OpCategory coverage (color routing) ------------------------------
 // categorize_op maps an op string to a coloring category. New v0.4.0 categories
 // (Attention/Recurrent/Quantize) plus gap-fill entries must land in the right

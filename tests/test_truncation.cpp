@@ -121,3 +121,10 @@ TEST_CASE("truncation: CoreML parser stays safe at every 1/8th") {
   truncation_sweep("mlmodel", fixture("model.mlmodel"),
                    [](const MappedFile& f, ProgressSink& p) { return coreml::parse(f, p); });
 }
+
+TEST_CASE("truncation: Keras HDF5 parser stays safe at every 1/8th") {
+  truncation_sweep("keras_h5", fixture("model.h5"),
+                   [](const MappedFile& f, ProgressSink& p) { return keras::parse(f, p); });
+  truncation_sweep("keras_v3", fixture("model.keras"),
+                   [](const MappedFile& f, ProgressSink& p) { return keras::parse(f, p); });
+}

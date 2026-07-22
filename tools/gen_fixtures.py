@@ -930,6 +930,161 @@ def build_coreml_mlmodel():
 
 
 # ---------------------------------------------------------------------------
+# Keras / HDF5 (classic symbol-table form) — hand-encoded, matches the minimal
+# reader in src/parsers/keras/Hdf5Reader.cpp exactly.
+#
+# Layout (all 8-byte offsets/lengths, superblock v0, v1 object headers):
+#   superblock -> root-group symbol-table entry -> root-group object header
+#   (one Symbol Table Message giving B-tree + local-heap addresses) ->
+#   v1 B-tree "TREE" (1 leaf entry) -> "SNOD" (1 symbol "kernel") ->
+#   dataset object header (Dataspace [2,2] + Datatype F32 + contiguous Layout)
+#   -> 16 bytes of raw F32 data. The reader records only (offset,len).
+# ---------------------------------------------------------------------------
+
+def _h5_object_header(messages):
+    """v1 object header: 16-byte prefix (version, msg count, refcount, size,
+    pad) + concatenated messages. Each message's data is already 8-padded."""
+    body = b"".join(messages)
+    hdr = bytearray()
+    hdr += bytes([1, 0])                       # version 1, reserved
+    hdr += struct.pack("<H", len(messages))    # number of header messages
+    hdr += struct.pack("<I", 1)                # object reference count
+    hdr += struct.pack("<I", len(body))        # header size (all message bytes)
+    hdr += bytes(4)                            # pad prefix to 16 bytes
+    return bytes(hdr) + body
+
+
+def _h5_message(type_id, data):
+    """v1 header message: type(2), size(2), flags(1), reserved(3), then data.
+    Data is padded to a multiple of 8 as the format requires."""
+    pad = (-len(data)) % 8
+    data = data + bytes(pad)
+    return struct.pack("<H", type_id) + struct.pack("<H", len(data)) + bytes([0]) + bytes(3) + data
+
+
+def build_keras_h5():
+    U = 0xFFFFFFFFFFFFFFFF  # HDF5 "undefined address"
+
+    # --- fixed-size blocks; compute absolute addresses up front --------------
+    SB_LEN = 96
+    ROOT_OH_LEN = 16 + 24          # prefix + one 24-byte Symbol Table Message
+    HEAP_HDR_LEN = 32
+    HEAPDATA_LEN = 16
+    BTREE_LEN = 48
+    SNOD_LEN = 48
+    DSET_OH_LEN = 16 + 96          # prefix + 3 * (8 hdr + 24 data)
+    DATA_LEN = 16
+
+    a_root_oh = SB_LEN
+    a_heap = a_root_oh + ROOT_OH_LEN
+    a_heapdata = a_heap + HEAP_HDR_LEN
+    a_btree = a_heapdata + HEAPDATA_LEN
+    a_snod = a_btree + BTREE_LEN
+    a_dset_oh = a_snod + SNOD_LEN
+    a_data = a_dset_oh + DSET_OH_LEN
+    eof = a_data + DATA_LEN
+
+    # --- superblock v0 (96 bytes) -------------------------------------------
+    sb = bytearray()
+    sb += b"\x89HDF\r\n\x1a\n"                  # 0-7  signature
+    sb += bytes([0, 0, 0, 0, 0])               # 8-12 versions + reserved
+    sb += bytes([8])                           # 13   size of offsets
+    sb += bytes([8])                           # 14   size of lengths
+    sb += bytes([0])                           # 15   reserved
+    sb += struct.pack("<H", 4)                 # 16-17 group leaf node K
+    sb += struct.pack("<H", 16)                # 18-19 group internal node K
+    sb += struct.pack("<I", 0)                 # 20-23 consistency flags
+    sb += struct.pack("<Q", 0)                 # 24-31 base address
+    sb += struct.pack("<Q", U)                 # 32-39 free-space address
+    sb += struct.pack("<Q", eof)               # 40-47 end-of-file address
+    sb += struct.pack("<Q", U)                 # 48-55 driver info address
+    # root-group symbol-table entry (40 bytes) at offset 56
+    sb += struct.pack("<Q", 0)                 # 56-63 link name offset
+    sb += struct.pack("<Q", a_root_oh)         # 64-71 object header address
+    sb += struct.pack("<I", 1)                 # 72-75 cache type 1
+    sb += struct.pack("<I", 0)                 # 76-79 reserved
+    sb += struct.pack("<Q", a_btree)           # 80-87 scratch: B-tree addr
+    sb += struct.pack("<Q", a_heap)            # 88-95 scratch: heap addr
+    assert len(sb) == SB_LEN
+
+    # --- root group object header (Symbol Table Message: btree + heap) -------
+    stm = struct.pack("<Q", a_btree) + struct.pack("<Q", a_heap)   # 16 bytes
+    root_oh = _h5_object_header([_h5_message(0x0011, stm)])
+    assert len(root_oh) == ROOT_OH_LEN, (len(root_oh), ROOT_OH_LEN)
+
+    # --- local heap: header + data segment ("kernel\0" at offset 8) ----------
+    heap = bytearray()
+    heap += b"HEAP" + bytes([0]) + bytes(3)    # signature, version, reserved
+    heap += struct.pack("<Q", HEAPDATA_LEN)    # data segment size
+    heap += struct.pack("<Q", 0)               # free-list head offset
+    heap += struct.pack("<Q", a_heapdata)      # data segment address
+    assert len(heap) == HEAP_HDR_LEN
+    heapdata = bytearray(HEAPDATA_LEN)
+    name = b"kernel\x00"
+    heapdata[8:8 + len(name)] = name           # name offset 8
+
+    # --- v1 B-tree (group nodes, 1 leaf entry -> SNOD) -----------------------
+    bt = bytearray()
+    bt += b"TREE" + bytes([0]) + bytes([0]) + struct.pack("<H", 1)  # sig,type0,level0,entries1
+    bt += struct.pack("<Q", U) + struct.pack("<Q", U)               # left/right sibling
+    bt += struct.pack("<Q", 0)                 # key0 (heap offset)
+    bt += struct.pack("<Q", a_snod)            # child0 -> SNOD
+    bt += struct.pack("<Q", 0)                 # key1 (heap offset)
+    assert len(bt) == BTREE_LEN
+
+    # --- SNOD: one symbol "kernel" -> dataset object header ------------------
+    snod = bytearray()
+    snod += b"SNOD" + bytes([1]) + bytes([0]) + struct.pack("<H", 1)
+    snod += struct.pack("<Q", 8)               # name offset in heap -> "kernel"
+    snod += struct.pack("<Q", a_dset_oh)       # object header address
+    snod += struct.pack("<I", 0)               # cache type 0
+    snod += struct.pack("<I", 0)               # reserved
+    snod += bytes(16)                          # scratch pad
+    assert len(snod) == SNOD_LEN
+
+    # --- dataset object header: Dataspace + Datatype + Layout ---------------
+    # Dataspace v1: version, rank, flags, reserved(1), reserved(4), dims[2,2].
+    dspace = bytes([1, 2, 0, 0]) + bytes(4) + struct.pack("<Q", 2) + struct.pack("<Q", 2)
+    # Datatype v1: class=1 (float), size=4, IEEE-F32LE properties (ignored by reader).
+    dtype = bytes([0x11]) + bytes([0x20, 0x3f, 0x00]) + struct.pack("<I", 4)
+    dtype += struct.pack("<H", 0) + struct.pack("<H", 32) + bytes([23, 8, 0, 23]) + struct.pack("<I", 127)
+    # Data Layout v3: contiguous -> (address, size).
+    layout = bytes([3, 1]) + struct.pack("<Q", a_data) + struct.pack("<Q", DATA_LEN)
+    dset_oh = _h5_object_header([
+        _h5_message(0x0001, dspace),
+        _h5_message(0x0003, dtype),
+        _h5_message(0x0008, layout),
+    ])
+    assert len(dset_oh) == DSET_OH_LEN, (len(dset_oh), DSET_OH_LEN)
+
+    data = struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)
+
+    blob = bytes(sb) + root_oh + bytes(heap) + bytes(heapdata) + bytes(bt) + \
+        bytes(snod) + dset_oh + data
+    assert len(blob) == eof, (len(blob), eof)
+    return blob
+
+
+def build_keras_v3(out_dir):
+    """A Keras-v3 archive: config.json + metadata.json + model.weights.h5, STORED
+    so the embedded HDF5 payload offset is resolvable from the local file header."""
+    path = os.path.join(out_dir, "model.keras")
+    if os.path.exists(path):
+        os.remove(path)
+    config = b'{"module":"keras","class_name":"Sequential","config":{"name":"seq"}}'
+    metadata = b'{"keras_version":"3.0.0","date_saved":"2026-07-22"}'
+    weights = build_keras_h5()
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        for arcname, blob in (("config.json", config),
+                              ("metadata.json", metadata),
+                              ("model.weights.h5", weights)):
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, blob)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -972,6 +1127,10 @@ def main():
     write("model.xml", build_openvino_xml())
     write("model.bin", build_openvino_bin())
     write("model.mlmodel", build_coreml_mlmodel())
+    h5 = build_keras_h5()
+    assert h5[:8] == b"\x89HDF\r\n\x1a\n", "HDF5 signature misplaced"
+    write("model.h5", h5)
+    build_keras_v3(out_dir)
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):
