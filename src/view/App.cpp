@@ -487,7 +487,8 @@ void App::inspect_tensor(const ir::TensorRef& t) {
   ir::TensorRef tc = t;
   jobs_->submit([this, token, tc]() {
     Result<TensorStats> r =
-        compute_tensor_stats(tc, session_->file(), session_->model_dir());
+        compute_tensor_stats(tc, session_->file(), session_->model_dir(),
+                             session_->model());
     bool ok = r.ok();
     TensorStats stats = ok ? *r : TensorStats{};
     std::string errmsg = ok ? std::string() : r.error().message;

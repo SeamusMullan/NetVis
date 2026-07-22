@@ -30,18 +30,24 @@ struct TensorStats {
 };
 
 // Decode a tensor's payload and compute stats. `base` is the model's mmap;
-// `model_dir` resolves ONNX external_data. This calls
-// ByteReader::mark_payload_read() exactly once (tests assert structural parse
-// left the counter at 0). Streams in chunks; never materializes a copy.
+// `model_dir` resolves ONNX external_data; `model` resolves StringId in
+// external_path (pass nullptr if external_path is already a path string).
+// This calls ByteReader::mark_payload_read() exactly once (tests assert
+// structural parse left the counter at 0). Streams in chunks; never
+// materializes a copy.
 Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
                                          const MappedFile& base,
-                                         const std::string& model_dir);
+                                         const std::string& model_dir,
+                                         const ir::Model* model = nullptr);
 
 // Export a tensor to NumPy .npy (v1.0 header, spec §7.5) or raw .bin.
 // Reads the payload from the mmap/external file; writes to `out_path`.
+// Pass `model` to resolve StringId in external_path (nullptr if not needed).
 Result<bool> export_npy(const ir::TensorRef& t, const MappedFile& base,
-                        const std::string& model_dir, const std::string& out_path);
+                        const std::string& model_dir, const std::string& out_path,
+                        const ir::Model* model = nullptr);
 Result<bool> export_raw(const ir::TensorRef& t, const MappedFile& base,
-                        const std::string& model_dir, const std::string& out_path);
+                        const std::string& model_dir, const std::string& out_path,
+                        const ir::Model* model = nullptr);
 
 }  // namespace netvis

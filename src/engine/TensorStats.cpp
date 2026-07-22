@@ -169,10 +169,10 @@ const char* npy_descr(DType d) {
 
 Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
                                          const MappedFile& base,
-                                         const std::string& model_dir) {
-  // We need the model only to resolve an external_path StringId; when the ref
-  // carries an external path but we have no arena we treat it as base-relative.
-  auto pr = resolve_payload(t, base, model_dir, nullptr);
+                                         const std::string& model_dir,
+                                         const ir::Model* model) {
+  // We need the model to resolve an external_path StringId.
+  auto pr = resolve_payload(t, base, model_dir, model);
   if (!pr) return pr.error();
   Payload p = std::move(*pr);
 
@@ -263,8 +263,9 @@ Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
 
 Result<bool> export_npy(const ir::TensorRef& t, const MappedFile& base,
                         const std::string& model_dir,
-                        const std::string& out_path) {
-  auto pr = resolve_payload(t, base, model_dir, nullptr);
+                        const std::string& out_path,
+                        const ir::Model* model) {
+  auto pr = resolve_payload(t, base, model_dir, model);
   if (!pr) return pr.error();
   Payload p = std::move(*pr);
 
@@ -355,8 +356,9 @@ Result<bool> export_npy(const ir::TensorRef& t, const MappedFile& base,
 
 Result<bool> export_raw(const ir::TensorRef& t, const MappedFile& base,
                         const std::string& model_dir,
-                        const std::string& out_path) {
-  auto pr = resolve_payload(t, base, model_dir, nullptr);
+                        const std::string& out_path,
+                        const ir::Model* model) {
+  auto pr = resolve_payload(t, base, model_dir, model);
   if (!pr) return pr.error();
   Payload p = std::move(*pr);
 

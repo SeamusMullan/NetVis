@@ -77,8 +77,8 @@ TEST_CASE("ONNX: 3 nodes, initializers, no payload reads") {
     CHECK(saw_strides);
   }
 
-  // --- initializers: one raw_data (real offset), one external ---------------
-  REQUIRE(g.initializers.size() == 2);
+  // --- initializers: one raw_data (real offset), two external ---------------
+  REQUIRE(g.initializers.size() == 3);
   const ir::TensorRef* raw = nullptr;
   const ir::TensorRef* ext = nullptr;
   for (const auto& t : g.initializers) {

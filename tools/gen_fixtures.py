@@ -135,6 +135,8 @@ def build_onnx():
     init_w = onnx_tensor_rawdata("W", [2, 2], [1.0, 2.0, 3.0, 4.0])
     init_b = onnx_tensor_external("B", [2, 2], "weights.bin",
                                   5000000000, 16)  # 5e9 bytes > 2GB
+    # Add a small resolvable external initializer: offset 8, length 8 (2 floats).
+    init_c = onnx_tensor_external("C", [2], "weights.bin", 8, 8)
 
     graph = bytearray()
     graph += pb_len(1, conv)          # node
@@ -143,6 +145,7 @@ def build_onnx():
     graph += pb_string(2, "test_graph")  # graph name
     graph += pb_len(5, init_w)        # initializer (repeated)
     graph += pb_len(5, init_b)
+    graph += pb_len(5, init_c)
 
     model = bytearray()
     model += pb_varint(1, 1)          # ir_version
@@ -682,6 +685,10 @@ def main():
             f.write(data)
 
     write("model.onnx", build_onnx())
+    # Write sibling weights.bin for ONNX external-data resolution test.
+    # Layout: 8 bytes padding + 8 bytes resolvable data (2 F32: 5.0, 6.0).
+    weights_bin = b"\x00" * 8 + struct.pack("<f", 5.0) + struct.pack("<f", 6.0)
+    write("weights.bin", weights_bin)
     write("model.safetensors", build_safetensors())
     write("model.gguf", build_gguf())
     build_pytorch(os.path.join(out_dir, "model.pt"))

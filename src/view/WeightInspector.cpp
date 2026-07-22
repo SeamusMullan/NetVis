@@ -106,8 +106,10 @@ void do_export(App& app, const ir::TensorRef& t, bool raw) {
   if (!path) return;  // user cancelled
 
   const std::string model_dir = app.session().model_dir();
-  Result<bool> r = raw ? export_raw(t, app.session().file(), model_dir, path)
-                       : export_npy(t, app.session().file(), model_dir, path);
+  Result<bool> r = raw ? export_raw(t, app.session().file(), model_dir, path,
+                                    app.session().model())
+                       : export_npy(t, app.session().file(), model_dir, path,
+                                    app.session().model());
   if (r.ok() && *r) {
     app.add_toast(std::string("Exported ") + path, false);
   } else {
