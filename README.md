@@ -34,8 +34,12 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
 
 ## Features
 
-- **Formats:** ONNX (`.onnx`), TFLite (`.tflite`), SafeTensors (`.safetensors`),
-  GGUF (`.gguf`), PyTorch zip & legacy pickle checkpoints (`.pt` / `.pth` / `.bin`).
+- **Formats:** ONNX (`.onnx`, incl. sibling external-data), TFLite (`.tflite`),
+  SafeTensors (`.safetensors`), GGUF (`.gguf`), PyTorch zip & legacy pickle
+  checkpoints (`.pt` / `.pth` / `.bin`), **OpenVINO IR** (`.xml` + `.bin`),
+  **CoreML** (`.mlmodel`), **Keras** (`.h5` / `.keras`), **NumPy** (`.npz`), and
+  best-effort **TorchScript** archive op listings. Zip-based formats are
+  disambiguated by content, not extension.
 - **Instant open:** memory-mapped I/O; structure parsed off the main thread; the
   window is interactive the moment the `mmap` succeeds.
 - **Compute-graph canvas:** a single custom-drawn region (no per-node widgets) with
