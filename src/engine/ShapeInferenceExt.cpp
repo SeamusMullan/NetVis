@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "core/ByteReader.h"
+#include "engine/plugin/Registry.h"   // v0.6.0 (#8): shape-inference override hook
 
 namespace netvis {
 
@@ -346,6 +347,32 @@ uint32_t infer_shapes_ext(Model& model, uint32_t graph_index,
     uint32_t ni = order[idx];
     const Node& n = g.nodes[ni];
     std::string_view op = model.str(n.op_type);
+
+    // v0.6.0 (#8): a registered non-built-in op handler may override shape
+    // inference for this op. With no user plugins the resolution is always the
+    // built-in catch-all (origin==Builtin), so this hook is skipped and the
+    // monolithic if-chain below runs byte-identically. When a plugin resolves the
+    // op AND returns at least one output shape, apply it (same set_shape "write
+    // only if empty / carry dtype only if Unknown" semantics) and skip the built-in
+    // chain for this node. mmap_base is threaded through so input_const_ints works.
+    {
+      plugin::Registry& reg = plugin::Registry::instance();
+      plugin::OpResolution r = reg.resolve_op(plugin::normalize_op_key(op));
+      if (r.origin != plugin::Origin::Builtin && r.handler) {
+        plugin::OpContext ctx =
+            reg.make_context(model, g, n, {}, base, base_size);
+        plugin::ShapeResult sr = r.handler->infer_shape(ctx);
+        if (!sr.outputs.empty()) {
+          for (const auto& o : sr.outputs) {
+            int32_t ov = output_value(g, n, o.slot);
+            if (ov < 0) continue;
+            if (set_shape(g.values[static_cast<size_t>(ov)], o.shape, o.dtype))
+              ++resolved;
+          }
+          continue;  // plugin owned this node
+        }
+      }
+    }
 
     int32_t in0 = input_value(g, n, 0);
     int32_t in1 = input_value(g, n, 1);

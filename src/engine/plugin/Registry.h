@@ -10,6 +10,7 @@
 // See docs/v0.6.0-design.md Part 2.4 + Part 3.3 (two-tier resolution + hoist).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -24,6 +25,20 @@
 #include "parsers/Parser.h"          // Format
 
 namespace netvis::plugin {
+
+// Normalize an op string to the exact-tier registry key: strip domain (keep the
+// last dot-segment) + lowercase ("com.microsoft.QLinearConv" -> "qlinearconv").
+// Byte-identical to CostModel.cpp::norm_op — the single normalization both the
+// built-in dispatch and the registry key use.
+std::string normalize_op_key(std::string_view op);
+
+// Resolve the color CATEGORY for a node through the registry (v0.6.0 #8): the
+// winning handler's category(). With no user plugins this is exactly
+// categorize_op(op) — the view sites route through here so a declarative/WASM
+// plugin can recolor an op (#9), while layout-structural predicates keep calling
+// categorize_op directly so a plugin category can never shift the layout.
+OpCategory resolve_category(const ir::Model& model, const ir::Graph& g,
+                            const ir::Node& node);
 
 // Backend tier = PRIMARY key of the total override order (design §0.5). Higher wins.
 enum class Origin : uint8_t { Builtin = 0, Declarative = 1, Wasm = 2 };
@@ -80,7 +95,8 @@ class Registry {
   void reload(std::shared_ptr<const RegistryTable> next);   // atomic swap
 
  private:
-  std::shared_ptr<const RegistryTable> table_;
+  // Lock-free reads (UI + worker threads); rare atomic swap on load/reload.
+  std::atomic<std::shared_ptr<const RegistryTable>> table_;
 };
 
 }  // namespace netvis::plugin

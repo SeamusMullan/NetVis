@@ -21,6 +21,7 @@
 #include "imgui.h"
 
 #include "engine/OpCategory.h"
+#include "engine/plugin/Registry.h"
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
 #include "view/PanelHelpers.h"
@@ -184,7 +185,7 @@ NodeLabel label_for(const App& app, uint32_t display_id) {
           const auto& nodes = m->graphs[gi].nodes;
           uint32_t ni = g.representative_nodes.front();
           if (ni < nodes.size())
-            out.cat = categorize_op(m->str(nodes[ni].op_type));
+            out.cat = plugin::resolve_category(*m, m->graphs[gi], nodes[ni]);
         }
       }
     }
@@ -196,7 +197,7 @@ NodeLabel label_for(const App& app, uint32_t display_id) {
         const ir::Node& n = nodes[dn.ir_node];
         out.primary = std::string(m->str(n.op_type));
         out.secondary = std::string(m->str(n.name));
-        out.cat = categorize_op(m->str(n.op_type));
+        out.cat = plugin::resolve_category(*m, m->graphs[gi], n);
       }
     }
   }
