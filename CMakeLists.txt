@@ -111,6 +111,31 @@ FetchContent_MakeAvailable(stb)
 add_library(stb INTERFACE)
 target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
 
+# wasm3 — single-file WebAssembly interpreter for the v0.6.0 WASM plugin backend
+# (#10). Chosen over wasmtime to keep the single-static-binary invariant (no LLVM/
+# codegen dep) and cross-platform portability; the host-API boundary is kept
+# runtime-agnostic so wasmtime is a later drop-in. Source-only, pinned tag. The
+# gas-metering define enables the fuel/step cap used to kill a hostile module.
+option(NETVIS_ENABLE_WASM "Build the WASM (wasm3) plugin backend" ON)
+if(NETVIS_ENABLE_WASM)
+  FetchContent_Declare(wasm3
+    GIT_REPOSITORY https://github.com/wasm3/wasm3.git
+    GIT_TAG v0.5.0)
+  # POPULATE ONLY — do NOT run wasm3's own CMakeLists (it pulls in uvwasi/WASI,
+  # which we explicitly do NOT want: the sandbox must expose zero syscalls). We
+  # compile only the interpreter core from source/*.c into our own static target.
+  FetchContent_GetProperties(wasm3)
+  if(NOT wasm3_POPULATED)
+    FetchContent_Populate(wasm3)
+  endif()
+  file(GLOB WASM3_SRC ${wasm3_SOURCE_DIR}/source/*.c)
+  add_library(wasm3 STATIC ${WASM3_SRC})
+  target_include_directories(wasm3 PUBLIC ${wasm3_SOURCE_DIR}/source)
+  target_compile_definitions(wasm3 PUBLIC d_m3MaxFunctionStackHeight=1024)
+  # wasm3's own C sources must NOT inherit our -Werror/-Wpedantic.
+  set_target_properties(wasm3 PROPERTIES COMPILE_FLAGS "-w")
+endif()
+
 # doctest — unit test harness (tests only).
 if(NETVIS_BUILD_TESTS)
   FetchContent_Declare(doctest
@@ -141,6 +166,13 @@ target_include_directories(netvis_core PUBLIC ${miniz_SOURCE_DIR} ${miniz_BINARY
 
 find_package(Threads REQUIRED)
 target_link_libraries(netvis_core PUBLIC Threads::Threads)
+
+# wasm3 plugin backend (#10): link + define the guard so the WASM binding code
+# compiles in. When NETVIS_ENABLE_WASM is OFF, the backend compiles to no-ops.
+if(NETVIS_ENABLE_WASM AND TARGET wasm3)
+  target_link_libraries(netvis_core PUBLIC wasm3)
+  target_compile_definitions(netvis_core PUBLIC NETVIS_ENABLE_WASM=1)
+endif()
 
 # =============================================================================
 #  netvis — the GUI application (GLFW + OpenGL + Dear ImGui).
