@@ -29,6 +29,14 @@ extern "C" {
 #pragma GCC diagnostic pop
 #endif
 
+// The m3ApiRawFunction macro expands to a fixed (runtime, _ctx, _sp, _mem)
+// signature; host fns that don't touch memory leave `runtime`/`_mem` unused. That
+// is intentional (the ABI is fixed), so silence MSVC C4100 for this TU — the
+// GCC/clang build already passes via -Wno-error=unused-parameter.
+#if defined(_MSC_VER)
+#pragma warning(disable : 4100)  // unreferenced formal parameter
+#endif
+
 namespace netvis::plugin::wasm {
 
 namespace {
