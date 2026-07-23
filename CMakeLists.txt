@@ -244,19 +244,42 @@ if(NETVIS_BUILD_APP)
   file(GLOB_RECURSE NETVIS_VIEW_SRC CONFIGURE_DEPENDS
     ${CMAKE_SOURCE_DIR}/src/view/*.cpp)
 
-  add_executable(netvis ${CMAKE_SOURCE_DIR}/src/main.cpp ${NETVIS_VIEW_SRC})
+  # WIN32 => link the GUI subsystem so double-clicking the .exe does NOT open a
+  # console window alongside the app (CMake keeps `int main` as the entry via
+  # /ENTRY:mainCRTStartup below, so no WinMain rewrite is needed). On Windows the
+  # .rc embeds the app icon into the executable. Non-Windows: WIN32/the .rc are
+  # ignored, so this is a single cross-platform add_executable.
+  set(NETVIS_WIN_RC "")
+  if(WIN32)
+    set(NETVIS_WIN_RC ${CMAKE_SOURCE_DIR}/assets/netvis.rc)
+  endif()
+  add_executable(netvis WIN32
+    ${CMAKE_SOURCE_DIR}/src/main.cpp ${NETVIS_VIEW_SRC} ${NETVIS_WIN_RC})
   target_link_libraries(netvis
     PRIVATE netvis_core imgui glfw tinyfiledialogs stb OpenGL::GL netvis_warnings)
   target_include_directories(netvis PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
-  # macOS: build a .app bundle so the .pkg installs a normal double-clickable app.
+  if(WIN32 AND MSVC)
+    # GUI subsystem but keep the standard C `main` entry point (no WinMain).
+    target_link_options(netvis PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+  elseif(WIN32 AND (MINGW OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+    target_link_options(netvis PRIVATE -mwindows)
+  endif()
+
+  # macOS: build a .app bundle so the .pkg installs a normal double-clickable app,
+  # with the app icon (.icns) referenced from the bundle Info.plist.
   if(APPLE)
+    set(NETVIS_ICNS ${CMAKE_SOURCE_DIR}/assets/netvis.icns)
+    target_sources(netvis PRIVATE ${NETVIS_ICNS})
+    set_source_files_properties(${NETVIS_ICNS} PROPERTIES
+      MACOSX_PACKAGE_LOCATION "Resources")
     set_target_properties(netvis PROPERTIES
       MACOSX_BUNDLE TRUE
       MACOSX_BUNDLE_BUNDLE_NAME "NetVis"
       MACOSX_BUNDLE_GUI_IDENTIFIER "com.seamusmullan.netvis"
       MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
-      MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
+      MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+      MACOSX_BUNDLE_ICON_FILE "netvis.icns")
   endif()
 
   # --- Install rules (consumed by CPack) -------------------------------------
@@ -270,6 +293,11 @@ if(NETVIS_BUILD_APP)
           RUNTIME DESTINATION bin)
   install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/DECISIONS.md
           DESTINATION share/netvis OPTIONAL)
+  # Linux: ship the PNG icon for desktop-entry / launcher use (harmless elsewhere).
+  if(UNIX AND NOT APPLE)
+    install(FILES ${CMAKE_SOURCE_DIR}/assets/netvis.png
+            DESTINATION share/icons/hicolor/256x256/apps OPTIONAL)
+  endif()
 endif()
 
 # =============================================================================
@@ -338,6 +366,11 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_DISPLAY_NAME "NetVis")
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     set(CPACK_NSIS_MODIFY_PATH OFF)
+    # Installer + Add/Remove-Programs icon (the exe's own icon is embedded via the
+    # .rc). MUI_ICON/UNICON must be a valid multi-size .ico.
+    set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/assets/netvis.ico")
+    set(CPACK_NSIS_MUI_UNIICON "${CMAKE_SOURCE_DIR}/assets/netvis.ico")
+    set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\netvis.exe")
     # Start-menu shortcut -> bin/netvis.exe
     set(CPACK_NSIS_CREATE_ICONS_EXTRA
         "CreateShortCut '$SMPROGRAMS\\\\NetVis\\\\NetVis.lnk' '$INSTDIR\\\\bin\\\\netvis.exe'")

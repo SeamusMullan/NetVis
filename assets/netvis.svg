@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- NetVis app icon: a small compute graph (layered nodes + edges), matching the
+       dark-theme canvas. Source of truth; rasterized to .ico/.icns/.png by
+       tools/gen_icons.sh. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2430"/>
+      <stop offset="1" stop-color="#0f151d"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="96" fill="url(#bg)"/>
+  <!-- edges -->
+  <g stroke="#3a4658" stroke-width="10" fill="none" stroke-linecap="round">
+    <path d="M136 150 L256 256"/>
+    <path d="M136 362 L256 256"/>
+    <path d="M256 256 L376 150"/>
+    <path d="M256 256 L376 362"/>
+    <path d="M136 150 L136 362"/>
+  </g>
+  <!-- nodes: Conv(blue) / MatMul(purple) / Activation(green) / center = focus -->
+  <g>
+    <circle cx="136" cy="150" r="40" fill="#5aa9f0"/>
+    <circle cx="136" cy="362" r="40" fill="#60be96"/>
+    <circle cx="256" cy="256" r="48" fill="#d864d0"/>
+    <circle cx="376" cy="150" r="40" fill="#d6b248"/>
+    <circle cx="376" cy="362" r="40" fill="#5aa9f0"/>
+  </g>
+</svg>

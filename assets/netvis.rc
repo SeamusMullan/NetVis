@@ -1,0 +1,4 @@
+// Windows resource script: embeds the app icon into netvis.exe so Explorer, the
+// taskbar, and the title bar show it. IDI_ICON1 (id 1) is the first icon, which
+// Windows uses as the executable's display icon.
+IDI_ICON1 ICON "netvis.ico"
