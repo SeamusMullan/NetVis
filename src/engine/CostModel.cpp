@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "engine/OpCategory.h"
+#include "engine/plugin/Registry.h"   // v0.6.0 (#8): FLOP routing via the registry
 #include "ir/IR.h"
 
 namespace netvis {
@@ -42,17 +43,10 @@ struct StringIdHash {
   }
 };
 
-// Saturating uint64_t arithmetic (never overflow, clamp at UINT64_MAX).
-uint64_t safe_add(uint64_t a, uint64_t b) {
-  if (UINT64_MAX - a < b) return UINT64_MAX;
-  return a + b;
-}
-
-uint64_t safe_mul(uint64_t a, uint64_t b) {
-  if (a == 0 || b == 0) return 0;
-  if (UINT64_MAX / a < b) return UINT64_MAX;
-  return a * b;
-}
+// Saturating uint64_t arithmetic (safe_add/safe_mul) is provided by
+// core/SafeMath.h (v0.6.0 §2.0 — promoted out of this TU so the plugin backends
+// share the identical primitives; the definitions were byte-identical). Pulled in
+// via engine/plugin/Registry.h -> ShapeMath.h -> SafeMath.h, used unqualified here.
 
 // Product of shape dims; returns 0 if any dim < 1 (dynamic/unresolved).
 uint64_t elem_count_from_shape(const SmallVec<int64_t, 6>& shape) {
@@ -665,11 +659,34 @@ GraphCostSummary compute_graph_costs(const ir::Model& model, const ir::Graph& g)
 
   auto init_idx = build_initializer_index(g);
 
+  // v0.6.0 (#8): FLOP estimation is resolved through the plugin registry. The
+  // handler is looked up ONCE PER DISTINCT op-type (StringId memo) — never per node
+  // — so the 3095-node hot path pays one integer-keyed probe per op-type, not a
+  // string normalize + hash per node. With no user plugins the resolution is always
+  // the built-in catch-all, whose flops() calls detail::builtin_compute_flops (==
+  // the unchanged compute_flops), so per-node output is byte-identical.
+  plugin::Registry& reg = plugin::Registry::instance();
+  std::unordered_map<uint32_t, const plugin::OpHandler*> handler_memo;
+  handler_memo.reserve(64);
+
   for (uint32_t i = 0; i < g.nodes.size(); ++i) {
     const ir::Node& node = g.nodes[i];
     NodeCost& nc = summary.per_node[i];
 
-    compute_flops(model, g, node, nc);
+    const plugin::OpHandler* h;
+    auto mit = handler_memo.find(node.op_type.id);
+    if (mit != handler_memo.end()) {
+      h = mit->second;
+    } else {
+      std::string_view raw = model.str(node.op_type);
+      h = reg.resolve_op(plugin::normalize_op_key(raw)).handler;
+      handler_memo.emplace(node.op_type.id, h);
+    }
+    plugin::OpContext ctx = reg.make_context(model, g, node, {});
+    plugin::FlopResult fr = h->flops(ctx);
+    nc.flops = fr.flops;
+    nc.flops_known = fr.known;
+
     compute_params(g, node, init_idx, nc);
     compute_act_bytes(g, node, nc);
     compute_input_act_bytes(g, node, init_idx, nc);
@@ -856,6 +873,14 @@ CostReport build_table_report(const ir::Model& model) {
 }
 
 }  // namespace
+
+// --- v0.6.0 (#8): plugin-registry bridge to the built-in FLOP formula table ---
+namespace detail {
+void builtin_compute_flops(const ir::Model& model, const ir::Graph& g,
+                           const ir::Node& node, NodeCost& nc) {
+  compute_flops(model, g, node, nc);
+}
+}  // namespace detail
 
 // --- v0.4.0: roofline / efficiency free functions -------------------------
 

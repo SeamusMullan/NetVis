@@ -227,4 +227,12 @@ const char* category_name(OpCategory c) {
   return "Other";
 }
 
+std::optional<OpCategory> category_from_name(std::string_view s) {
+  for (int i = 0; i <= static_cast<int>(OpCategory::Other); ++i) {
+    OpCategory c = static_cast<OpCategory>(i);
+    if (s == category_name(c)) return c;
+  }
+  return std::nullopt;
+}
+
 }  // namespace netvis

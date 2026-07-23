@@ -370,6 +370,18 @@ std::vector<CategoryCost> rollup_by_category(const ir::Model& model,
 // ---------------------------------------------------------------------------
 CostReport compute_cost(const ir::Model& model, uint32_t graph_index);
 
+// --- v0.6.0 (#8): plugin-registry bridge ----------------------------------
+// The BuiltinOpHandler (engine/plugin) delegates node FLOP estimation to the SAME
+// v0.4.0 formula table used by compute_cost, so the built-in path and the plugin
+// path are one path. This is a thin public wrapper over the (anonymous-namespace)
+// compute_flops; it sets nc.flops / nc.flops_known and reads no tensor payload.
+// Keeping the formula table itself TU-local means the byte-identical acceptance
+// gate is protected: the registry adds an indirection, never a reimplementation.
+namespace detail {
+void builtin_compute_flops(const ir::Model& model, const ir::Graph& g,
+                           const ir::Node& node, NodeCost& nc);
+}  // namespace detail
+
 // Live activation bytes at each node in execution (node index == topological)
 // order — the FULL curve behind the single peak_activation_bytes scalar.
 // liveness_curve[i] = the memory HIGH-WATER MARK during node i: live activation

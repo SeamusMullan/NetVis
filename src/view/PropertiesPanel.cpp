@@ -21,6 +21,7 @@
 // App.h) references without including it; include it first so App.h compiles.
 #include "engine/LayoutEngine.h"
 #include "engine/OpCategory.h"
+#include "engine/plugin/Registry.h"
 #include "ir/IR.h"
 #include "view/App.h"
 #include "view/CostPanel.h"
@@ -286,7 +287,7 @@ void draw_properties_panel(App& app) {
 
   std::string_view op = model->str(node.op_type);
   std::string_view name = model->str(node.name);
-  OpCategory cat = categorize_op(op);
+  OpCategory cat = plugin::resolve_category(*model, g, node);  // v0.6.0 #8
 
   ImGui::SeparatorText("Node");
   ImGui::Text("op:       %s", op.empty() ? "?" : std::string(op).c_str());

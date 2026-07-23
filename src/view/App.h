@@ -92,6 +92,7 @@ struct ViewState {
   bool dark_theme = true;
   bool show_minimap = true;
   bool request_fit = false;      // set to trigger a fit-to-graph next frame
+  bool show_plugins = false;     // v0.6.0 #11: the Plugins management window
 
   // --- v0.2.0 additions (append-only; see CONTRACTS.md: view/ is not frozen) --
   // Layout readability: hide constant/initializer input edges in the canvas and

@@ -16,6 +16,7 @@
 #include "engine/GraphAdjacency.h"
 #include "engine/LayoutEngine.h"
 #include "engine/OpCategory.h"
+#include "engine/plugin/Registry.h"
 #include "view/App.h"
 #include "view/PanelHelpers.h"
 
@@ -42,12 +43,13 @@ OpCategory category_for_display(ModelSession& s, uint32_t display_id) {
     if (dn.group_index < groups.size() &&
         !groups[dn.group_index].representative_nodes.empty()) {
       uint32_t ni = groups[dn.group_index].representative_nodes.front();
-      if (ni < nodes.size()) return categorize_op(m->str(nodes[ni].op_type));
+      if (ni < nodes.size())
+        return plugin::resolve_category(*m, m->graphs[gi], nodes[ni]);
     }
     return OpCategory::Other;
   }
   if (dn.ir_node < nodes.size())
-    return categorize_op(m->str(nodes[dn.ir_node].op_type));
+    return plugin::resolve_category(*m, m->graphs[gi], nodes[dn.ir_node]);
   return OpCategory::Other;
 }
 
