@@ -128,6 +128,15 @@ if(NETVIS_ENABLE_WASM)
   if(NOT wasm3_POPULATED)
     FetchContent_Populate(wasm3)
   endif()
+  # Patch the loop back-edge ops so the sandbox can kill a tight-loop module (the
+  # weak m3_Yield hook only fires on Call). Idempotent; runs at configure time so
+  # the pinned upstream tag stays pristine. Non-fatal if anchors drift.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/patch_wasm3.py
+              ${wasm3_SOURCE_DIR}/source/m3_exec.h)
+  endif()
   file(GLOB WASM3_SRC ${wasm3_SOURCE_DIR}/source/*.c)
   add_library(wasm3 STATIC ${WASM3_SRC})
   target_include_directories(wasm3 PUBLIC ${wasm3_SOURCE_DIR}/source)

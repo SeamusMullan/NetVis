@@ -1085,6 +1085,134 @@ def build_keras_v3(out_dir):
 
 
 # ---------------------------------------------------------------------------
+# WebAssembly plugin fixtures (v0.6.0 #10). Hand-encoded, stdlib-only — no wasm
+# toolchain needed (same discipline as the hand-built TFLite/HDF5 fixtures).
+# ---------------------------------------------------------------------------
+def _uleb(n):
+    """Unsigned LEB128."""
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
+
+
+def _wasm_section(sid, body):
+    return bytes([sid]) + _uleb(len(body)) + body
+
+
+def _wasm_module(type_sec, func_sec, export_sec, code_sec):
+    """Assemble a minimal module with type/function/export/code sections."""
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")  # magic + version 1
+    out += _wasm_section(1, type_sec)    # Type
+    out += _wasm_section(3, func_sec)    # Function
+    out += _wasm_section(7, export_sec)  # Export
+    out += _wasm_section(10, code_sec)   # Code
+    return bytes(out)
+
+
+def build_wasm_const():
+    """A tiny valid module: export "run" : () -> i32 that returns 42.
+    Proves the sandbox runs a well-behaved module to completion."""
+    # Type section: one type () -> i32.  0x60 form, 0 params, 1 result i32(0x7F).
+    types = _uleb(1) + b"\x60" + _uleb(0) + _uleb(1) + b"\x7f"
+    funcs = _uleb(1) + _uleb(0)                       # one func, type index 0
+    name = b"run"
+    exports = _uleb(1) + _uleb(len(name)) + name + b"\x00" + _uleb(0)  # export func 0 as "run"
+    # Code: locals=0; body: i32.const 42 ; end
+    body = _uleb(0) + b"\x41" + _uleb(42) + b"\x0b"
+    code = _uleb(1) + _uleb(len(body)) + body
+    return _wasm_module(types, funcs, exports, code)
+
+
+def build_wasm_pass():
+    """A PASS plugin: imports netvis.host_total_flops : ()->f64 and
+    netvis.host_emit_metric : (i32 ptr, i32 len, f64 value, i32 known)->void.
+    On run() it emits a metric "double_flops" = 2 * host_total_flops(), known=1.
+    Proves the capability host API + marshalling round-trip (and that NO weight
+    buffer ever crosses — the host has no such import)."""
+    # --- Type section: 3 types ---
+    #  t0: () -> f64            (host_total_flops)
+    #  t1: (i32,i32,f64,i32)->()(host_emit_metric)
+    #  t2: () -> ()             (run)
+    t0 = b"\x60" + _uleb(0) + _uleb(1) + b"\x7c"                       # ()->f64
+    t1 = b"\x60" + _uleb(4) + b"\x7f\x7f\x7c\x7f" + _uleb(0)           # (i32,i32,f64,i32)->()
+    t2 = b"\x60" + _uleb(0) + _uleb(0)                                 # ()->()
+    types = _uleb(3) + t0 + t1 + t2
+
+    def name(s):
+        b = s.encode()
+        return _uleb(len(b)) + b
+
+    # --- Import section: two funcs from module "netvis" ---
+    imp = _uleb(2)
+    imp += name("netvis") + name("host_total_flops") + b"\x00" + _uleb(0)  # func type 0
+    imp += name("netvis") + name("host_emit_metric") + b"\x00" + _uleb(1)  # func type 1
+    # --- Function section: one local func "run" of type 2 ---
+    funcs = _uleb(1) + _uleb(2)
+    # --- Memory section: one memory, min 1 page (for the metric name bytes) ---
+    mem = _uleb(1) + b"\x00" + _uleb(1)   # limits: flag 0 (min only), min=1
+    # --- Export section: "run" (func index 2 = after 2 imported funcs) + memory ---
+    exp = _uleb(2)
+    exp += name("run") + b"\x00" + _uleb(2)
+    exp += name("memory") + b"\x02" + _uleb(0)
+    # --- Data section: metric name "double_flops" at memory offset 8 ---
+    # NOT offset 0: wasm3's m3ApiIsNullPtr treats a pointer == memory base (offset
+    # 0) as null and traps host_read/CheckMem. Real toolchains reserve low memory
+    # for the same reason; we mirror that so a bounds-checked host read succeeds.
+    NAME_OFF = 8
+    mname = b"double_flops"
+    data = _uleb(1) + _uleb(0) + b"\x41" + _uleb(NAME_OFF) + b"\x0b" + _uleb(len(mname)) + mname
+    # --- Code for run(): value = 2.0 * host_total_flops(); emit(0, len, value, 1) ---
+    #   call 0 (host_total_flops) -> f64 ; f64.const 2 ; f64.mul  => value on stack
+    #   then push args for emit: ptr=0, len, <value>, known=1 ; call 1
+    # WASM args are pushed in order, so: i32.const 0; i32.const len; <value>; i32.const 1; call 1
+    import struct as _struct
+    f64_2 = b"\x44" + _struct.pack("<d", 2.0)     # f64.const 2.0
+    body = _uleb(0)                                # 0 locals
+    body += b"\x41" + _uleb(NAME_OFF)              # i32.const 8 (name ptr, non-null)
+    body += b"\x41" + _uleb(len(mname))            # i32.const len
+    body += b"\x10" + _uleb(0)                     # call 0 (host_total_flops) -> f64
+    body += f64_2 + b"\xa2"                        # f64.const 2 ; f64.mul
+    body += b"\x41\x01"                            # i32.const 1 (known)
+    body += b"\x10" + _uleb(1)                     # call 1 (host_emit_metric)
+    body += b"\x0b"                                # end
+    code = _uleb(1) + _uleb(len(body)) + body
+
+    # Sections MUST appear in canonical id order: type(1) import(2) func(3)
+    # memory(5) export(7) code(10) data(11). (code before data.)
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(2, imp)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(5, mem)
+    out += _wasm_section(7, exp)
+    out += _wasm_section(10, code)
+    out += _wasm_section(11, data)
+    return bytes(out)
+
+
+def build_wasm_loop():
+    """A HOSTILE module: export "run" : () -> i32 with an infinite loop
+    (loop; br 0; end). Must be KILLED by the sandbox fuel cap, not hang."""
+    types = _uleb(1) + b"\x60" + _uleb(0) + _uleb(1) + b"\x7f"
+    funcs = _uleb(1) + _uleb(0)
+    name = b"run"
+    exports = _uleb(1) + _uleb(len(name)) + name + b"\x00" + _uleb(0)
+    # body: loop (void 0x40) ; br 0 ; end ; i32.const 0 ; end
+    #   0x03 loop, 0x40 void blocktype, 0x0c br, 0x00 depth, 0x0b end(loop),
+    #   0x41 0x00 i32.const 0, 0x0b end(func)
+    body = _uleb(0) + b"\x03\x40" + b"\x0c" + _uleb(0) + b"\x0b" + b"\x41\x00" + b"\x0b"
+    code = _uleb(1) + _uleb(len(body)) + body
+    return _wasm_module(types, funcs, exports, code)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1131,6 +1259,13 @@ def main():
     assert h5[:8] == b"\x89HDF\r\n\x1a\n", "HDF5 signature misplaced"
     write("model.h5", h5)
     build_keras_v3(out_dir)
+
+    # WASM plugin fixtures (#10): a well-behaved module + a hostile infinite loop.
+    wc = build_wasm_const()
+    assert wc[:4] == b"\x00asm", "wasm magic misplaced"
+    write("plugin_const.wasm", wc)
+    write("plugin_loop.wasm", build_wasm_loop())
+    write("plugin_pass.wasm", build_wasm_pass())
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):
