@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -63,6 +64,9 @@ struct RegistryTable {
   std::vector<std::unique_ptr<OpHandler>>     op_storage;
   std::vector<std::unique_ptr<ParserPlugin>>  parser_storage;
   std::vector<std::unique_ptr<PassPlugin>>    pass_storage;
+  // Stable backing for OpResolution::plugin_name string_views. A deque keeps
+  // element addresses stable across growth (a vector would reallocate and dangle).
+  std::deque<std::string> plugin_names;
 };
 
 class Registry {

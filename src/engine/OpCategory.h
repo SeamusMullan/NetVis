@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace netvis {
@@ -40,5 +41,9 @@ enum class OpCategory : uint8_t {
 OpCategory categorize_op(std::string_view op_type);
 
 const char* category_name(OpCategory c);
+
+// Inverse of category_name: a manifest's "category" string -> enum, or nullopt if
+// it names no known category (so a typo is REJECTED, never silently -> Other).
+std::optional<OpCategory> category_from_name(std::string_view s);
 
 }  // namespace netvis

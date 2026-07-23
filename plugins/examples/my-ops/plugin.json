@@ -1,0 +1,42 @@
+{
+  // NetVis declarative plugin example (v0.6.0 #9). Drop a directory like this into
+  // your plugin_dir() (a config-tree sibling of the layout cache) and NetVis loads
+  // it at startup. JSONC: comments + trailing-comment tolerant.
+  //
+  // The DSL is pure integer arithmetic over a node's resolved shapes + attrs:
+  //   inK.shape[i]  (negative i = from end)   inK.rank   O (=output-0 elem count)
+  //   nin / nout    attr("name"[, default])   sattr("name") == "literal"
+  //   + - * / %  min() max() prod(inK.shape[a:b])  ?:  && || !  comparisons  unknown
+  // All arithmetic is checked int64: div-0 / overflow / unresolved shape / a
+  // negative feeding FLOPs => honest-unknown (never a fabricated or crashing value).
+  // MAC = 2 FLOPs, so an N-MAC op writes "2 * (...)".
+  "api_version": 1,
+  "name": "my-ops",
+  "author": "NetVis example",
+  "ops": [
+    {
+      // A fused multi-head attention contrib op the built-ins don't cost.
+      "name": "MyFusedAttention",
+      "domain": "com.example",
+      "category": "Attention",
+      "color": "#D864D0",
+      "vars": {
+        "B":  "in0.shape[0]",
+        "Sq": "in0.shape[1]",
+        "Hq": "in0.rank == 4 ? in0.shape[2] * in0.shape[3] : in0.shape[2]",
+        "Skv": "nin > 1 && in1.rank >= 3 ? in1.shape[1] : Sq"
+      },
+      "flops": "2 * (2 * B * Sq * Skv * Hq)",
+      "shape": { "out0": ["B", "Sq", "Hq"] }
+    },
+    {
+      // Override a built-in's color only (keeps its FLOP formula): requires
+      // "override": true to shadow a built-in key.
+      "name": "Gelu",
+      "category": "Activation",
+      "color": "#66CCFF",
+      "override": true,
+      "flops": "O"
+    }
+  ]
+}

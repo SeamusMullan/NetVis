@@ -84,6 +84,7 @@
 
 #include "engine/DiffLoader.h"
 #include "engine/LayoutCache.h"
+#include "engine/plugin/declarative/Manifest.h"  // v0.6.0 #9: plugin discovery
 // GraphNav.h defines GraphNavState so ViewState's unique_ptr<GraphNavState>
 // deleter sees the complete type at ~App(); DiffPanel.h for draw_diff_panel.
 #include "engine/CostModel.h"  // complete type for ViewState's unique_ptr<CostReport>
@@ -199,6 +200,11 @@ bool App::init(const std::string& initial_path) {
   // Load persisted view prefs BEFORE applying the theme so a saved theme choice
   // and the heatmap gradient take effect on startup.
   load_prefs();
+
+  // v0.6.0 (#9): discover + register declarative plugins from plugin_dir(). Safe by
+  // construction (JSON manifest + pure DSL, no side effects), so they load freely;
+  // WASM plugins (#10) require explicit per-plugin enable (#11) and are gated there.
+  plugin::discover_and_load_plugins();
 
   apply_theme(view_.dark_theme);
 

@@ -336,7 +336,10 @@ void Registry::register_op_handler(std::string norm_key, std::string /*domain*/,
   if (mut.op_by_key.count(norm_key) > 0 && !override_flag) return;
   OpHandler* raw = h.get();
   mut.op_storage.push_back(std::move(h));
-  mut.op_by_key[norm_key] = OpResolution{raw, origin, shadows_builtin, plugin_name};
+  // Own the plugin name in stable (deque) storage so the string_view never dangles.
+  mut.plugin_names.push_back(std::move(plugin_name));
+  std::string_view name_view = mut.plugin_names.back();
+  mut.op_by_key[norm_key] = OpResolution{raw, origin, shadows_builtin, name_view};
 }
 
 void Registry::register_parser(std::unique_ptr<ParserPlugin> p) {
