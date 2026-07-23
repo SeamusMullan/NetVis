@@ -293,6 +293,10 @@ if(NETVIS_BUILD_APP)
           RUNTIME DESTINATION bin)
   install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/DECISIONS.md
           DESTINATION share/netvis OPTIONAL)
+  # The LICENSE ships inside every installer payload (all platforms). The NSIS
+  # license-agreement page + macOS/other license display are wired via
+  # CPACK_RESOURCE_FILE_LICENSE below.
+  install(FILES ${CMAKE_SOURCE_DIR}/LICENSE DESTINATION share/netvis)
   # Linux: ship the PNG icon for desktop-entry / launcher use (harmless elsewhere).
   if(UNIX AND NOT APPLE)
     install(FILES ${CMAKE_SOURCE_DIR}/assets/netvis.png
@@ -357,6 +361,13 @@ if(NETVIS_BUILD_APP)
       "NetVis-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
   # NOTE: do NOT set CPACK_RESOURCE_FILE_README to a .md — productbuild only
   # accepts .rtf/.rtfd/.html/.txt and errors on other extensions.
+
+  # License-agreement page in the installers. NSIS + productbuild require a .txt
+  # (or .rtf/.html) extension and error on a bare/`.md` name, so copy the repo
+  # LICENSE to a build-dir LICENSE.txt at configure time and point CPack at that.
+  configure_file(${CMAKE_SOURCE_DIR}/LICENSE
+                 ${CMAKE_BINARY_DIR}/LICENSE.txt COPYONLY)
+  set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_BINARY_DIR}/LICENSE.txt")
 
   if(WIN32)
     # NSIS: a standard Start-menu + uninstall installer. `makensis` must be on
