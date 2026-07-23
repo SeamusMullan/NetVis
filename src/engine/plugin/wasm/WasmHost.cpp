@@ -12,7 +12,10 @@
 #include <cstring>
 #include <string>
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4200)  // nonstandard: zero-sized array in struct/union
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
@@ -20,7 +23,9 @@ extern "C" {
 #include "wasm3.h"
 #include "m3_env.h"
 }
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
 
