@@ -79,13 +79,24 @@ RunResult WasmModule::call_i32(const char* export_name, int32_t* out_ret) {
   RunResult r;
   if (!impl_ || !impl_->runtime) { r.status = RunStatus::LoadError; r.message = "no module"; return r; }
 
-  IM3Function fn = nullptr;
-  M3Result err = m3_FindFunction(&fn, impl_->runtime, export_name);
-  if (err || !fn) { r.status = RunStatus::LoadError; r.message = err ? err : "export not found"; return r; }
-
-  // Arm fuel for this call; disarm after so host-side code isn't metered.
+  // Arm fuel BEFORE FindFunction: wasm3 runs a module's `start` section LAZILY on
+  // the first FindFunction (m3_env.c: the start fn fires inside function lookup),
+  // so a hostile `(start $loop)` would otherwise execute UNMETERED. Metering the
+  // lookup traps a runaway start section too.
   g_fuel = impl_->lim.max_steps;
   g_fuel_armed = true;
+
+  IM3Function fn = nullptr;
+  M3Result err = m3_FindFunction(&fn, impl_->runtime, export_name);
+  if (err || !fn) {
+    g_fuel_armed = false;
+    if (err && std::strcmp(err, kFuelExhausted) == 0) {
+      r.status = RunStatus::FuelExhausted; r.message = err; return r;  // start-section runaway
+    }
+    r.status = RunStatus::LoadError; r.message = err ? err : "export not found"; return r;
+  }
+
+  g_fuel = impl_->lim.max_steps;   // refresh for the actual call
   err = m3_CallV(fn);
   g_fuel_armed = false;
 

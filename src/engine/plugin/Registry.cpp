@@ -330,16 +330,21 @@ void Registry::register_op_handler(std::string norm_key, std::string /*domain*/,
   snapshot();  // ensure table_ is initialized
   auto tbl = table_.load();
   auto& mut = const_cast<RegistryTable&>(*tbl);
-  // Refuse a collision with a built-in-known key unless override was requested.
-  bool shadows_builtin = (categorize_op(norm_key) != OpCategory::Other) ||
-                         mut.op_by_key.count(norm_key) > 0;
-  if (mut.op_by_key.count(norm_key) > 0 && !override_flag) return;
+  // A key shadows a BUILT-IN when categorize_op recognizes it as a known op family
+  // (the built-in catch-all would otherwise answer it), or shadows an already-
+  // registered USER handler. Either way, shadowing REQUIRES an explicit
+  // override:true (design §0.5/§Q3 — a plugin must not silently replace a built-in
+  // FLOP/category formula). Refuse otherwise; never half-register.
+  bool shadows_builtin = categorize_op(norm_key) != OpCategory::Other;
+  bool shadows_user = mut.op_by_key.count(norm_key) > 0;
+  if ((shadows_builtin || shadows_user) && !override_flag) return;
   OpHandler* raw = h.get();
   mut.op_storage.push_back(std::move(h));
   // Own the plugin name in stable (deque) storage so the string_view never dangles.
   mut.plugin_names.push_back(std::move(plugin_name));
   std::string_view name_view = mut.plugin_names.back();
-  mut.op_by_key[norm_key] = OpResolution{raw, origin, shadows_builtin, name_view};
+  mut.op_by_key[norm_key] =
+      OpResolution{raw, origin, shadows_builtin || shadows_user, name_view};
 }
 
 void Registry::register_parser(std::unique_ptr<ParserPlugin> p) {

@@ -1212,6 +1212,38 @@ def build_wasm_loop():
     return _wasm_module(types, funcs, exports, code)
 
 
+def build_wasm_start_loop():
+    """A HOSTILE module whose START section runs an infinite loop, plus an exported
+    run():()->i32. wasm3 runs the start fn lazily on first FindFunction, BEFORE the
+    call — so the sandbox must meter that path too (regression for the adversarial
+    review's start-section fuel-bypass finding). f0 = run (returns 0),
+    f1 = start (loops). NB: the start index must be NON-ZERO — wasm3's lazy-start
+    check is `if (module->startFunction)` (truthiness), so index 0 is treated as
+    'no start'; we put the looping start fn at index 1."""
+    # Types: t0 ()->i32 [run], t1 ()->() [start]
+    t0 = b"\x60" + _uleb(0) + _uleb(1) + b"\x7f"
+    t1 = b"\x60" + _uleb(0) + _uleb(0)
+    types = _uleb(2) + t0 + t1
+    funcs = _uleb(2) + _uleb(0) + _uleb(1)       # f0:t0 (run), f1:t1 (start)
+    # Export "run" = func index 0.
+    rn = b"run"
+    exports = _uleb(1) + _uleb(len(rn)) + rn + b"\x00" + _uleb(0)
+    # Start section (id 8): start func index 1 (non-zero so wasm3 actually runs it).
+    start = _uleb(1)
+    # Code: f0 = i32.const 0;end   f1 = loop;br 0;end;end
+    b0 = _uleb(0) + b"\x41\x00\x0b"
+    b1 = _uleb(0) + b"\x03\x40" + b"\x0c" + _uleb(0) + b"\x0b" + b"\x0b"
+    code = _uleb(2) + _uleb(len(b0)) + b0 + _uleb(len(b1)) + b1
+    # Section order: type(1) func(3) export(7) start(8) code(10)
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(7, exports)
+    out += _wasm_section(8, start)
+    out += _wasm_section(10, code)
+    return bytes(out)
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -1265,6 +1297,7 @@ def main():
     assert wc[:4] == b"\x00asm", "wasm magic misplaced"
     write("plugin_const.wasm", wc)
     write("plugin_loop.wasm", build_wasm_loop())
+    write("plugin_start_loop.wasm", build_wasm_start_loop())
     write("plugin_pass.wasm", build_wasm_pass())
 
     print("wrote fixtures to", out_dir)

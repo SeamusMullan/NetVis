@@ -137,6 +137,30 @@ TEST_CASE("dsl: hostile input is rejected, never crashes") {
   CHECK(dsl::Expr::compile("in0.bogus", dsl::Limits{}, &err).valid() == false);
   // '.shape'/'.rank' on a non-operand.
   CHECK(dsl::Expr::compile("5.rank", dsl::Limits{}, &err).valid() == false);
+
+  // REGRESSION (adversarial review): a huge operand index must NOT crash via an
+  // uncaught std::stoul out_of_range, and must NOT wrap-alias slot 0. "in<huge>"
+  // is not a valid operand -> treated as a plain (unbound) variable -> compiles
+  // but evaluates to unknown; the point is NO throw/crash.
+  {
+    dsl::Expr e = dsl::Expr::compile("in4294967296", dsl::Limits{}, &err);
+    // Compiles as a bare identifier (unbound var); evaluating it is unknown, never a crash.
+    if (e.valid()) {
+      ir::Model mm; mm.graphs.emplace_back(); mm.graphs[0].nodes.emplace_back();
+      OpContext c = Registry::instance().make_context(mm, mm.graphs[0], mm.graphs[0].nodes[0], {});
+      CHECK(e.eval(c, {}).known == false);
+    }
+    // And inside a shape access — the original repro — must not throw either.
+    dsl::Expr e2 = dsl::Expr::compile("in99999999999999999999.shape[0]", dsl::Limits{}, &err);
+    CHECK(e2.valid() == false);   // "in<huge>" isn't an operand, so ".shape" has no operand base
+  }
+
+  // REGRESSION: deep unary chain must hit the depth cap, not overflow the stack.
+  {
+    std::string deep(500, '!');
+    deep += "1";
+    CHECK(dsl::Expr::compile(deep, dsl::Limits{}, &err).valid() == false);
+  }
 }
 
 TEST_CASE("declarative: attr access mirrors built-in getters") {
@@ -259,6 +283,27 @@ TEST_CASE("declarative: registered plugin op resolves + FLOP-counts through the 
   FlopResult fr = r.handler->flops(ctx);
   CHECK(fr.known == true);
   CHECK(fr.flops == 3 * 4 * 8);   // the DSL formula, evaluated on this node
+}
+
+TEST_CASE("registry: shadowing a built-in without override:true is refused (review fix)") {
+  Registry& reg = Registry::instance();
+  // "sigmoid" is a known built-in op (categorize_op -> Activation, not Other).
+  // Registering a handler for it WITHOUT override must NOT take effect.
+  struct DummyH : OpHandler {
+    OpCategory category(const OpContext&) const override { return OpCategory::MatMul; }
+    uint32_t api_version() const override { return kOpHandlerAbiVersion; }
+  };
+  reg.register_op_handler("sigmoid", "", std::make_unique<DummyH>(),
+                          Origin::Declarative, /*override_flag=*/false, "rogue");
+  OpResolution r = reg.resolve_op("sigmoid");
+  CHECK(r.origin == Origin::Builtin);   // refused -> still the built-in catch-all
+
+  // WITH override:true it takes effect and is flagged as shadowing a built-in.
+  reg.register_op_handler("sigmoid", "", std::make_unique<DummyH>(),
+                          Origin::Declarative, /*override_flag=*/true, "override-ok");
+  OpResolution r2 = reg.resolve_op("sigmoid");
+  CHECK(r2.origin == Origin::Declarative);
+  CHECK(r2.overrides_builtin == true);
 }
 
 TEST_CASE("manifest: overrides_builtin flag is surfaced (for the Plugins panel #11)") {

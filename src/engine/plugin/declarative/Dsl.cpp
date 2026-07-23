@@ -248,6 +248,10 @@ struct Parser {
   }
 
   NodePtr parse_unary() {
+    // Depth-guard the unary chain: `-`/`!` recurse into parse_unary directly, so
+    // without this a token stream like `!!!!...`(x4096) would recurse past the
+    // native stack, bypassing the max_depth bound the other productions enforce.
+    Depth d(*this); if (!d.ok || !ok) return nullptr;
     if (accept(Tk::Minus)) {
       auto n = mk(Op::Neg); n->kids = {parse_unary()}; return n;
     }
@@ -257,15 +261,35 @@ struct Parser {
     return parse_postfix();
   }
 
-  // operand token: inK / outK -> (is_input, slot). Returns null if not an operand.
+  // Parse the digit tail of an operand token (e.g. "42" in "in42") into a slot.
+  // Bounded + NON-throwing (std::stoul throws out_of_range on a huge literal and
+  // wraps to uint32 — a hostile "in4294967296" would crash the app or alias slot 0).
+  // Every char must be a digit; the value must fit under kMaxSlot; else NOT an
+  // operand (returns false → the token falls through to a plain variable name).
+  static bool parse_slot(std::string_view digits, uint32_t& out) {
+    static constexpr uint32_t kMaxSlot = 4096;   // far beyond any real op arity
+    if (digits.empty()) return false;
+    uint32_t v = 0;
+    for (char c : digits) {
+      if (c < '0' || c > '9') return false;
+      v = v * 10 + static_cast<uint32_t>(c - '0');
+      if (v > kMaxSlot) return false;            // overflow-proof: reject early
+    }
+    out = v;
+    return true;
+  }
+
+  // operand token: inK / outK -> (is_input, slot). Returns false if not an operand.
   bool operand_of(const std::string& id, bool& is_input, uint32_t& slot) {
     if (id.size() >= 3 && id.compare(0, 2, "in") == 0 &&
         std::isdigit(static_cast<unsigned char>(id[2]))) {
-      is_input = true; slot = static_cast<uint32_t>(std::stoul(id.substr(2))); return true;
+      if (!parse_slot(std::string_view(id).substr(2), slot)) return false;
+      is_input = true; return true;
     }
     if (id.size() >= 4 && id.compare(0, 3, "out") == 0 &&
         std::isdigit(static_cast<unsigned char>(id[3]))) {
-      is_input = false; slot = static_cast<uint32_t>(std::stoul(id.substr(3))); return true;
+      if (!parse_slot(std::string_view(id).substr(3), slot)) return false;
+      is_input = false; return true;
     }
     return false;
   }

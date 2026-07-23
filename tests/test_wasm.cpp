@@ -77,6 +77,24 @@ TEST_CASE("wasm: a hostile infinite-loop module is KILLED by the fuel cap") {
   // ...and the app is still alive to make this assertion — that IS the survival test.
 }
 
+TEST_CASE("wasm: a hostile START-section loop is metered too (fuel bypass regression)") {
+  if (!WasmEngine::instance().enabled()) return;
+  std::vector<uint8_t> img = read_file(fixture("plugin_start_loop.wasm"));
+  REQUIRE(img.size() > 8);
+
+  SandboxLimits lim;
+  lim.max_steps = 100000;
+  RunResult lerr;
+  WasmModule mod = WasmEngine::instance().load(img, lim, nullptr, &lerr);
+  REQUIRE(mod.loaded());   // wasm3 defers the start fn to first FindFunction
+
+  int32_t ret = 0;
+  RunResult rr = mod.call_i32("run", &ret);
+  // The start section loops forever; it runs during FindFunction, which the fuel
+  // now covers -> FuelExhausted, app survives (regression for the review finding).
+  CHECK(rr.status == RunStatus::FuelExhausted);
+}
+
 TEST_CASE("wasm: a garbage image fails to load cleanly (no crash)") {
   if (!WasmEngine::instance().enabled()) return;
   std::vector<uint8_t> junk = {0x00, 0x61, 0x73, 0x6d, 0xff, 0xff, 0xff, 0xff,
