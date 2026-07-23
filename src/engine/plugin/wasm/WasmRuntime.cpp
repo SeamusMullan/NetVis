@@ -7,9 +7,13 @@
 #include <cstring>
 
 // wasm3's public + internal headers use C constructs (flexible array members)
-// that trip our -Wpedantic -Werror when pulled into this C++ TU. Silence just for
-// these includes; our own code below stays under the strict flags.
-#if defined(__GNUC__) || defined(__clang__)
+// that trip our strict warnings (-Wpedantic -Werror on GCC/clang; C4200 under
+// MSVC /WX) when pulled into this C++ TU. Silence just for these includes; our own
+// code below stays under the strict flags.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4200)  // nonstandard: zero-sized array in struct/union
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
@@ -17,7 +21,9 @@ extern "C" {
 #include "wasm3.h"
 #include "m3_env.h"
 }
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
 

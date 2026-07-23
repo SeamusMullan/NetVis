@@ -12,7 +12,10 @@
 #include <cstring>
 #include <string>
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4200)  // nonstandard: zero-sized array in struct/union
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
@@ -20,8 +23,18 @@ extern "C" {
 #include "wasm3.h"
 #include "m3_env.h"
 }
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
+
+// The m3ApiRawFunction macro expands to a fixed (runtime, _ctx, _sp, _mem)
+// signature; host fns that don't touch memory leave `runtime`/`_mem` unused. That
+// is intentional (the ABI is fixed), so silence MSVC C4100 for this TU — the
+// GCC/clang build already passes via -Wno-error=unused-parameter.
+#if defined(_MSC_VER)
+#pragma warning(disable : 4100)  // unreferenced formal parameter
 #endif
 
 namespace netvis::plugin::wasm {

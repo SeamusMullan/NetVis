@@ -10,10 +10,10 @@
 // See docs/v0.6.0-design.md Part 2.4 + Part 3.3 (two-tier resolution + hoist).
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -72,7 +72,7 @@ struct RegistryTable {
 class Registry {
  public:
   static Registry& instance();                              // Meyers singleton
-  std::shared_ptr<const RegistryTable> snapshot() const;    // lock-free load
+  std::shared_ptr<const RegistryTable> snapshot() const;    // mutex-guarded load
 
   // Two-tier op resolution (design Part 3.3): exact normalized-op key first, else
   // the builtin catch-all (which itself category-dispatches + honest-unknowns).
@@ -96,11 +96,17 @@ class Registry {
   void register_parser(std::unique_ptr<ParserPlugin>);
   void register_pass(std::unique_ptr<PassPlugin>);
 
-  void reload(std::shared_ptr<const RegistryTable> next);   // atomic swap
+  void reload(std::shared_ptr<const RegistryTable> next);   // guarded swap
 
  private:
-  // Lock-free reads (UI + worker threads); rare atomic swap on load/reload.
-  std::atomic<std::shared_ptr<const RegistryTable>> table_;
+  // A shared_ptr<const> published under a mutex. Reads copy the shared_ptr (a cheap
+  // refcount bump) under a short lock; the swap on load/reload takes the same lock.
+  // NOTE: NOT std::atomic<shared_ptr> — libc++ (macOS/clang) lacks that C++20
+  // specialization and falls back to the trivially-copyable-only primary template,
+  // which static_asserts on a shared_ptr. The mutex is portable + the read cost is
+  // negligible (resolve_op is hoisted once per op-type). [portability-fix]
+  mutable std::mutex table_mutex_;
+  mutable std::shared_ptr<const RegistryTable> table_;   // lazy-inited in snapshot()
 };
 
 }  // namespace netvis::plugin

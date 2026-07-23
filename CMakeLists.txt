@@ -138,11 +138,19 @@ if(NETVIS_ENABLE_WASM)
               ${wasm3_SOURCE_DIR}/source/m3_exec.h)
   endif()
   file(GLOB WASM3_SRC ${wasm3_SOURCE_DIR}/source/*.c)
+  # Drop the WASI/uvwasi host-API translation units: we expose ZERO syscalls, so
+  # they are dead weight, and they are the files that reference the unfetched
+  # uvwasi headers (guarded, but excluded for clarity + smaller builds).
+  list(FILTER WASM3_SRC EXCLUDE REGEX "m3_api_(wasi|uvwasi|meta_wasi)\\.c$")
   add_library(wasm3 STATIC ${WASM3_SRC})
   target_include_directories(wasm3 PUBLIC ${wasm3_SOURCE_DIR}/source)
   target_compile_definitions(wasm3 PUBLIC d_m3MaxFunctionStackHeight=1024)
-  # wasm3's own C sources must NOT inherit our -Werror/-Wpedantic.
-  set_target_properties(wasm3 PROPERTIES COMPILE_FLAGS "-w")
+  # wasm3's own C sources must NOT inherit our strict warnings-as-errors.
+  if(MSVC)
+    target_compile_options(wasm3 PRIVATE /w)
+  else()
+    target_compile_options(wasm3 PRIVATE -w)
+  endif()
 endif()
 
 # doctest — unit test harness (tests only).

@@ -267,19 +267,13 @@ std::shared_ptr<const RegistryTable> make_default_table() {
 }  // namespace
 
 std::shared_ptr<const RegistryTable> Registry::snapshot() const {
-  // Lazy-init on first use; atomic-swap on reload. std::atomic<shared_ptr> makes
-  // the load/store race-free across UI + worker threads.
-  auto& tbl = const_cast<Registry*>(this)->table_;
-  std::shared_ptr<const RegistryTable> cur = tbl.load();
-  if (!cur) {
-    auto def = make_default_table();
-    // Publish once; if a racing thread already set it, keep theirs (idempotent —
-    // both are the same built-in-only default).
-    std::shared_ptr<const RegistryTable> expected = nullptr;
-    if (tbl.compare_exchange_strong(expected, def)) return def;
-    return tbl.load();
-  }
-  return cur;
+  // Lazy-init on first use. Reads copy the shared_ptr under a short lock (a refcount
+  // bump); the rare load/reload swap takes the same lock. Portable across libstdc++
+  // + libc++ (no atomic<shared_ptr>). resolve_op is hoisted once per op-type, so the
+  // lock cost is off the per-node hot path.
+  std::lock_guard<std::mutex> lk(table_mutex_);
+  if (!table_) table_ = make_default_table();
+  return table_;
 }
 
 OpResolution Registry::resolve_op(std::string_view op_norm) const {
@@ -288,18 +282,6 @@ OpResolution Registry::resolve_op(std::string_view op_norm) const {
   if (it != tbl->op_by_key.end()) return it->second;
   return OpResolution{tbl->builtin_op, Origin::Builtin, false, std::string_view{}};
 }
-
-namespace {
-// Registration mutex. Registration happens at load time (startup, or a user-driven
-// reload in #11); reads are lock-free via the atomic snapshot. RegistryTable owns
-// unique_ptr storage so it is NOT copyable — the registration path mutates a single
-// owned table in place under this lock and republishes it atomically. (The full
-// build-a-fresh-table-and-swap loader for concurrent hot-reload lands with #9/#10.)
-std::mutex& reg_mutex() {
-  static std::mutex m;
-  return m;
-}
-}  // namespace
 
 OpContext Registry::make_context(const ir::Model& model, const ir::Graph& g,
                                  const ir::Node& node, std::string_view /*op_norm*/,
@@ -314,22 +296,23 @@ OpContext Registry::make_context(const ir::Model& model, const ir::Graph& g,
 }
 
 void Registry::reload(std::shared_ptr<const RegistryTable> next) {
-  table_.store(next);
+  std::lock_guard<std::mutex> lk(table_mutex_);
+  table_ = std::move(next);
 }
 
-// Registration entry points. RegistryTable owns non-copyable unique_ptr storage,
-// so registration mutates the single owned table in place under reg_mutex() and
-// republishes the same shared_ptr atomically. Registration is a load-time event;
-// reads are lock-free. A future hot-reload (#11) that must not perturb in-flight
-// readers builds a brand-new table and atomic_stores it — same public surface.
+// Registration entry points. RegistryTable owns non-copyable unique_ptr storage, so
+// registration mutates the single owned table IN PLACE under table_mutex_ (the same
+// lock readers take). Registration is a load-time event; the per-node read path
+// (resolve_op) is hoisted once per op-type so the shared lock is off the hot path.
+// NOTE: hold table_mutex_ directly and init inline — do NOT call snapshot() here
+// (non-recursive mutex would deadlock).
 void Registry::register_op_handler(std::string norm_key, std::string /*domain*/,
                                    std::unique_ptr<OpHandler> h, Origin origin,
                                    bool override_flag, std::string plugin_name) {
   if (!h || h->api_version() != kOpHandlerAbiVersion) return;  // refuse mismatch
-  std::lock_guard<std::mutex> lk(reg_mutex());
-  snapshot();  // ensure table_ is initialized
-  auto tbl = table_.load();
-  auto& mut = const_cast<RegistryTable&>(*tbl);
+  std::lock_guard<std::mutex> lk(table_mutex_);
+  if (!table_) table_ = make_default_table();
+  auto& mut = const_cast<RegistryTable&>(*table_);
   // A key shadows a BUILT-IN when categorize_op recognizes it as a known op family
   // (the built-in catch-all would otherwise answer it), or shadows an already-
   // registered USER handler. Either way, shadowing REQUIRES an explicit
@@ -349,10 +332,9 @@ void Registry::register_op_handler(std::string norm_key, std::string /*domain*/,
 
 void Registry::register_parser(std::unique_ptr<ParserPlugin> p) {
   if (!p || p->api_version() != kParserPluginAbiVersion) return;
-  std::lock_guard<std::mutex> lk(reg_mutex());
-  snapshot();
-  auto tbl = table_.load();
-  auto& mut = const_cast<RegistryTable&>(*tbl);
+  std::lock_guard<std::mutex> lk(table_mutex_);
+  if (!table_) table_ = make_default_table();
+  auto& mut = const_cast<RegistryTable&>(*table_);
   mut.parsers.push_back(p.get());
   mut.parser_storage.push_back(std::move(p));
   std::sort(mut.parsers.begin(), mut.parsers.end(),
@@ -363,9 +345,9 @@ void Registry::register_parser(std::unique_ptr<ParserPlugin> p) {
 
 void Registry::register_pass(std::unique_ptr<PassPlugin> p) {
   if (!p || p->api_version() != kPassPluginAbiVersion) return;
-  std::lock_guard<std::mutex> lk(reg_mutex());
-  snapshot();
-  auto tbl = table_.load();
+  std::lock_guard<std::mutex> lk(table_mutex_);
+  if (!table_) table_ = make_default_table();
+  auto tbl = table_;
   auto& mut = const_cast<RegistryTable&>(*tbl);
   mut.passes[std::string(p->display_name())] = p.get();
   mut.pass_storage.push_back(std::move(p));
