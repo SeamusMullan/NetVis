@@ -16,5 +16,6 @@ tests/fixtures/*.mlmodel
 tests/fixtures/*.npz
 tests/fixtures/*.h5
 tests/fixtures/*.keras
+tests/fixtures/*.wasm
 .wf/
 imgui.ini
