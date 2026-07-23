@@ -96,6 +96,23 @@ RunResult WasmModule::call_i32(const char* export_name, int32_t* out_ret) {
     r.status = RunStatus::LoadError; r.message = err ? err : "export not found"; return r;
   }
 
+  // VALIDATE the export's signature BEFORE m3_CallV/GetResultsV. m3_FindFunction
+  // resolves by NAME only; m3_CallVL/GetResultsVL have NO arg/ret count guard, so a
+  // hostile `run` taking args (e.g. (i32)->()) or returning >1 value makes them
+  // va_arg past the caller's varargs → UB / wild write. We require ZERO args and
+  // accept either 0 rets (void) or exactly 1 i32 ret; anything else is rejected
+  // cleanly. [review-fix]
+  const uint32_t nargs = m3_GetArgCount(fn);
+  const uint32_t nrets = m3_GetRetCount(fn);
+  const bool ret_ok = (nrets == 0) ||
+                      (nrets == 1 && m3_GetRetType(fn, 0) == c_m3Type_i32);
+  if (nargs != 0 || !ret_ok) {
+    g_fuel_armed = false;
+    r.status = RunStatus::LoadError;
+    r.message = "export has wrong signature (expected () -> i32 or () -> ())";
+    return r;
+  }
+
   g_fuel = impl_->lim.max_steps;   // refresh for the actual call
   err = m3_CallV(fn);
   g_fuel_armed = false;
@@ -107,10 +124,15 @@ RunResult WasmModule::call_i32(const char* export_name, int32_t* out_ret) {
     r.status = RunStatus::Trap; r.message = err; return r;
   }
   if (out_ret) {
-    // Best-effort: read the i32 result if present.
-    uint64_t ret = 0;
-    m3_GetResultsV(fn, &ret);
-    *out_ret = static_cast<int32_t>(ret);
+    // Read the i32 result ONLY when the export actually returns one (else the
+    // GetResultsVL loop would va_arg past our single pointer → UB).
+    if (nrets == 1) {
+      uint64_t ret = 0;
+      m3_GetResultsV(fn, &ret);
+      *out_ret = static_cast<int32_t>(ret);
+    } else {
+      *out_ret = 0;
+    }
   }
   r.status = RunStatus::Ok;
   return r;
@@ -148,6 +170,14 @@ WasmModule WasmEngine::load(const std::vector<uint8_t>& wasm, const SandboxLimit
   impl->runtime = m3_NewRuntime(impl_->env, /*stackSizeInBytes=*/64 * 1024, host_ctx);
   if (!impl->runtime) { err.status = RunStatus::LoadError; err.message = "runtime alloc failed"; if (out_err) *out_err = err; return mod; }
 
+  // Cap linear memory BEFORE m3_LoadModule: LoadModule -> InitMemory allocates the
+  // module's declared initial pages, and wasm3 only applies the memoryLimit MIN-
+  // clamp (m3_env.c ResizeMemory) when the limit is already set. Setting it after
+  // load let a hostile module declaring huge initPages (e.g. `(memory 30000)`)
+  // force a ~2 GiB allocation at load — a memory-exhaustion DoS. [review-fix]
+  impl->runtime->memoryLimit =
+      static_cast<uint32_t>(lim.max_memory_pages) * 65536u;
+
   IM3Module m = nullptr;
   M3Result r = m3_ParseModule(impl_->env, &m, impl->image.data(),
                               static_cast<uint32_t>(impl->image.size()));
@@ -156,10 +186,6 @@ WasmModule WasmEngine::load(const std::vector<uint8_t>& wasm, const SandboxLimit
   r = m3_LoadModule(impl->runtime, m);
   if (r) { err.status = RunStatus::LoadError; err.message = r; m3_FreeRuntime(impl->runtime); if (out_err) *out_err = err; return mod; }
   impl->module = m;
-
-  // Cap linear memory: a module that grows past this many bytes traps on grow.
-  impl->runtime->memoryLimit =
-      static_cast<uint32_t>(lim.max_memory_pages) * 65536u;
 
   mod.impl_ = std::move(impl);
   if (out_err) { err.status = RunStatus::Ok; *out_err = err; }

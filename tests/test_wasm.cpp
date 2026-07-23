@@ -95,6 +95,35 @@ TEST_CASE("wasm: a hostile START-section loop is metered too (fuel bypass regres
   CHECK(rr.status == RunStatus::FuelExhausted);
 }
 
+TEST_CASE("wasm: a wrong-signature export is rejected, not UB (review fix)") {
+  if (!WasmEngine::instance().enabled()) return;
+  std::vector<uint8_t> img = read_file(fixture("plugin_badsig.wasm"));
+  REQUIRE(img.size() > 8);
+  SandboxLimits lim;
+  RunResult lerr;
+  WasmModule mod = WasmEngine::instance().load(img, lim, nullptr, &lerr);
+  REQUIRE(mod.loaded());
+  int32_t ret = 0;
+  RunResult rr = mod.call_i32("run", &ret);   // run:(i32)->() — must be refused
+  CHECK(rr.status == RunStatus::LoadError);
+  CHECK(rr.message.find("signature") != std::string::npos);
+}
+
+TEST_CASE("wasm: a huge declared memory is capped at load, not OOM (review fix)") {
+  if (!WasmEngine::instance().enabled()) return;
+  std::vector<uint8_t> img = read_file(fixture("plugin_bigmem.wasm"));
+  REQUIRE(img.size() > 8);
+  SandboxLimits lim;   // default 256 pages = 16 MiB cap
+  RunResult lerr;
+  // Must NOT allocate ~1.9 GiB: the memoryLimit MIN-clamp applies at load because
+  // it is set before m3_LoadModule. Loads (module is otherwise valid) + runs fine.
+  WasmModule mod = WasmEngine::instance().load(img, lim, nullptr, &lerr);
+  REQUIRE(mod.loaded());
+  uint32_t memsz = 0;
+  mod.memory(&memsz);
+  CHECK(memsz <= lim.max_memory_pages * 65536u);   // capped, not 30000 pages
+}
+
 TEST_CASE("wasm: a garbage image fails to load cleanly (no crash)") {
   if (!WasmEngine::instance().enabled()) return;
   std::vector<uint8_t> junk = {0x00, 0x61, 0x73, 0x6d, 0xff, 0xff, 0xff, 0xff,

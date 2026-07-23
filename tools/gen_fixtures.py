@@ -1197,6 +1197,41 @@ def build_wasm_pass():
     return bytes(out)
 
 
+def build_wasm_badsig():
+    """A module exporting run:(i32)->() — WRONG signature. call_i32 must REJECT it
+    cleanly (not va_arg past the empty arg list → UB). Regression for the review's
+    export-signature finding."""
+    # Type () with ONE i32 param, no result: 0x60, 1 param i32, 0 results.
+    types = _uleb(1) + b"\x60" + _uleb(1) + b"\x7f" + _uleb(0)
+    funcs = _uleb(1) + _uleb(0)
+    name = b"run"
+    exports = _uleb(1) + _uleb(len(name)) + name + b"\x00" + _uleb(0)
+    body = _uleb(0) + b"\x0b"   # empty body, just end
+    code = _uleb(1) + _uleb(len(body)) + body
+    return _wasm_module(types, funcs, exports, code)
+
+
+def build_wasm_bigmem():
+    """A module declaring 30000 initial memory pages (~1.9 GiB) + run:()->i32.
+    The sandbox's 256-page cap must bound the allocation at LOAD time (regression
+    for the review's memory-cap-set-too-late finding)."""
+    types = _uleb(1) + b"\x60" + _uleb(0) + _uleb(1) + b"\x7f"
+    funcs = _uleb(1) + _uleb(0)
+    mem = _uleb(1) + b"\x00" + _uleb(30000)   # limits flag 0 (min only), min=30000 pages
+    name = b"run"
+    exports = _uleb(1) + _uleb(len(name)) + name + b"\x00" + _uleb(0)
+    body = _uleb(0) + b"\x41\x00\x0b"
+    code = _uleb(1) + _uleb(len(body)) + body
+    # order: type(1) func(3) memory(5) export(7) code(10)
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(5, mem)
+    out += _wasm_section(7, exports)
+    out += _wasm_section(10, code)
+    return bytes(out)
+
+
 def build_wasm_loop():
     """A HOSTILE module: export "run" : () -> i32 with an infinite loop
     (loop; br 0; end). Must be KILLED by the sandbox fuel cap, not hang."""
@@ -1298,6 +1333,8 @@ def main():
     write("plugin_const.wasm", wc)
     write("plugin_loop.wasm", build_wasm_loop())
     write("plugin_start_loop.wasm", build_wasm_start_loop())
+    write("plugin_badsig.wasm", build_wasm_badsig())
+    write("plugin_bigmem.wasm", build_wasm_bigmem())
     write("plugin_pass.wasm", build_wasm_pass())
 
     print("wrote fixtures to", out_dir)
