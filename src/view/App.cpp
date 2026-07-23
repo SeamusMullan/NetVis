@@ -91,6 +91,7 @@
 #include "view/CostPanel.h"
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
+#include "view/PluginsPanel.h"
 
 // tinyfiledialogs ships only a .c/.h that is NOT on our include path; its two
 // entry points are plain C, so we declare them ourselves (spec §8.7). At link
@@ -395,6 +396,8 @@ void App::frame() {
       }
       // Model diff panel visibility (v0.2.0).
       ImGui::MenuItem("Model diff panel", nullptr, &view_.diff_panel_open);
+      // Plugins management panel (v0.6.0 #11).
+      ImGui::MenuItem("Plugins", nullptr, &view_.show_plugins);
       ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -418,6 +421,7 @@ void App::frame() {
 
   // Panels + overlays are always present (they self-hide when empty).
   draw_diff_panel(*this);
+  draw_plugins_panel(*this);
   draw_properties_panel(*this);
   draw_weight_inspector(*this);
   draw_search_bar(*this);

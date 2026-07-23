@@ -42,7 +42,13 @@ std::string plugin_dir();
 
 // Discover + load every `<plugin_dir>/*/plugin.json`, deterministic path order.
 // Returns one LoadedManifest per file. Declarative plugins load freely (safe by
-// construction); enable/disable filtering (#11) is applied by the caller.
+// construction); enable/disable filtering (#11) is applied by the caller. The
+// results are also cached process-wide for the Plugins panel (loaded_manifests()).
 std::vector<LoadedManifest> discover_and_load_plugins();
+
+// The manifests loaded by the most recent discover_and_load_plugins() call — the
+// Plugins panel (#11) reads this to list plugins, their ops, overrides, and any
+// rejection reason. Empty until discovery runs.
+const std::vector<LoadedManifest>& loaded_manifests();
 
 }  // namespace netvis::plugin

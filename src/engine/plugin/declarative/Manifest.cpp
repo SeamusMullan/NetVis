@@ -323,6 +323,15 @@ LoadedManifest load_manifest_file(const std::string& path, bool register_into) {
   return lm;
 }
 
+namespace {
+std::vector<LoadedManifest>& manifest_cache() {
+  static std::vector<LoadedManifest> cache;
+  return cache;
+}
+}  // namespace
+
+const std::vector<LoadedManifest>& loaded_manifests() { return manifest_cache(); }
+
 std::vector<LoadedManifest> discover_and_load_plugins() {
   std::vector<LoadedManifest> out;
   std::string root = plugin_dir();
@@ -336,6 +345,7 @@ std::vector<LoadedManifest> discover_and_load_plugins() {
   }
   std::sort(manifests.begin(), manifests.end());  // deterministic path order
   for (const auto& p : manifests) out.push_back(load_manifest_file(p.string(), true));
+  manifest_cache() = out;   // cache for the Plugins panel (#11)
   return out;
 }
 

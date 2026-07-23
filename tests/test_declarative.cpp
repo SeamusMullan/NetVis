@@ -260,3 +260,15 @@ TEST_CASE("declarative: registered plugin op resolves + FLOP-counts through the 
   CHECK(fr.known == true);
   CHECK(fr.flops == 3 * 4 * 8);   // the DSL formula, evaluated on this node
 }
+
+TEST_CASE("manifest: overrides_builtin flag is surfaced (for the Plugins panel #11)") {
+  // "Gelu" is a known built-in op; override:true must be reflected in the diag so
+  // the Plugins panel can show "overrides built-in".
+  std::string p = write_temp(R"json({ "api_version": 1, "name": "ov",
+    "ops": [{ "name": "Gelu", "category": "Activation", "override": true, "flops": "O" }] })json");
+  LoadedManifest lm = load_manifest_file(p, /*register_into=*/false);
+  std::remove(p.c_str());
+  REQUIRE(lm.ops.size() == 1);
+  CHECK(lm.ops[0].ok == true);
+  CHECK(lm.ops[0].overrides_builtin == true);
+}
