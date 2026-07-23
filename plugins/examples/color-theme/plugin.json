@@ -1,0 +1,24 @@
+{
+  // color-theme — a pure recolor plugin: no new ops, no FLOP changes, just override
+  // the color of several built-in op categories to a custom palette. Shows that a
+  // plugin can be purely cosmetic, and that shadowing a built-in needs override:true.
+  //
+  // Each op here IS a built-in the host already knows, so "override": true is
+  // required (a plugin may never silently replace a built-in). We keep each op's
+  // category the same and set only `color`; omitting `flops` leaves the built-in
+  // FLOP number untouched... EXCEPT: a declarative op fully REPLACES the built-in
+  // handler, so to keep FLOPs we restate the generic formula for its category
+  // (Activation/Elementwise => |O|). For an op with a non-generic built-in formula
+  // (Conv/MatMul/Attention), a recolor-only override would LOSE its FLOPs — so this
+  // theme only recolors elementwise/activation ops whose formula is just |O|.
+  "api_version": 1,
+  "name": "color-theme",
+  "author": "NetVis examples",
+  "ops": [
+    { "name": "Relu",    "category": "Activation", "color": "#FF6B6B", "override": true, "flops": "O" },
+    { "name": "Gelu",    "category": "Activation", "color": "#FFA94D", "override": true, "flops": "O" },
+    { "name": "Sigmoid", "category": "Activation", "color": "#FFD43B", "override": true, "flops": "O" },
+    { "name": "Add",     "category": "Elementwise","color": "#69DB7C", "override": true, "flops": "O" },
+    { "name": "Mul",     "category": "Elementwise","color": "#4DABF7", "override": true, "flops": "O" }
+  ]
+}
