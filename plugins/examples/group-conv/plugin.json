@@ -1,0 +1,32 @@
+{
+  // group-conv — a grouped/depthwise convolution, showing prod() over a shape slice
+  // and the standard Conv FLOP formula.
+  //
+  // Conv MACs = |output| * (Cin / groups) * prod(kernel spatial dims). The weight
+  // (in1) is [Cout, Cin/groups, kH, kW, ...], so:
+  //   - Cin/groups   = in1.shape[1]                (already per-group in the weight)
+  //   - kernel prod  = prod(in1.shape[2 : rank])   (all spatial dims after [Cout,Cin/g])
+  // flops = 2 * |O| * (Cin/groups) * kernel_prod.
+  "api_version": 1,
+  "name": "group-conv",
+  "author": "NetVis examples",
+  "ops": [
+    {
+      "name": "GroupedConv",
+      "domain": "com.example",
+      "category": "Conv",
+      "vars": {
+        "cin_per_group": "in1.shape[1]",
+        // prod over the weight's spatial dims: from index 2 to the end. `-1`... no:
+        // the slice upper bound is the rank, so use in1.rank.
+        "kernel": "prod(in1.shape[2 : in1.rank])"
+      },
+      "flops": "2 * O * cin_per_group * kernel"
+      // NO shape rule: the output's spatial dims depend on stride/pad/dilation math
+      // the integer DSL can't express, and a shape must be all-or-nothing correct —
+      // asserting only [N, Cout] would fabricate a wrong-rank 2-D shape. So we leave
+      // shape to the exporter / built-in inference (honest). FLOPs above only need O,
+      // which comes from the already-resolved output shape.
+    }
+  ]
+}

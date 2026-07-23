@@ -1,0 +1,28 @@
+{
+  // linear-layer — the simplest useful op plugin: a fully-connected layer under a
+  // CUSTOM op name the built-ins don't know. Shows the canonical MatMul-family cost.
+  // (NetVis already knows "Linear"/"Gemm"/"MatMul"; we use "FullyConnected" +
+  // com.example so no "override" is needed — this demonstrates ADDING coverage for
+  // an op the built-ins don't recognize, which is the common case.)
+  //
+  // Y = X @ W (+ b): output element count O times the shared/contract dimension K,
+  // times 2 for the multiply-accumulate. K is the last dim of the input activation
+  // (in0), which also equals the weight's in-features.
+  "api_version": 1,
+  "name": "linear-layer",
+  "author": "NetVis examples",
+  "ops": [
+    {
+      "name": "FullyConnected",      // a custom fused FC op the built-ins don't cost
+      "domain": "com.example",
+      "category": "MatMul",          // colors like MatMul + uses the MatMul palette
+      "vars": {
+        "K": "in0.shape[-1]"         // contraction dim = input's last dim
+      },
+      "flops": "2 * O * K",          // 2 * |output| * K  (MAC = 2 FLOPs)
+      // Output keeps the input's leading dims, last dim becomes the weight's out-
+      // features (weight in1 = [in_features, out_features]).
+      "shape": { "out0": ["in0.shape[0]", "in1.shape[-1]"] }
+    }
+  ]
+}

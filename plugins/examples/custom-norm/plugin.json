@@ -1,0 +1,37 @@
+{
+  // custom-norm — a CUSTOM normalization op the built-ins don't know, showing the
+  // honest-unknown guard and a string-attribute branch. (NetVis already costs the
+  // standard RMSNorm/LayerNorm; these names are deliberately novel — "com.example.*"
+  // contrib ops — so no "override" is needed, demonstrating how to ADD coverage.)
+  //
+  // Cost is a small constant multiple of the element count; we model ~4 FLOPs/elem
+  // (square, mean, rsqrt, scale) — a documented estimate, like the built-in Norm
+  // formula. The example's point is the DSL patterns, not the exact constant.
+  "api_version": 1,
+  "name": "custom-norm",
+  "author": "NetVis examples",
+  "ops": [
+    {
+      "name": "FusedRMSNorm",         // a custom op the built-ins don't recognize
+      "domain": "com.example",
+      "category": "Norm",
+      "vars": {
+        "elems": "O",
+        // Guard: if the output shape is unresolved, O is unknown and this whole
+        // expression stays unknown (contagious) — so no fabricated number.
+        "ok": "O > 0"
+      },
+      // ternary + the `unknown` literal: when O didn't resolve, report honest-unknown
+      // instead of a bogus 0.
+      "flops": "ok ? 4 * elems : unknown"
+    },
+    {
+      // A string-attribute branch: some exporters tag a reduction mode; a "simple"
+      // variant is cheaper.
+      "name": "FusedRMSNormV2",
+      "domain": "com.example",
+      "category": "Norm",
+      "flops": "sattr(\"mode\") == \"simple\" ? 2 * O : 4 * O"
+    }
+  ]
+}
