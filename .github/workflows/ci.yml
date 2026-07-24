@@ -113,3 +113,11 @@ jobs:
           name: NetVis ${{ needs.version.outputs.version }}
           generate_release_notes: true
           files: dist/*
+          # Force a FULL, latest release. Without these, if a release object for
+          # this tag already exists as a draft/pre-release (e.g. a prior
+          # release-override validation run reused the version number), the action
+          # UPDATES it without clearing the flag — so the tag release wrongly stays
+          # pre-release. Explicit flags make the tag publish authoritative.
+          prerelease: false
+          draft: false
+          make_latest: true
