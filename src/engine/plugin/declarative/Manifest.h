@@ -8,8 +8,12 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include "engine/plugin/PluginPrefs.h"   // PluginKind
 
 namespace netvis::plugin {
 
@@ -29,7 +33,19 @@ struct LoadedManifest {
   bool ok = false;            // false => whole file rejected (api mismatch/parse)
   std::string error;
   std::vector<LoadedOp> ops;
+  // v0.7.0 (#11, Increment C): discovery/trust metadata for the Plugins panel.
+  std::string id;             // discovery subdir name — the STABLE enable-key
+  PluginKind kind = PluginKind::Declarative;   // Declarative | Wasm (trust tier)
+  bool enabled = true;        // effective enable state (gate result this session)
+  bool registered = false;    // did it actually reach the Registry?
 };
+
+// Gate consulted ONCE per discovered plugin (#11 §0.4): given the stable id + kind,
+// return whether it should be REGISTERED. A disabled plugin is still discovered (its
+// diagnostics populate the panel) but never reaches the Registry — so a disabled
+// WASM parser's can_parse (which executes code) never runs. Passed by const& (no
+// per-node std::function copy).
+using PluginGate = std::function<bool(std::string_view id, PluginKind kind)>;
 
 // Parse + compile + REGISTER every op in a manifest file into the global Registry.
 // Returns a diagnostic record (never throws). If `register_into` is false, only
@@ -41,10 +57,19 @@ LoadedManifest load_manifest_file(const std::string& path, bool register_into);
 std::string plugin_dir();
 
 // Discover + load every `<plugin_dir>/*/plugin.json`, deterministic path order.
-// Returns one LoadedManifest per file. Declarative plugins load freely (safe by
-// construction); enable/disable filtering (#11) is applied by the caller. The
-// results are also cached process-wide for the Plugins panel (loaded_manifests()).
+// Returns one LoadedManifest per file, and caches them for the panel. The gate
+// decides per-plugin registration (§0.4): a plugin failing the gate is discovered
+// (diagnostics filled) but NOT registered — structurally absent from the Registry.
+// A .wasm sidecar (op or parser plugin) is discovered here too; it is registered
+// only when the gate allows AND the WASM engine is enabled.
+//
+// Overloads: the no-arg form registers everything (legacy/back-compat); the gated
+// form applies the trust gate; the (gate, root) form also overrides the discovery
+// root (testable without touching the user config dir).
 std::vector<LoadedManifest> discover_and_load_plugins();
+std::vector<LoadedManifest> discover_and_load_plugins(const PluginGate& gate);
+std::vector<LoadedManifest> discover_and_load_plugins(const PluginGate& gate,
+                                                      const std::string& root);
 
 // The manifests loaded by the most recent discover_and_load_plugins() call — the
 // Plugins panel (#11) reads this to list plugins, their ops, overrides, and any

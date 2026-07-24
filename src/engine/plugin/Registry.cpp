@@ -353,12 +353,54 @@ void Registry::register_pass(std::unique_ptr<PassPlugin> p) {
   mut.pass_storage.push_back(std::move(p));
 }
 
+std::optional<Result<ir::Model>> Registry::try_unknown_parsers(
+    const MappedFile& file, const std::string& ext_hint, ProgressSink& progress) const {
+  auto tbl = snapshot();
+  for (const ParserPlugin* p : tbl->parsers) {   // already priority-sorted
+    if (p->can_parse(file, ext_hint))
+      return p->parse(file, progress);           // first claimer wins
+  }
+  return std::nullopt;                            // none claimed -> caller errors
+}
+
+void Registry::reset_to_builtins() {
+  {
+    std::lock_guard<std::mutex> lk(table_mutex_);
+    table_ = make_default_table();                // drop all user plugins
+  }
+  std::lock_guard<std::mutex> ck(wasm_cat_mutex_);
+  wasm_cat_.clear();                              // stale after the table changed
+}
+
+void Registry::warm_wasm_category(std::string_view op_norm, OpCategory cat) {
+  std::lock_guard<std::mutex> ck(wasm_cat_mutex_);
+  wasm_cat_[std::string(op_norm)] = cat;
+}
+
+std::optional<OpCategory> Registry::cached_wasm_category(std::string_view op_norm) const {
+  std::lock_guard<std::mutex> ck(wasm_cat_mutex_);
+  auto it = wasm_cat_.find(std::string(op_norm));
+  if (it == wasm_cat_.end()) return std::nullopt;
+  return it->second;
+}
+
 OpCategory resolve_category(const ir::Model& model, const ir::Graph& g,
                             const ir::Node& node) {
   Registry& reg = Registry::instance();
-  OpResolution r = reg.resolve_op(normalize_op_key(model.str(node.op_type)));
+  std::string_view raw = model.str(node.op_type);
+  std::string key = normalize_op_key(raw);
+  OpResolution r = reg.resolve_op(key);
+  // §A.1: a WASM handler's category() enters the sandbox. This function is called
+  // per visible node per frame on the RENDER thread, so for Origin::Wasm we NEVER
+  // enter the sandbox here — return the scalar the worker cost/shape pass warmed
+  // (warm_wasm_category). Before the first pass warms an op-type, fall back to the
+  // deterministic default category (categorize_op) — honest, never a stale sandbox.
+  if (r.origin == Origin::Wasm) {
+    if (auto cached = reg.cached_wasm_category(key)) return *cached;
+    return categorize_op(raw);
+  }
   OpContext ctx = reg.make_context(model, g, node, {});
-  return r.handler ? r.handler->category(ctx) : categorize_op(model.str(node.op_type));
+  return r.handler ? r.handler->category(ctx) : categorize_op(raw);
 }
 
 Format Registry::detect_format(const MappedFile& file, const std::string& ext_hint) const {

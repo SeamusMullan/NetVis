@@ -17,6 +17,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -202,4 +203,51 @@ TEST_CASE("registry: resolve_category == categorize_op with no plugins") {
     OpCategory via_direct = categorize_op(op);
     CHECK(via_registry == via_direct);
   }
+}
+
+// v0.7.0 (#10, Increment B): a fake parser proving try_unknown_parsers routing +
+// reset_to_builtins, without needing the WASM backend.
+namespace {
+class FakeParser final : public plugin::ParserPlugin {
+ public:
+  explicit FakeParser(bool claim) : claim_(claim) {}
+  Format format() const override { return Format::Unknown; }
+  std::string_view display_name() const override { return "fake"; }
+  int priority() const override { return 10000; }
+  uint32_t api_version() const override { return plugin::kParserPluginAbiVersion; }
+  bool can_parse(const MappedFile&, const std::string& ext_hint) const override {
+    return claim_ && ext_hint == "fake";
+  }
+  Result<ir::Model> parse(const MappedFile&, ProgressSink&) const override {
+    ir::Model m; m.format_name = m.intern("FAKE"); m.has_graph = false;
+    return m;
+  }
+ private:
+  bool claim_;
+};
+}  // namespace
+
+TEST_CASE("registry: try_unknown_parsers routes to a claiming parser, then reset") {
+  plugin::Registry& reg = plugin::Registry::instance();
+  reg.reset_to_builtins();  // clean slate
+
+  MappedFile empty;  // an empty mapping; the fake parser ignores content
+  ProgressSink prog;
+
+  // No parser registered -> nullopt (caller reports unrecognized format).
+  CHECK_FALSE(reg.try_unknown_parsers(empty, "fake", prog).has_value());
+
+  // Register a claiming parser -> it wins for ext "fake".
+  reg.register_parser(std::make_unique<FakeParser>(true));
+  auto r = reg.try_unknown_parsers(empty, "fake", prog);
+  REQUIRE(r.has_value());
+  REQUIRE(r->operator bool());        // parsed ok
+  CHECK((*r)->str((*r)->format_name) == "FAKE");
+
+  // A different ext is not claimed -> nullopt.
+  CHECK_FALSE(reg.try_unknown_parsers(empty, "onnx", prog).has_value());
+
+  // reset_to_builtins drops it -> nullopt again.
+  reg.reset_to_builtins();
+  CHECK_FALSE(reg.try_unknown_parsers(empty, "fake", prog).has_value());
 }

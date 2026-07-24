@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "imgui.h"
@@ -20,6 +21,7 @@
 #include "engine/DiffLoader.h"
 #include "engine/HeatmapGradient.h"
 #include "engine/ModelSession.h"
+#include "engine/plugin/PluginPrefs.h"   // #11: PluginEnableSet, PluginKind
 #include "engine/OpCategory.h"
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
@@ -212,6 +214,17 @@ class App {
   // Best-effort; failure is silent (a missing prefs file just uses defaults).
   void save_prefs();
 
+  // v0.7.0 (#11): per-plugin enable state (persisted in view_prefs "plugins").
+  plugin::PluginEnableSet& plugin_enabled() { return plugin_enabled_; }
+  // The trust gate consulted per discovered plugin (#11 §0.4).
+  bool plugin_gate(std::string_view id, plugin::PluginKind kind) const {
+    return plugin_enabled_.effective(id, kind);
+  }
+  // Reset the Registry to built-ins then re-discover under the current gate (§0.4).
+  // Bumps the session generation so an in-flight cost/shape job over the transient
+  // table is superseded (its result never published). Called at startup + on toggle.
+  void reload_plugins();
+
  private:
   GLFWwindow* window_ = nullptr;
   std::unique_ptr<JobSystem> jobs_;
@@ -225,6 +238,7 @@ class App {
   Fonts fonts_;
   std::vector<Toast> toasts_;
   std::vector<std::string> recent_;
+  plugin::PluginEnableSet plugin_enabled_;   // #11: persisted per-plugin enable state
 
   void frame();                 // one UI frame
   void apply_theme(bool dark);

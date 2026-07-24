@@ -314,7 +314,10 @@ if(NETVIS_BUILD_TESTS)
   if(NETVIS_TEST_SRC)
     add_executable(netvis_tests ${NETVIS_TEST_SRC})
     target_link_libraries(netvis_tests PRIVATE netvis_core doctest::doctest)
-    target_include_directories(netvis_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    # ${CMAKE_SOURCE_DIR} on the path so test_sdk_abi.cpp can include the shipped
+    # plugins/sdk/netvis_plugin.h (the SDK<->C++ drift guard, #10 Increment D).
+    target_include_directories(netvis_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
 
     # Generate the tiny fixture models at build time (Python 3 stdlib only, no
     # pip) so `ctest` always has them, and run tests from the source root so the
