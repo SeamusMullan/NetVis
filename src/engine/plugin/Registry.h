@@ -14,6 +14,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -95,6 +96,19 @@ class Registry {
                            std::string plugin_name);
   void register_parser(std::unique_ptr<ParserPlugin>);
   void register_pass(std::unique_ptr<PassPlugin>);
+
+  // v0.7.0 (#10, Increment B): last-resort parse hook for a file NO built-in
+  // format claimed. Iterates the registered parsers (already priority-sorted); the
+  // first whose can_parse() accepts parses it. Returns nullopt if none claim it, so
+  // the caller reports the normal "unrecognized format" error. A built-in format
+  // short-circuits BEFORE this in Detect.cpp, so a plugin never hijacks a known one.
+  std::optional<Result<ir::Model>> try_unknown_parsers(
+      const MappedFile& file, const std::string& ext_hint, ProgressSink& progress) const;
+
+  // v0.7.0 (#11, Increment C): drop all user plugins, back to built-ins only. Used
+  // by App::reload_plugins() before re-discovering under the current enable gate, so
+  // a disabled plugin becomes structurally absent (table-membership gate, §0.4).
+  void reset_to_builtins();
 
   void reload(std::shared_ptr<const RegistryTable> next);   // guarded swap
 

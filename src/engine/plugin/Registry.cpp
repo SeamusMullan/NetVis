@@ -353,6 +353,21 @@ void Registry::register_pass(std::unique_ptr<PassPlugin> p) {
   mut.pass_storage.push_back(std::move(p));
 }
 
+std::optional<Result<ir::Model>> Registry::try_unknown_parsers(
+    const MappedFile& file, const std::string& ext_hint, ProgressSink& progress) const {
+  auto tbl = snapshot();
+  for (const ParserPlugin* p : tbl->parsers) {   // already priority-sorted
+    if (p->can_parse(file, ext_hint))
+      return p->parse(file, progress);           // first claimer wins
+  }
+  return std::nullopt;                            // none claimed -> caller errors
+}
+
+void Registry::reset_to_builtins() {
+  std::lock_guard<std::mutex> lk(table_mutex_);
+  table_ = make_default_table();                  // drop all user plugins
+}
+
 OpCategory resolve_category(const ir::Model& model, const ir::Graph& g,
                             const ir::Node& node) {
   Registry& reg = Registry::instance();

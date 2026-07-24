@@ -9,8 +9,10 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "core/ByteReader.h"
+#include "engine/plugin/Registry.h"   // v0.7.0 #10: WASM parser fallback (Unknown branch)
 
 namespace netvis {
 
@@ -322,6 +324,12 @@ Result<ir::Model> parse_model(const MappedFile& file, const std::string& ext_hin
     case Format::Keras:         return keras::parse(file, progress);
     case Format::CoreML:        return coreml::parse(file, progress);
     case Format::Unknown:
+      // v0.7.0 (#10): a file no built-in format claimed may still be handled by an
+      // enabled WASM parser plugin (structurally absent when disabled, §0.4). Only
+      // reached AFTER every built-in sniff failed, so a plugin never hijacks a known
+      // format.
+      if (auto r = plugin::Registry::instance().try_unknown_parsers(file, ext_hint, progress))
+        return std::move(*r);
       return err("unrecognized model file format", UINT64_MAX);
   }
   return err("unrecognized model file format", UINT64_MAX);
