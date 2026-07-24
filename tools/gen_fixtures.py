@@ -1333,6 +1333,21 @@ def _uleb(n):
     return bytes(out)
 
 
+def _sleb(n):
+    """Signed LEB128 — the encoding wasm i32.const/i64.const operands use."""
+    out = bytearray()
+    more = True
+    while more:
+        b = n & 0x7F
+        n >>= 7  # arithmetic shift (Python ints are arbitrary precision, sign-preserving)
+        if (n == 0 and not (b & 0x40)) or (n == -1 and (b & 0x40)):
+            more = False
+        else:
+            b |= 0x80
+        out.append(b)
+    return bytes(out)
+
+
 def _wasm_section(sid, body):
     return bytes([sid]) + _uleb(len(body)) + body
 
@@ -1359,6 +1374,133 @@ def build_wasm_const():
     body = _uleb(0) + b"\x41" + _uleb(42) + b"\x0b"
     code = _uleb(1) + _uleb(len(body)) + body
     return _wasm_module(types, funcs, exports, code)
+
+
+def build_wasm_ophandler(hostile=False):
+    """An OP-HANDLER plugin (#10, Increment A). Exports:
+      netvis_op_abi_version : ()->i32   (returns 1)
+      netvis_op_category    : ()->i32   (calls op_set_category(Conv=0), returns 0)
+      netvis_op_flops       : ()->i32   (calls op_set_flops(1024, 1), returns 0)
+    Imports from module "netvis_op": op_set_category:(i32)->() , op_set_flops:(i64,i32)->().
+    hostile=True makes netvis_op_category call op_set_category(9999) to exercise the
+    host-side clamp (must become OpCategory::Other, never OOB)."""
+    CONV = 0
+    CAT = 9999 if hostile else CONV
+    # Type section:
+    #  t0: (i32)->()       op_set_category
+    #  t1: (i64,i32)->()   op_set_flops
+    #  t2: ()->i32         the three exports
+    t0 = b"\x60" + _uleb(1) + b"\x7f" + _uleb(0)
+    t1 = b"\x60" + _uleb(2) + b"\x7e\x7f" + _uleb(0)     # i64=0x7e, i32=0x7f
+    t2 = b"\x60" + _uleb(0) + _uleb(1) + b"\x7f"
+    types = _uleb(3) + t0 + t1 + t2
+
+    def nm(s):
+        b = s.encode(); return _uleb(len(b)) + b
+
+    # Imports: op_set_category (func type 0), op_set_flops (func type 1).
+    imp = _uleb(2)
+    imp += nm("netvis_op") + nm("op_set_category") + b"\x00" + _uleb(0)  # func idx 0
+    imp += nm("netvis_op") + nm("op_set_flops") + b"\x00" + _uleb(1)     # func idx 1
+    # Functions: three local funcs, all type 2 () -> i32.
+    funcs = _uleb(3) + _uleb(2) + _uleb(2) + _uleb(2)
+    # Exports: the three entry points (func indices 2,3,4 after 2 imported).
+    exp = _uleb(3)
+    exp += nm("netvis_op_abi_version") + b"\x00" + _uleb(2)
+    exp += nm("netvis_op_category") + b"\x00" + _uleb(3)
+    exp += nm("netvis_op_flops") + b"\x00" + _uleb(4)
+
+    # func 2 abi_version: i32.const 1 ; end
+    b_abi = _uleb(0) + b"\x41" + _uleb(1) + b"\x0b"
+    # func 3 category: i32.const CAT ; call 0 (op_set_category) ; i32.const 0 ; end
+    b_cat = _uleb(0) + b"\x41" + _sleb(CAT) + b"\x10" + _uleb(0) + b"\x41\x00" + b"\x0b"
+    # func 4 flops: i64.const 1024 ; i32.const 1 ; call 1 (op_set_flops) ; i32.const 0 ; end
+    b_flp = _uleb(0) + b"\x42" + _sleb(1024) + b"\x41\x01" + b"\x10" + _uleb(1) + b"\x41\x00" + b"\x0b"
+    code = _uleb(3)
+    for body in (b_abi, b_cat, b_flp):
+        code += _uleb(len(body)) + body
+    # Sections in canonical id order: type(1) import(2) func(3) export(7) code(10).
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(2, imp)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(7, exp)
+    out += _wasm_section(10, code)
+    return bytes(out)
+
+
+def build_wasm_toyparser():
+    """A PARSER plugin (#10, Increment B). Exports:
+      netvis_parser_abi_version : ()->i32  (returns 1)
+      netvis_can_parse          : ()->i32  (returns 1 — claims the file)
+      netvis_parse              : ()->i32  (records one tensor + one node, returns 0)
+    Imports the "netvis" parser API it uses: host_intern_range:(i64,i32)->i32,
+    host_begin_graph:(i32)->i32, host_add_node:(i32,i32,i32,i32,i32,i32,i32)->i32,
+    host_record_tensor:(i32,i32,i64,i64,i32,i32,i32)->i32, host_set_model_info:(i32,i32,i32)->().
+    Uses no linear memory reads for structure (interns are host-side); a minimal
+    exercise of the append-only command path + zero-payload witness."""
+    # Type section
+    #  t0 (I i)->i    host_intern_range(i64,i32)->i32
+    #  t1 (i)->i      host_begin_graph(i32)->i32
+    #  t2 (iiiiiii)->i host_add_node
+    #  t3 (iiIIiii)->i host_record_tensor
+    #  t4 (iii)->()   host_set_model_info
+    #  t5 ()->i       exports
+    i, I = b"\x7f", b"\x7e"
+    def ftype(params, results):
+        return b"\x60" + _uleb(len(params)) + b"".join(params) + _uleb(len(results)) + b"".join(results)
+    t0 = ftype([I, i], [i])
+    t1 = ftype([i], [i])
+    t2 = ftype([i, i, i, i, i, i, i], [i])
+    t3 = ftype([i, i, I, I, i, i, i], [i])
+    t4 = ftype([i, i, i], [])
+    t5 = ftype([], [i])
+    types = _uleb(6) + t0 + t1 + t2 + t3 + t4 + t5
+
+    def nm(s):
+        b = s.encode(); return _uleb(len(b)) + b
+
+    imp = _uleb(5)
+    imp += nm("netvis") + nm("host_intern_range") + b"\x00" + _uleb(0)   # func 0
+    imp += nm("netvis") + nm("host_begin_graph") + b"\x00" + _uleb(1)    # func 1
+    imp += nm("netvis") + nm("host_add_node") + b"\x00" + _uleb(2)       # func 2
+    imp += nm("netvis") + nm("host_record_tensor") + b"\x00" + _uleb(3)  # func 3
+    imp += nm("netvis") + nm("host_set_model_info") + b"\x00" + _uleb(4) # func 4
+    # three local funcs, all type 5 () -> i32 (indices 5,6,7).
+    funcs = _uleb(3) + _uleb(5) + _uleb(5) + _uleb(5)
+    exp = _uleb(3)
+    exp += nm("netvis_parser_abi_version") + b"\x00" + _uleb(5)
+    exp += nm("netvis_can_parse") + b"\x00" + _uleb(6)
+    exp += nm("netvis_parse") + b"\x00" + _uleb(7)
+
+    # func 5 abi_version: i32.const 1 ; end
+    b_abi = _uleb(0) + b"\x41\x01\x0b"
+    # func 6 can_parse: i32.const 1 ; end (always claims)
+    b_can = _uleb(0) + b"\x41\x01\x0b"
+    # func 7 parse:
+    #   g = host_begin_graph(0)               ; drop
+    #   host_record_tensor(0,0, 0, 0, 15/*Unknown*/, 0, 0)  ; drop
+    #   host_set_model_info(0,0,0)
+    #   return 0
+    # (name_id 0 = empty StringId; offsets 0/len 0 -> a zero-length in-bounds tensor)
+    b_par = _uleb(0)
+    b_par += b"\x41\x00" + b"\x10" + _uleb(1) + b"\x1a"          # begin_graph(0); drop
+    # record_tensor(g=0,name=0,off=0(i64),len=0(i64),dtype=15,dims=0,rank=0)
+    b_par += b"\x41\x00" + b"\x41\x00" + b"\x42\x00" + b"\x42\x00" + b"\x41" + _sleb(15) + b"\x41\x00" + b"\x41\x00"
+    b_par += b"\x10" + _uleb(3) + b"\x1a"                        # call record_tensor; drop
+    b_par += b"\x41\x00\x41\x00\x41\x00" + b"\x10" + _uleb(4)    # set_model_info(0,0,0)
+    b_par += b"\x41\x00\x0b"                                     # return 0 ; end
+    code = _uleb(3)
+    for body in (b_abi, b_can, b_par):
+        code += _uleb(len(body)) + body
+
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(2, imp)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(7, exp)
+    out += _wasm_section(10, code)
+    return bytes(out)
 
 
 def build_wasm_pass():
@@ -1573,6 +1715,10 @@ def main():
     write("plugin_badsig.wasm", build_wasm_badsig())
     write("plugin_bigmem.wasm", build_wasm_bigmem())
     write("plugin_pass.wasm", build_wasm_pass())
+    # WASM op-handler + parser adapter fixtures (#10, Increments A/B).
+    write("plugin_ophandler.wasm", build_wasm_ophandler(hostile=False))
+    write("plugin_ophandler_hostile.wasm", build_wasm_ophandler(hostile=True))
+    write("plugin_toyparser.wasm", build_wasm_toyparser())
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):
