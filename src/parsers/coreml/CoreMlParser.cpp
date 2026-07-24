@@ -44,6 +44,10 @@ using onnx::WireType;
 constexpr uint32_t kMaxLayers = 5'000'000;      // bounded layer count
 constexpr int kMaxWeightDepth = 16;             // nested layer-body recursion cap
 constexpr uint32_t kMaxWeightsPerLayer = 256;   // bounded weights per layer
+// mlProgram (MIL) bounds — separate walk, same hostile-input discipline (#85).
+constexpr uint32_t kMaxMilOps = 5'000'000;      // bounded op count per block
+constexpr int kMaxMilBlockDepth = 32;           // nested Block recursion cap
+constexpr uint32_t kMaxMilIO = 100'000;         // bounded inputs/outputs per op
 
 // --- CoreML field numbers (verified against apple/coremltools
 // mlmodel/format/{Model,NeuralNetwork}.proto) ---------------------------------
@@ -57,6 +61,7 @@ enum ModelField : uint32_t {
   MF_NEURAL_NETWORK = 500,
   MF_NN_CLASSIFIER = 403,
   MF_NN_REGRESSOR = 303,
+  MF_ML_PROGRAM = 502,  // mlProgram (MILSpec.Program) — the modern path (#85)
 };
 
 // NeuralNetwork(/Classifier/Regressor): repeated NeuralNetworkLayer at field 1.
@@ -426,6 +431,547 @@ Result<bool> parse_neural_network(const SubRange& sr, ir::Model& model,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// mlProgram (MILSpec) structural path (#85)
+// ---------------------------------------------------------------------------
+// MIL wire (field numbers verified against apple/coremltools MIL.proto):
+//   Program{version=1, functions=2 map<string,Function>}
+//   Function{inputs=1 NVT*, opset=2 string, block_specializations=3 map<string,Block>}
+//   Block{inputs=1 NVT*, outputs=2 string*, operations=3 Operation*}
+//   Operation{type=1 string, inputs=2 map<string,Argument>, outputs=3 NVT*, blocks=4 Block*}
+//   NamedValueType{name=1, type=2 ValueType}
+//   Argument{arguments=1 Binding*}; Binding{ name=1 string | value=2 Value }
+//   Value{type=2 ValueType, immediateValue=3, blobFileValue=5}   (field 4 skipped)
+//   Value.BlobFileValue{fileName=1 string, offset=2 uint64}
+//   ValueType{tensorType=1 TensorType}
+//   TensorType{dataType=1 enum, rank=2, dimensions=3 Dimension*}
+//   Dimension{constant=1 ConstantDimension{size=1 uint64} | unknown=2}
+//   proto3 map<string,V> on the wire = repeated entry{key=1 string, value=2 V}
+// The weight payload lives in an external weight.bin; blobFileValue.offset points
+// at a MIL blob_metadata header (TensorStats follows it). We record offset+len
+// only — NO blob byte is read here (zero-payload thesis holds).
+
+constexpr uint32_t kMaxMilRank = 64;  // bounded tensor rank
+
+// MIL proto DataType enum -> ir::DType (+ human label for exotic/unmapped types
+// that ir::DType cannot represent; the enum is frozen at 16). Distinct from the
+// blob-file BlobDataType enum used inside weight.bin.
+ir::DType map_mil_dtype(uint64_t dt, const char** label) {
+  *label = nullptr;
+  switch (dt) {
+    case 1:  return ir::DType::Bool;
+    case 10: return ir::DType::F16;
+    case 11: return ir::DType::F32;
+    case 12: return ir::DType::F64;
+    case 13: return ir::DType::BF16;
+    case 21: return ir::DType::I8;
+    case 22: return ir::DType::I16;
+    case 23: return ir::DType::I32;
+    case 24: return ir::DType::I64;
+    case 31: return ir::DType::U8;
+    case 32: return ir::DType::U16;
+    case 33: return ir::DType::U32;
+    case 34: return ir::DType::U64;
+    // Exotic / sub-byte / fp8 -> honest Unknown + a human label for the inspector.
+    case 2:  *label = "string";  return ir::DType::Unknown;
+    case 25: *label = "int4";    return ir::DType::Unknown;
+    case 35: *label = "uint4";   return ir::DType::Unknown;
+    case 36: *label = "uint2";   return ir::DType::Unknown;
+    case 37: *label = "uint1";   return ir::DType::Unknown;
+    case 38: *label = "uint6";   return ir::DType::Unknown;
+    case 39: *label = "uint3";   return ir::DType::Unknown;
+    case 40: *label = "fp8e4m3"; return ir::DType::Unknown;
+    case 41: *label = "fp8e5m2"; return ir::DType::Unknown;
+    default: return ir::DType::Unknown;
+  }
+}
+
+// Parsed MIL ValueType (tensorType only; list/tuple/dict -> has_type stays true
+// but shape empty / dtype Unknown, which is honest).
+struct MilType {
+  ir::DType dtype = ir::DType::Unknown;
+  const char* dtype_label = nullptr;
+  SmallVec<int64_t, 6> shape;
+  bool has_type = false;
+};
+
+// Parse a ValueType sub-message: tensorType(1) -> TensorType{dataType, dimensions}.
+Result<MilType> parse_mil_value_type(const SubRange& sr) {
+  MilType out;
+  WireReader r = WireReader::sub(sr);
+  while (!r.at_end()) {
+    auto h = r.read_tag();
+    if (!h) return h.error();
+    if (h->field_number == 1 && h->wire_type == WireType::LenDelim) {  // tensorType
+      auto tt = r.read_len_delim();
+      if (!tt) return tt.error();
+      out.has_type = true;
+      WireReader tr = WireReader::sub(*tt);
+      while (!tr.at_end()) {
+        auto th = tr.read_tag();
+        if (!th) return th.error();
+        if (th->field_number == 1 && th->wire_type == WireType::Varint) {  // dataType
+          auto v = tr.read_varint();
+          if (!v) return v.error();
+          out.dtype = map_mil_dtype(*v, &out.dtype_label);
+        } else if (th->field_number == 3 && th->wire_type == WireType::LenDelim) {  // Dimension
+          auto dsr = tr.read_len_delim();
+          if (!dsr) return dsr.error();
+          int64_t dim = -1;  // unknown/symbolic dim -> dynamic
+          WireReader dr = WireReader::sub(*dsr);
+          while (!dr.at_end()) {
+            auto dh = dr.read_tag();
+            if (!dh) return dh.error();
+            if (dh->field_number == 1 && dh->wire_type == WireType::LenDelim) {  // constant
+              auto cd = dr.read_len_delim();
+              if (!cd) return cd.error();
+              WireReader cr = WireReader::sub(*cd);
+              while (!cr.at_end()) {
+                auto ch = cr.read_tag();
+                if (!ch) return ch.error();
+                if (ch->field_number == 1 && ch->wire_type == WireType::Varint) {  // size
+                  auto sz = cr.read_varint();
+                  if (!sz) return sz.error();
+                  dim = static_cast<int64_t>(*sz);
+                } else {
+                  auto sk = cr.skip_field(ch->wire_type);
+                  if (!sk) return sk.error();
+                }
+              }
+            } else {
+              auto sk = dr.skip_field(dh->wire_type);
+              if (!sk) return sk.error();
+            }
+          }
+          if (out.shape.size() < kMaxMilRank) out.shape.push_back(dim);
+        } else {
+          auto sk = tr.skip_field(th->wire_type);
+          if (!sk) return sk.error();
+        }
+      }
+    } else {
+      auto sk = r.skip_field(h->wire_type);
+      if (!sk) return sk.error();
+    }
+  }
+  return out;
+}
+
+// A blobFileValue reference (a weight in the external weight.bin).
+struct MilBlob {
+  bool found = false;
+  std::string file_name;
+  uint64_t offset = 0;
+};
+
+// Parse a Value sub-message: type(2) + blobFileValue(5). immediateValue(3) is
+// ignored (inline constants are not weights we record).
+Result<bool> parse_mil_value(const SubRange& sr, MilType* type_out, MilBlob* blob_out) {
+  WireReader r = WireReader::sub(sr);
+  while (!r.at_end()) {
+    auto h = r.read_tag();
+    if (!h) return h.error();
+    if (h->field_number == 2 && h->wire_type == WireType::LenDelim) {  // type
+      auto vt = r.read_len_delim();
+      if (!vt) return vt.error();
+      auto t = parse_mil_value_type(*vt);
+      if (!t) return t.error();
+      *type_out = *t;
+    } else if (h->field_number == 5 && h->wire_type == WireType::LenDelim) {  // blobFileValue
+      auto bfv = r.read_len_delim();
+      if (!bfv) return bfv.error();
+      WireReader br = WireReader::sub(*bfv);
+      while (!br.at_end()) {
+        auto bh = br.read_tag();
+        if (!bh) return bh.error();
+        if (bh->field_number == 1 && bh->wire_type == WireType::LenDelim) {  // fileName
+          auto s = br.read_string();
+          if (!s) return s.error();
+          blob_out->file_name = *s;
+        } else if (bh->field_number == 2 && bh->wire_type == WireType::Varint) {  // offset
+          auto o = br.read_varint();
+          if (!o) return o.error();
+          blob_out->offset = *o;
+        } else {
+          auto sk = br.skip_field(bh->wire_type);
+          if (!sk) return sk.error();
+        }
+      }
+    } else {
+      auto sk = r.skip_field(h->wire_type);
+      if (!sk) return sk.error();
+    }
+  }
+  blob_out->found = !blob_out->file_name.empty();
+  return true;
+}
+
+// NamedValueType: name(1) + type(2).
+struct MilNvt {
+  StringId name;
+  MilType type;
+};
+Result<MilNvt> parse_mil_nvt(const SubRange& sr, ir::Model& model) {
+  MilNvt out;
+  WireReader r = WireReader::sub(sr);
+  while (!r.at_end()) {
+    auto h = r.read_tag();
+    if (!h) return h.error();
+    if (h->field_number == 1 && h->wire_type == WireType::LenDelim) {
+      auto s = r.read_string();
+      if (!s) return s.error();
+      out.name = model.intern(*s);
+    } else if (h->field_number == 2 && h->wire_type == WireType::LenDelim) {
+      auto vt = r.read_len_delim();
+      if (!vt) return vt.error();
+      auto t = parse_mil_value_type(*vt);
+      if (!t) return t.error();
+      out.type = *t;
+    } else {
+      auto sk = r.skip_field(h->wire_type);
+      if (!sk) return sk.error();
+    }
+  }
+  return out;
+}
+
+// Apply a resolved MIL type to a ValueInfo (write-if-empty; carry dtype only if
+// currently Unknown so a producer's authoritative shape is never clobbered).
+void apply_mil_type(ir::ValueInfo* v, const MilType& t) {
+  if (!t.has_type) return;
+  if (v->dtype == ir::DType::Unknown) v->dtype = t.dtype;
+  if (v->shape.empty() && !t.shape.empty()) v->shape = t.shape;
+}
+
+// Forward decl for mutual recursion (Operation.blocks -> nested Block).
+Result<int32_t> build_mil_block(const SubRange& block_sr, ir::Model& model, int depth);
+
+// One discovered inline weight (blobFileValue) on an op input.
+struct MilWeight {
+  ir::DType dtype = ir::DType::Unknown;
+  const char* dtype_label = nullptr;
+  SmallVec<int64_t, 6> shape;
+  std::string file_name;
+  uint64_t offset = 0;
+};
+
+// Parse one Operation into an ir::Node appended to g.
+Result<bool> parse_mil_operation(const SubRange& sr, ir::Model& model, ir::Graph& g,
+                                 ValueMap& map, uint32_t op_index, int depth) {
+  std::string op_type;
+  std::vector<StringId> input_names;   // value references from name-bindings
+  std::vector<MilNvt> outputs;
+  std::vector<MilWeight> weights;
+  std::vector<SubRange> nested_blocks;
+
+  WireReader r = WireReader::sub(sr);
+  while (!r.at_end()) {
+    auto h = r.read_tag();
+    if (!h) return h.error();
+    switch (h->field_number) {
+      case 1: {  // type (string)
+        if (h->wire_type == WireType::LenDelim) {
+          auto s = r.read_string();
+          if (!s) return s.error();
+          op_type = *s;
+        } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
+        break;
+      }
+      case 2: {  // inputs: map<string,Argument> entry
+        if (h->wire_type != WireType::LenDelim) {
+          auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); break;
+        }
+        auto entry = r.read_len_delim();
+        if (!entry) return entry.error();
+        WireReader er = WireReader::sub(*entry);
+        while (!er.at_end()) {
+          auto eh = er.read_tag();
+          if (!eh) return eh.error();
+          if (eh->field_number == 2 && eh->wire_type == WireType::LenDelim) {  // Argument
+            auto arg = er.read_len_delim();
+            if (!arg) return arg.error();
+            WireReader ar = WireReader::sub(*arg);
+            while (!ar.at_end()) {
+              auto ah = ar.read_tag();
+              if (!ah) return ah.error();
+              if (ah->field_number == 1 && ah->wire_type == WireType::LenDelim) {  // Binding
+                auto binding = ar.read_len_delim();
+                if (!binding) return binding.error();
+                WireReader brd = WireReader::sub(*binding);
+                while (!brd.at_end()) {
+                  auto bh = brd.read_tag();
+                  if (!bh) return bh.error();
+                  if (bh->field_number == 1 && bh->wire_type == WireType::LenDelim) {  // name ref
+                    auto s = brd.read_string();
+                    if (!s) return s.error();
+                    if (input_names.size() < kMaxMilIO) input_names.push_back(model.intern(*s));
+                  } else if (bh->field_number == 2 && bh->wire_type == WireType::LenDelim) {  // inline Value
+                    auto val = brd.read_len_delim();
+                    if (!val) return val.error();
+                    MilType t; MilBlob blob;
+                    auto ok = parse_mil_value(*val, &t, &blob);
+                    if (!ok) return ok.error();
+                    if (blob.found && weights.size() < kMaxMilIO) {
+                      MilWeight w;
+                      w.dtype = t.dtype; w.dtype_label = t.dtype_label; w.shape = t.shape;
+                      w.file_name = blob.file_name; w.offset = blob.offset;
+                      weights.push_back(std::move(w));
+                    }
+                  } else {
+                    auto sk = brd.skip_field(bh->wire_type); if (!sk) return sk.error();
+                  }
+                }
+              } else {
+                auto sk = ar.skip_field(ah->wire_type); if (!sk) return sk.error();
+              }
+            }
+          } else {
+            auto sk = er.skip_field(eh->wire_type); if (!sk) return sk.error();  // key(1)
+          }
+        }
+        break;
+      }
+      case 3: {  // outputs (repeated NamedValueType)
+        if (h->wire_type == WireType::LenDelim) {
+          auto s = r.read_len_delim();
+          if (!s) return s.error();
+          auto nvt = parse_mil_nvt(*s, model);
+          if (!nvt) return nvt.error();
+          if (outputs.size() < kMaxMilIO) outputs.push_back(std::move(*nvt));
+        } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
+        break;
+      }
+      case 4: {  // blocks (repeated Block) -> nested subgraph
+        if (h->wire_type == WireType::LenDelim) {
+          auto s = r.read_len_delim();
+          if (!s) return s.error();
+          nested_blocks.push_back(*s);
+        } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
+        break;
+      }
+      default: {
+        auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error();
+        break;
+      }
+    }
+  }
+
+  int32_t node_idx = static_cast<int32_t>(g.nodes.size());
+  ir::Node node;
+  node.op_type = model.intern(op_type.empty() ? "MILOp" : op_type);
+  // Identity: MIL ops have no name field; use the first output's SSA name.
+  std::string base;
+  if (!outputs.empty() && outputs[0].name.valid()) {
+    node.name = outputs[0].name;
+    base = std::string(model.str(outputs[0].name));
+  } else {
+    base = "op" + std::to_string(op_index);
+    node.name = model.intern(base);
+  }
+
+  // Inline blobFileValue weights -> external, blob-indirect initializers wired as
+  // synthesized inputs (CostModel attributes them like ONNX initializers).
+  for (uint32_t k = 0; k < weights.size(); ++k) {
+    const MilWeight& w = weights[k];
+    StringId wid = model.intern(base + "_weight_" + std::to_string(k));
+    ir::TensorRef tr;
+    tr.name = wid;
+    tr.dtype = w.dtype;
+    if (w.dtype_label) tr.dtype_label = model.intern(w.dtype_label);
+    tr.shape = w.shape;
+    tr.external_path = model.intern(w.file_name);
+    tr.file_offset = w.offset;   // -> blob_metadata header (TensorStats follows)
+    tr.blob_indirect = true;
+    tr.byte_len = 0;             // unknown until the header is read; never here
+    g.initializers.push_back(std::move(tr));
+    if (input_names.size() < kMaxMilIO) input_names.push_back(wid);
+  }
+
+  // inputs -> edge_refs
+  node.inputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+  for (StringId in : input_names) g.edge_refs.push_back(get_or_create_value(g, map, in));
+  node.inputs.count = static_cast<uint32_t>(input_names.size());
+
+  // outputs -> edge_refs; this node produces each output value.
+  node.outputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+  for (const MilNvt& o : outputs) {
+    uint32_t vi = get_or_create_value(g, map, o.name);
+    g.values[vi].producer = node_idx;
+    apply_mil_type(&g.values[vi], o.type);
+    g.edge_refs.push_back(vi);
+  }
+  node.outputs.count = static_cast<uint32_t>(outputs.size());
+
+  // Nested blocks (cond/while_loop bodies) -> primary subgraph, depth-bounded.
+  int32_t primary_subgraph = -1;
+  for (const SubRange& b : nested_blocks) {
+    auto gi = build_mil_block(b, model, depth + 1);
+    if (!gi) return gi.error();
+    if (primary_subgraph < 0) primary_subgraph = *gi;
+  }
+  node.subgraph = primary_subgraph;
+
+  g.nodes.push_back(std::move(node));
+  return true;
+}
+
+// Build one MIL Block into a graph slot (reserves its index BEFORE recursing so
+// graphs[0] stays main and indices are stable — mirrors OpenVINO build_graph).
+Result<int32_t> build_mil_block(const SubRange& block_sr, ir::Model& model, int depth) {
+  if (depth > kMaxMilBlockDepth)
+    return err("MIL block nesting too deep", block_sr.offset);
+
+  int32_t my_idx = static_cast<int32_t>(model.graphs.size());
+  model.graphs.emplace_back();  // reserve; do not hold a reference across recursion
+
+  ir::Graph g;
+  ValueMap map;
+
+  std::vector<SubRange> op_subs;
+  std::vector<StringId> block_inputs;
+  std::vector<std::string> block_outputs;
+
+  WireReader r = WireReader::sub(block_sr);
+  while (!r.at_end()) {
+    auto h = r.read_tag();
+    if (!h) return h.error();
+    switch (h->field_number) {
+      case 1: {  // inputs (repeated NamedValueType)
+        if (h->wire_type == WireType::LenDelim) {
+          auto s = r.read_len_delim();
+          if (!s) return s.error();
+          auto nvt = parse_mil_nvt(*s, model);
+          if (!nvt) return nvt.error();
+          if (nvt->name.valid()) {
+            uint32_t vi = get_or_create_value(g, map, nvt->name);
+            apply_mil_type(&g.values[vi], nvt->type);
+            block_inputs.push_back(nvt->name);
+          }
+        } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
+        break;
+      }
+      case 2: {  // outputs (repeated string)
+        if (h->wire_type == WireType::LenDelim) {
+          auto s = r.read_string();
+          if (!s) return s.error();
+          block_outputs.push_back(*s);
+        } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
+        break;
+      }
+      case 3: {  // operations (repeated Operation)
+        if (h->wire_type == WireType::LenDelim) {
+          auto s = r.read_len_delim();
+          if (!s) return s.error();
+          if (op_subs.size() < kMaxMilOps) op_subs.push_back(*s);
+        } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
+        break;
+      }
+      default: {
+        auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error();
+        break;
+      }
+    }
+  }
+
+  for (uint32_t i = 0; i < op_subs.size(); ++i) {
+    auto ok = parse_mil_operation(op_subs[i], model, g, map, i, depth);
+    if (!ok) return ok.error();
+  }
+
+  for (StringId n : block_inputs) {
+    auto it = map.find(n.id);
+    if (it != map.end()) g.graph_inputs.push_back(it->second);
+  }
+  for (const std::string& on : block_outputs) {
+    uint32_t vi = get_or_create_value(g, map, model.intern(on));
+    g.graph_outputs.push_back(vi);
+  }
+
+  model.graphs[my_idx] = std::move(g);
+  return my_idx;
+}
+
+// Parse a MILSpec.Program: pick function "main" (else the first), then its first
+// block_specialization, and build graphs[0] from that Block.
+Result<bool> parse_ml_program(const SubRange& sr, ir::Model& model,
+                              ProgressSink& progress) {
+  SubRange main_func, first_func;
+  bool have_main = false, have_first = false;
+
+  WireReader r = WireReader::sub(sr);
+  while (!r.at_end()) {
+    auto h = r.read_tag();
+    if (!h) return h.error();
+    if (h->field_number == 2 && h->wire_type == WireType::LenDelim) {  // functions entry
+      auto entry = r.read_len_delim();
+      if (!entry) return entry.error();
+      std::string key;
+      SubRange fn;
+      bool have_fn = false;
+      WireReader er = WireReader::sub(*entry);
+      while (!er.at_end()) {
+        auto eh = er.read_tag();
+        if (!eh) return eh.error();
+        if (eh->field_number == 1 && eh->wire_type == WireType::LenDelim) {
+          auto s = er.read_string();
+          if (!s) return s.error();
+          key = *s;
+        } else if (eh->field_number == 2 && eh->wire_type == WireType::LenDelim) {
+          auto f = er.read_len_delim();
+          if (!f) return f.error();
+          fn = *f;
+          have_fn = true;
+        } else {
+          auto sk = er.skip_field(eh->wire_type); if (!sk) return sk.error();
+        }
+      }
+      if (have_fn) {
+        if (!have_first) { first_func = fn; have_first = true; }
+        if (key == "main") { main_func = fn; have_main = true; }
+      }
+    } else {
+      auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error();
+    }
+  }
+
+  if (!have_main && !have_first)
+    return err("mlProgram has no functions", sr.offset);
+  const SubRange& func = have_main ? main_func : first_func;
+
+  // Function.block_specializations (field 3, map<string,Block>): take first block.
+  SubRange block;
+  bool have_block = false;
+  WireReader fr = WireReader::sub(func);
+  while (!fr.at_end()) {
+    auto h = fr.read_tag();
+    if (!h) return h.error();
+    if (h->field_number == 3 && h->wire_type == WireType::LenDelim) {
+      auto entry = fr.read_len_delim();
+      if (!entry) return entry.error();
+      WireReader er = WireReader::sub(*entry);
+      while (!er.at_end()) {
+        auto eh = er.read_tag();
+        if (!eh) return eh.error();
+        if (eh->field_number == 2 && eh->wire_type == WireType::LenDelim) {
+          auto b = er.read_len_delim();
+          if (!b) return b.error();
+          if (!have_block) { block = *b; have_block = true; }
+        } else {
+          auto sk = er.skip_field(eh->wire_type); if (!sk) return sk.error();
+        }
+      }
+    } else {
+      auto sk = fr.skip_field(h->wire_type); if (!sk) return sk.error();
+    }
+  }
+  if (!have_block) return err("mlProgram function has no block", func.offset);
+
+  progress.set(0.5f, "Building graph");
+  auto gi = build_mil_block(block, model, 0);
+  if (!gi) return gi.error();
+  return true;
+}
+
 // FeatureDescription: 1 name (string). Best-effort — returns empty on any issue.
 Result<StringId> parse_feature_name(const SubRange& sr, ir::Model& model) {
   StringId nm;
@@ -497,6 +1043,8 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
   bool have_desc = false;
   SubRange nn_sub;
   bool have_nn = false;
+  SubRange mlprog_sub;
+  bool have_mlprog = false;
 
   WireReader r(file.data(), file.size(), 0);
   while (!r.at_end()) {
@@ -530,9 +1078,17 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
         } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
         break;
       }
+      case MF_ML_PROGRAM: {  // mlProgram (MILSpec.Program) — the modern path (#85)
+        if (h->wire_type == WireType::LenDelim) {
+          auto s = r.read_len_delim();
+          if (!s) return s.error();
+          if (!have_mlprog) { mlprog_sub = *s; have_mlprog = true; }
+        } else { auto sk = r.skip_field(h->wire_type); if (!sk) return sk.error(); }
+        break;
+      }
       default: {
-        // Any other top-level Type oneof (mlProgram, pipeline, tree/GLM/SVM, …)
-        // -> note it for the tensor-table fallback, then skip its body.
+        // Any other top-level Type oneof (pipeline, tree/GLM/SVM, …) -> note it
+        // for the tensor-table fallback, then skip its body.
         if (fallback_type == nullptr) {
           const char* mt = model_type_name(h->field_number);
           if (mt != nullptr) fallback_type = mt;
@@ -570,19 +1126,47 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
       auto it = map.find(n.id);
       if (it != map.end()) g.graph_outputs.push_back(it->second);
     }
+  } else if (have_mlprog) {
+    // mlProgram (MIL): build a real graph. On a structural failure, fall back to
+    // an honest note rather than erroring the whole open (best-effort, no crash).
+    auto ok = parse_ml_program(mlprog_sub, model, progress);
+    if (ok) {
+      model.has_graph = true;
+      ir::Graph& g = model.graphs[0];
+      // Wire ModelDescription feature names to graph values when they line up
+      // (only add ones not already present as MIL block IO).
+      ValueMap map;
+      map.reserve(g.values.size());
+      for (uint32_t i = 0; i < g.values.size(); ++i) map.emplace(g.values[i].name.id, i);
+      auto add_unique = [](std::vector<uint32_t>& v, uint32_t idx) {
+        for (uint32_t e : v) if (e == idx) return;
+        v.push_back(idx);
+      };
+      for (StringId n : in_names) {
+        auto it = map.find(n.id);
+        if (it != map.end()) add_unique(g.graph_inputs, it->second);
+      }
+      for (StringId n : out_names) {
+        auto it = map.find(n.id);
+        if (it != map.end()) add_unique(g.graph_outputs, it->second);
+      }
+    } else {
+      // Partial build may have reserved graph slots before failing; drop them so
+      // the tensor-table fallback contract (has_graph==false => graphs empty) holds
+      // and no downstream consumer (collapse/layout) sees a half-built graph.
+      model.graphs.clear();
+      model.has_graph = false;
+      model.metadata.emplace_back(
+          model.intern("note"),
+          model.intern(std::string("CoreML mlProgram: ") + ok.error().message));
+    }
   } else {
     // No recognizable compute graph: tensor-table fallback (no error, ever).
     model.has_graph = false;
-    std::string note;
-    if (fallback_type != nullptr) {
-      note = std::string("CoreML ") + fallback_type +
-             " model: graph view not supported (structural ops not surfaced)";
-      if (std::string(fallback_type) == "mlProgram") {
-        note += "; weights typically reside in weights/weight.bin (.mlpackage bundle)";
-      }
-    } else {
-      note = "CoreML model: no neuralNetwork graph found";
-    }
+    std::string note = fallback_type != nullptr
+        ? (std::string("CoreML ") + fallback_type +
+           " model: graph view not supported (structural ops not surfaced)")
+        : std::string("CoreML model: no neuralNetwork graph found");
     model.metadata.emplace_back(model.intern("note"), model.intern(note));
   }
 
@@ -592,6 +1176,8 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
     if (spec_version >= 0) vinfo = "spec v" + std::to_string(spec_version);
     if (have_nn) {
       vinfo += vinfo.empty() ? "neuralNetwork" : "; neuralNetwork";
+    } else if (have_mlprog) {
+      vinfo += vinfo.empty() ? "mlProgram" : "; mlProgram";
     } else if (fallback_type != nullptr) {
       vinfo += vinfo.empty() ? fallback_type : (std::string("; ") + fallback_type);
     }

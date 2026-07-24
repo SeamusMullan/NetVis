@@ -143,7 +143,15 @@ void draw_weight_inspector(App& app) {
   // Header: identity is known even before the decode finishes.
   ImGui::TextUnformatted(name.empty() ? "(unnamed tensor)"
                                       : std::string(name).c_str());
-  ImGui::Text("dtype: %s   shape: %s", ir::dtype_name(t.dtype),
+  // Prefer the exact dtype label when the type has no ir::DType (#85: OpenVINO
+  // i4/u4/nf4/u1, CoreML MIL sub-byte/fp8), so a quant tensor reads honestly
+  // instead of "?".
+  std::string dtype_disp = ir::dtype_name(t.dtype);
+  if (t.dtype == ir::DType::Unknown && model && t.dtype_label.valid()) {
+    std::string_view lbl = model->str(t.dtype_label);
+    if (!lbl.empty()) dtype_disp = std::string(lbl);
+  }
+  ImGui::Text("dtype: %s   shape: %s", dtype_disp.c_str(),
               shape_string(t.shape).c_str());
   ImGui::Text("size:  %s", human_bytes(t.byte_len).c_str());
   ImGui::Separator();

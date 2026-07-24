@@ -16,6 +16,8 @@
 
 #include "core/ByteReader.h"
 #include "core/MappedFile.h"
+#include "engine/ModelPath.h"
+#include "engine/TensorStats.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
 
@@ -127,4 +129,65 @@ TEST_CASE("truncation: Keras HDF5 parser stays safe at every 1/8th") {
                    [](const MappedFile& f, ProgressSink& p) { return keras::parse(f, p); });
   truncation_sweep("keras_v3", fixture("model.keras"),
                    [](const MappedFile& f, ProgressSink& p) { return keras::parse(f, p); });
+}
+
+TEST_CASE("truncation: mlPackage inner model.mlmodel stays safe at every 1/8th") {
+  // The mlProgram fixture: must truncate the INNER model.mlmodel file, not the
+  // bundle directory. resolve_model_path gives us the inner file path.
+  const std::string bundle_path = fixture("model.mlpackage");
+  if (!std::filesystem::exists(bundle_path)) {
+    WARN_MESSAGE(false, "fixture missing; run tools/gen_fixtures.py");
+    return;
+  }
+  auto resolved = resolve_model_path(bundle_path);
+  truncation_sweep("mlprogram_inner", resolved.map_path,
+                   [](const MappedFile& f, ProgressSink& p) { return coreml::parse(f, p); });
+}
+
+TEST_CASE("truncation: mlPackage weight.bin stays safe at every 1/8th") {
+  // Truncate the external weight.bin file. Open it with a pass-through parser
+  // (we don't parse weight.bin standalone; just test that truncating it doesn't
+  // crash when compute_tensor_stats attempts to follow the blob_metadata header).
+  const std::string bundle_path = fixture("model.mlpackage");
+  if (!std::filesystem::exists(bundle_path)) {
+    WARN_MESSAGE(false, "fixture missing; run tools/gen_fixtures.py");
+    return;
+  }
+  // Construct the weight.bin path from the bundle structure.
+  std::filesystem::path weight_bin_path =
+      std::filesystem::path(bundle_path) / "Data" / "com.apple.CoreML" / "weights" / "weight.bin";
+  if (!std::filesystem::exists(weight_bin_path)) {
+    WARN_MESSAGE(false, "weight.bin fixture missing; run tools/gen_fixtures.py");
+    return;
+  }
+
+  std::vector<uint8_t> bytes = read_all(weight_bin_path.string());
+  REQUIRE(bytes.size() > 0);
+
+  // Drive the ACTUAL blob-header follow (follow_blob_header via resolve_payload)
+  // against each truncated prefix: a blob_indirect TensorRef pointing at offset
+  // 64 (the metadata header). A truncated/short weight.bin must yield a clean
+  // Result error, never an out-of-bounds read (ASan/UBSan catch a regression).
+  for (int k = 0; k <= 8; ++k) {
+    size_t n = (bytes.size() * static_cast<size_t>(k)) / 8;
+    std::string path = write_prefix("weight_bin", bytes, n);
+
+    auto mf = MappedFile::open(path);
+    if (mf) {
+      ir::Model m;
+      ir::TensorRef t;
+      t.name = m.intern("w");
+      t.external_path = m.intern(path);   // absolute path -> used verbatim
+      t.file_offset = 64;                  // the blob_metadata header offset
+      t.blob_indirect = true;
+      t.dtype = ir::DType::F32;
+      ByteReader::payload_read_counter() = 0;
+      // model_dir empty: external_path is absolute, resolved as-is.
+      auto stats = compute_tensor_stats(t, *mf, std::string(), &m);
+      // Full-length (k==8) should succeed; truncated prefixes error cleanly.
+      // The invariant under test is "no crash / no UB", not a specific verdict.
+      (void)stats;
+    }
+    std::filesystem::remove(path);
+  }
 }

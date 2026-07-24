@@ -1035,6 +1035,13 @@ def mil_blob_value(data_type, dims, file_name, offset):
     return bytes(b)
 
 
+def mil_arg_value(value_bytes):
+    """Argument{ arguments(1) = [ Binding{ value(2) = Value } ] } — an op input
+    that carries an inline Value (e.g. a blobFileValue weight)."""
+    binding = pb_len(2, value_bytes)       # Binding.value (oneof binding, field 2)
+    return pb_len(1, binding)              # Argument.arguments (repeated Binding)
+
+
 def build_weight_bin():
     """MIL blob v2 weight.bin with one Float32 blob of four F32 (16 bytes).
     Returns (bytes, metadata_offset) — the offset the BlobFileValue must carry."""
@@ -1081,8 +1088,8 @@ def build_coreml_mlprogram(weight_offset):
     op += pb_string(1, "linear")           # Operation.type
     op += pb_map_entry(2, "x", bytes(mil_arg_name("x")))       # inputs["x"]
     op += pb_map_entry(2, "weight",
-                       bytes(mil_blob_value(FLOAT32, [2, 2],
-                                            "weights/weight.bin", weight_offset)))
+                       bytes(mil_arg_value(mil_blob_value(
+                           FLOAT32, [2, 2], "weights/weight.bin", weight_offset))))
     op += pb_len(3, mil_named_value_type("out", FLOAT32, [2, 2]))  # outputs
 
     block = bytearray()
@@ -1101,6 +1108,23 @@ def build_coreml_mlprogram(weight_offset):
     model = bytearray()
     model += pb_varint(1, 7)               # specificationVersion = 7 (iOS16)
     model += pb_len(502, bytes(program))   # mlProgram (oneof Type)
+    return bytes(model)
+
+
+def build_coreml_mlprogram_deep(depth):
+    """A pathologically deep mlProgram: Block -> Operation{blocks=[Block ->
+    Operation{blocks=[...]}]} nested `depth` levels. Exercises the parser's
+    build_mil_block <-> parse_mil_operation recursion cap (#85 hardening): the
+    parser must return a clean error / bounded model, never a stack overflow."""
+    # Innermost block: one terminal op with no nested blocks.
+    block = pb_len(3, pb_string(1, "leaf"))          # Block{operations=[Op{type}]}
+    for i in range(depth):
+        op = pb_string(1, "op") + pb_len(4, block)   # Operation{type, blocks=[block]}
+        block = pb_len(3, op)                        # Block{operations=[op]}
+
+    func = pb_string(2, "CoreML6") + pb_map_entry(3, "CoreML6", block)
+    program = pb_varint(1, 1) + pb_map_entry(2, "main", bytes(func))
+    model = pb_varint(1, 7) + pb_len(502, bytes(program))
     return bytes(model)
 
 
@@ -1533,6 +1557,8 @@ def main():
     write("model.mlmodel", build_coreml_mlmodel())
     # CoreML .mlpackage (mlProgram/MIL) DIRECTORY bundle (#85).
     build_mlpackage(out_dir)
+    # Hostile deep-nested mlProgram (#85 hardening): recursion-cap regression.
+    write("model_mlprogram_deep.mlmodel", build_coreml_mlprogram_deep(2000))
     h5 = build_keras_h5()
     assert h5[:8] == b"\x89HDF\r\n\x1a\n", "HDF5 signature misplaced"
     write("model.h5", h5)

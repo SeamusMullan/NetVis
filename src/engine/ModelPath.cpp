@@ -33,6 +33,9 @@ bool within_root(const fs::path& root, const fs::path& child) {
   auto ri = nroot.begin();
   auto ci = nchild.begin();
   for (; ri != nroot.end(); ++ri, ++ci) {
+    // A trailing slash on root yields a trailing empty component; stop there so a
+    // legitimate inner path is not falsely rejected on a trailing-slash invocation.
+    if (ri->empty()) break;
     if (ci == nchild.end() || *ci != *ri) return false;
   }
   return true;

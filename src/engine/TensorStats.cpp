@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <vector>
@@ -63,10 +64,33 @@ Result<bool> follow_blob_header(const uint8_t* file_base, uint64_t file_size,
   return true;
 }
 
+// True if `child`, lexically normalized, stays within `root` (component-wise, no
+// `..`/absolute escape). Mirrors ModelPath.cpp::within_root — an external tensor
+// path (ONNX external_data.location / CoreML MIL blobFileValue.fileName) is fully
+// attacker-controlled, so a malicious model must not read arbitrary local files.
+bool path_within_root(const std::filesystem::path& root,
+                      const std::filesystem::path& child) {
+  const std::filesystem::path nroot = root.lexically_normal();
+  const std::filesystem::path nchild = child.lexically_normal();
+  auto ri = nroot.begin();
+  auto ci = nchild.begin();
+  for (; ri != nroot.end(); ++ri, ++ci) {
+    // Skip a trailing empty component from a trailing slash on root.
+    if (ri->empty()) break;
+    if (ci == nchild.end() || *ci != *ri) return false;
+  }
+  return true;
+}
+
 // Resolve the payload for a tensor. external_path nonempty -> open+mmap that
 // file relative to model_dir; else use base.data()+file_offset with a bounds
 // check against base.size(). When t.blob_indirect, file_offset points at a MIL
 // blob_metadata header that we follow to the real data (still one payload read).
+//
+// SECURITY: external_path comes verbatim from the model file (attacker-
+// controlled). When a model_dir context exists, the resolved external file is
+// confined to model_dir — a `../` or absolute path that escapes is rejected, so a
+// hostile model cannot turn the weight inspector into an arbitrary file reader.
 Result<Payload> resolve_payload(const ir::TensorRef& t, const MappedFile& base,
                                 const std::string& model_dir,
                                 const ir::Model* model) {
@@ -82,11 +106,14 @@ Result<Payload> resolve_payload(const ir::TensorRef& t, const MappedFile& base,
 
   if (!ext.empty()) {
     std::string path = ext;
-    // Resolve relative to model_dir unless already absolute.
-    if (!path.empty() && path[0] != '/' && !model_dir.empty()) {
-      path = model_dir;
-      if (path.back() != '/') path.push_back('/');
-      path += ext;
+    // Resolve + confine relative to model_dir. When model_dir is empty the caller
+    // passed an already-trusted absolute path (headless/tests): use it verbatim.
+    if (!model_dir.empty()) {
+      std::filesystem::path root(model_dir);
+      std::filesystem::path resolved = root / ext;  // absolute ext replaces root
+      if (!path_within_root(root, resolved))
+        return err("external tensor path escapes model directory", 0);
+      path = resolved.string();
     }
     auto mf = MappedFile::open(path);
     if (!mf) return mf.error();
