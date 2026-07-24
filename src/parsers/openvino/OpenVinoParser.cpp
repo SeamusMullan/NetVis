@@ -337,8 +337,15 @@ Result<bool> parse_layer(
         tr.name = g.values[const_out_value].name;
       else
         tr.name = node.name;
-      if (const std::string* et = data->attr("element_type"))
+      if (const std::string* et = data->attr("element_type")) {
         tr.dtype = map_ov_dtype(*et);
+        // v0.6.3 (#85): when element_type maps to Unknown (i4/u4/nf4/u1/f8* — exotic
+        // quant types with no ir::DType), record the raw type as a label so the
+        // inspector can still display it honestly.
+        if (tr.dtype == ir::DType::Unknown) {
+          tr.dtype_label = model.intern(lower(*et));
+        }
+      }
       if (const std::string* sh = data->attr("shape"))
         parse_shape_csv(*sh, &tr.shape);
       tr.external_path = bin_path;
@@ -466,6 +473,21 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
   progress.set(0.3f, "Building graph");
   auto gi = build_graph(doc, net, model, bin_path, 0);
   if (!gi) return gi.error();
+
+  // v0.6.3 (#85): if the model declared at least one Const initializer and the
+  // sibling .bin does not exist on disk, append a metadata note. Do NOT error —
+  // the topology must still parse successfully (zero-payload invariant: we never
+  // read the weight blob during structural parse, so a missing blob is not a parse
+  // failure, just a metadata fact the inspector should know).
+  if (!model.graphs.empty() && !model.graphs[0].initializers.empty() &&
+      !file.path().empty()) {
+    std::filesystem::path bin_full_path =
+        std::filesystem::path(file.path()).parent_path() / bin_name;
+    if (!std::filesystem::exists(bin_full_path)) {
+      model.metadata.emplace_back(model.intern("note"),
+                                   model.intern("weights blob not found: " + bin_name));
+    }
+  }
 
   progress.set(1.0f, "Done");
   return model;

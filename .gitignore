@@ -19,3 +19,4 @@ tests/fixtures/*.keras
 tests/fixtures/*.wasm
 .wf/
 imgui.ini
+tests/fixtures/model.mlpackage/

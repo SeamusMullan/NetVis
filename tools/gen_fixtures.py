@@ -794,6 +794,39 @@ def build_openvino_bin():
     return b"".join(struct.pack("<f", f) for f in (1.0, 2.0, 3.0, 4.0))
 
 
+def build_openvino_quant_xml():
+    """OpenVINO IR v11 with a Const whose element_type is a sub-byte quant type
+    (nf4) that has no ir::DType. The parser must keep dtype=Unknown but record the
+    raw element_type as TensorRef::dtype_label. There is intentionally NO sibling
+    .bin for this fixture (issue #85 "weights blob not found" path): the topology
+    must still parse and a metadata note must be emitted. (#85)"""
+    return (
+        '<?xml version="1.0"?>\n'
+        '<net name="quant_ov" version="11">\n'
+        '  <layers>\n'
+        '    <layer id="0" name="w" type="Const">\n'
+        '      <data offset="0" size="8" element_type="nf4" shape="4,4"/>\n'
+        '      <output>\n'
+        '        <port id="0" precision="NF4">\n'
+        '          <dim>4</dim><dim>4</dim>\n'
+        '        </port>\n'
+        '      </output>\n'
+        '    </layer>\n'
+        '    <layer id="1" name="out" type="Result">\n'
+        '      <input>\n'
+        '        <port id="0" precision="NF4">\n'
+        '          <dim>4</dim><dim>4</dim>\n'
+        '        </port>\n'
+        '      </input>\n'
+        '    </layer>\n'
+        '  </layers>\n'
+        '  <edges>\n'
+        '    <edge from-layer="0" from-port="0" to-layer="1" to-port="0"/>\n'
+        '  </edges>\n'
+        '</net>\n'
+    ).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # NumPy .npz (zip of .npy arrays)
 # ---------------------------------------------------------------------------
@@ -927,6 +960,204 @@ def build_coreml_mlmodel():
     model += pb_len(2, bytes(description))  # description (ModelDescription)
     model += pb_len(500, neural_network)  # neuralNetwork (oneof Type)
     return bytes(model)
+
+
+# ---------------------------------------------------------------------------
+# CoreML .mlpackage (mlProgram / MIL) — issue #85
+# ---------------------------------------------------------------------------
+# A modern Apple export: a DIRECTORY bundle, not a single file.
+#
+#   model.mlpackage/
+#     Manifest.json
+#     Data/com.apple.CoreML/model.mlmodel     (Model proto, mlProgram=field 502)
+#     Data/com.apple.CoreML/weights/weight.bin (MIL blob v2 storage)
+#
+# Field numbers verified against apple/coremltools mlmodel/format/{Model,MIL}.proto:
+#   Model:            502 mlProgram (MILSpec.Program)
+#   Program:          1 version(int64), 2 functions(map<string,Function>)
+#   Function:         2 opset(string), 3 block_specializations(map<string,Block>)
+#   Block:            1 inputs(NamedValueType*), 2 outputs(string*), 3 operations*
+#   Operation:        1 type(string), 2 inputs(map<string,Argument>), 3 outputs(NVT*)
+#   NamedValueType:   1 name(string), 2 type(ValueType)
+#   Argument:         1 arguments(Binding*);  Binding: 1 name(string) | 2 value(Value)
+#   Value:            2 type(ValueType), 3 immediateValue, 5 blobFileValue
+#   BlobFileValue:    1 fileName(string), 2 offset(uint64)
+#   ValueType:        1 tensorType(TensorType)
+#   TensorType:       1 dataType(enum), 2 rank(int64), 3 dimensions(Dimension*)
+#   Dimension:        1 constant(ConstantDimension{1 size uint64})
+#   DataType enum:    FLOAT32=11, FLOAT16=10, INT8=21  (distinct from blob enum!)
+#
+# weight.bin MIL blob v2 (MILBlob/Blob/StorageFormat.hpp):
+#   storage_header 64B: count u32@0, version u32@4(=2), 7x reserved u64
+#   blob_metadata  64B: sentinel u32@0 =0xDEADBEEF, mil_dtype u32@4,
+#                       sizeInBytes u64@8, data_offset u64@16, padding_bits u64@24,
+#                       4x reserved u64.  Everything 64-byte aligned.
+#   BlobFileValue.offset -> the blob_metadata header (NOT the raw data).
+
+
+def pb_map_entry(field, key, value_bytes):
+    """A proto3 map<string,MSG> field on the wire: one length-delimited entry per
+    key, entry = { 1: key(string), 2: value(message) }."""
+    entry = pb_string(1, key) + pb_len(2, value_bytes)
+    return pb_len(field, entry)
+
+
+def mil_tensor_type(data_type, dims):
+    """ValueType{ tensorType(1) = TensorType{ dataType(1), rank(2), dimensions(3) } }."""
+    tt = bytearray()
+    tt += pb_varint(1, data_type)          # dataType enum
+    tt += pb_varint(2, len(dims))          # rank
+    for d in dims:
+        # Dimension{ constant(1) = ConstantDimension{ size(1) uint64 } }
+        const_dim = pb_varint(1, d)
+        tt += pb_len(3, pb_len(1, const_dim))
+    return pb_len(1, bytes(tt))            # ValueType.tensorType = field 1
+
+
+def mil_named_value_type(name, data_type, dims):
+    """NamedValueType{ name(1), type(2) = ValueType }."""
+    b = pb_string(1, name) + pb_len(2, mil_tensor_type(data_type, dims))
+    return bytes(b)
+
+
+def mil_arg_name(value_name):
+    """Argument{ arguments(1) = [ Binding{ name(1) = value_name } ] } — an op input
+    that references another value by its SSA name."""
+    binding = pb_string(1, value_name)     # Binding.name (oneof binding, field 1)
+    return pb_len(1, binding)              # Argument.arguments (repeated Binding)
+
+
+def mil_blob_value(data_type, dims, file_name, offset):
+    """Value{ type(2)=ValueType, blobFileValue(5)=BlobFileValue{fileName(1),offset(2)} }
+    — a weight stored in weight.bin at `offset` (points at the blob_metadata hdr)."""
+    bfv = pb_string(1, file_name) + pb_varint(2, offset)
+    b = pb_len(2, mil_tensor_type(data_type, dims)) + pb_len(5, bytes(bfv))
+    return bytes(b)
+
+
+def mil_arg_value(value_bytes):
+    """Argument{ arguments(1) = [ Binding{ value(2) = Value } ] } — an op input
+    that carries an inline Value (e.g. a blobFileValue weight)."""
+    binding = pb_len(2, value_bytes)       # Binding.value (oneof binding, field 2)
+    return pb_len(1, binding)              # Argument.arguments (repeated Binding)
+
+
+def build_weight_bin():
+    """MIL blob v2 weight.bin with one Float32 blob of four F32 (16 bytes).
+    Returns (bytes, metadata_offset) — the offset the BlobFileValue must carry."""
+    ALIGN = 64
+    SENTINEL = 0xDEADBEEF
+    BLOB_FLOAT32 = 2                        # BlobDataType.Float32 (blob enum!)
+    raw = b"".join(struct.pack("<f", f) for f in (1.0, 2.0, 3.0, 4.0))
+
+    # storage_header @0 (64B): count=1, version=2, reserved.
+    hdr = bytearray()
+    hdr += struct.pack("<I", 1)            # count
+    hdr += struct.pack("<I", 2)            # version = 2
+    hdr += b"\x00" * (64 - 8)              # 7x reserved u64
+    assert len(hdr) == 64
+
+    meta_off = ALIGN                       # first metadata at 64
+    data_off = meta_off + ALIGN            # its data at 128 (64-aligned)
+
+    meta = bytearray()
+    meta += struct.pack("<I", SENTINEL)    # sentinel @0
+    meta += struct.pack("<I", BLOB_FLOAT32)  # mil_dtype @4
+    meta += struct.pack("<Q", len(raw))    # sizeInBytes @8
+    meta += struct.pack("<Q", data_off)    # data_offset @16
+    meta += struct.pack("<Q", 0)           # padding_bits @24
+    meta += b"\x00" * (64 - 32)            # 4x reserved u64
+    assert len(meta) == 64
+
+    blob = bytearray()
+    blob += hdr
+    blob += meta
+    blob += raw
+    return bytes(blob), meta_off
+
+
+def build_coreml_mlprogram(weight_offset):
+    """Model proto carrying an mlProgram (field 502). One function "main" with one
+    block whose single op `linear` takes input "x" + a blobFileValue weight and
+    produces "out". weight_offset points at the blob_metadata header in weight.bin.
+    """
+    # Operation: type="linear", inputs{ x: name-binding "x", weight: blob },
+    #            outputs=[ NamedValueType("out", FLOAT32 [2,2]) ]
+    FLOAT32 = 11                           # MIL proto DataType.FLOAT32
+    op = bytearray()
+    op += pb_string(1, "linear")           # Operation.type
+    op += pb_map_entry(2, "x", bytes(mil_arg_name("x")))       # inputs["x"]
+    op += pb_map_entry(2, "weight",
+                       bytes(mil_arg_value(mil_blob_value(
+                           FLOAT32, [2, 2], "weights/weight.bin", weight_offset))))
+    op += pb_len(3, mil_named_value_type("out", FLOAT32, [2, 2]))  # outputs
+
+    block = bytearray()
+    block += pb_len(1, mil_named_value_type("x", FLOAT32, [2, 2]))  # Block.inputs
+    block += pb_string(2, "out")           # Block.outputs (repeated string)
+    block += pb_len(3, bytes(op))          # Block.operations
+
+    func = bytearray()
+    func += pb_string(2, "CoreML6")        # Function.opset
+    func += pb_map_entry(3, "CoreML6", bytes(block))  # block_specializations
+
+    program = bytearray()
+    program += pb_varint(1, 1)             # Program.version
+    program += pb_map_entry(2, "main", bytes(func))   # functions["main"]
+
+    model = bytearray()
+    model += pb_varint(1, 7)               # specificationVersion = 7 (iOS16)
+    model += pb_len(502, bytes(program))   # mlProgram (oneof Type)
+    return bytes(model)
+
+
+def build_coreml_mlprogram_deep(depth):
+    """A pathologically deep mlProgram: Block -> Operation{blocks=[Block ->
+    Operation{blocks=[...]}]} nested `depth` levels. Exercises the parser's
+    build_mil_block <-> parse_mil_operation recursion cap (#85 hardening): the
+    parser must return a clean error / bounded model, never a stack overflow."""
+    # Innermost block: one terminal op with no nested blocks.
+    block = pb_len(3, pb_string(1, "leaf"))          # Block{operations=[Op{type}]}
+    for i in range(depth):
+        op = pb_string(1, "op") + pb_len(4, block)   # Operation{type, blocks=[block]}
+        block = pb_len(3, op)                        # Block{operations=[op]}
+
+    func = pb_string(2, "CoreML6") + pb_map_entry(3, "CoreML6", block)
+    program = pb_varint(1, 1) + pb_map_entry(2, "main", bytes(func))
+    model = pb_varint(1, 7) + pb_len(502, bytes(program))
+    return bytes(model)
+
+
+def build_mlpackage(out_dir):
+    """Write a model.mlpackage DIRECTORY bundle under out_dir."""
+    import json
+    pkg = os.path.join(out_dir, "model.mlpackage")
+    inner_dir = os.path.join(pkg, "Data", "com.apple.CoreML")
+    weights_dir = os.path.join(inner_dir, "weights")
+    os.makedirs(weights_dir, exist_ok=True)
+
+    weight_bin, meta_off = build_weight_bin()
+    with open(os.path.join(weights_dir, "weight.bin"), "wb") as f:
+        f.write(weight_bin)
+    with open(os.path.join(inner_dir, "model.mlmodel"), "wb") as f:
+        f.write(build_coreml_mlprogram(meta_off))
+
+    # Manifest.json: rootModelIdentifier -> itemInfoEntries[uuid].path (=<author>/<name>).
+    manifest = {
+        "fileFormatVersion": "1.0.0",
+        "itemInfoEntries": {
+            "11111111-1111-1111-1111-111111111111": {
+                "path": "com.apple.CoreML/model.mlmodel",
+                "name": "model.mlmodel",
+                "author": "com.apple.CoreML",
+                "description": "CoreML Model Specification",
+            }
+        },
+        "rootModelIdentifier": "11111111-1111-1111-1111-111111111111",
+    }
+    with open(os.path.join(pkg, "Manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    return pkg
 
 
 # ---------------------------------------------------------------------------
@@ -1321,7 +1552,13 @@ def main():
     # .bin MUST be a real sibling so external-data resolution is exercised.
     write("model.xml", build_openvino_xml())
     write("model.bin", build_openvino_bin())
+    # OpenVINO quant IR (#85): nf4 Const, NO sibling .bin -> dtype_label + note.
+    write("model_quant.xml", build_openvino_quant_xml())
     write("model.mlmodel", build_coreml_mlmodel())
+    # CoreML .mlpackage (mlProgram/MIL) DIRECTORY bundle (#85).
+    build_mlpackage(out_dir)
+    # Hostile deep-nested mlProgram (#85 hardening): recursion-cap regression.
+    write("model_mlprogram_deep.mlmodel", build_coreml_mlprogram_deep(2000))
     h5 = build_keras_h5()
     assert h5[:8] == b"\x89HDF\r\n\x1a\n", "HDF5 signature misplaced"
     write("model.h5", h5)

@@ -254,7 +254,13 @@ void draw_tensor_table(App& app) {
         }
 
         ImGui::TableSetColumnIndex(1);
-        ImGui::TextUnformatted(ir::dtype_name(t.dtype));
+        // #85: show the exact dtype label for types with no ir::DType (quant).
+        if (t.dtype == ir::DType::Unknown && t.dtype_label.valid()) {
+          std::string_view lbl = model->str(t.dtype_label);
+          ImGui::TextUnformatted(lbl.empty() ? "?" : std::string(lbl).c_str());
+        } else {
+          ImGui::TextUnformatted(ir::dtype_name(t.dtype));
+        }
 
         ImGui::TableSetColumnIndex(2);
         ImGui::TextUnformatted(shape_string(t.shape).c_str());

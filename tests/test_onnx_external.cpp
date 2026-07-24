@@ -133,3 +133,36 @@ TEST_CASE("ONNX external-data: large-offset external survives as 64-bit") {
   CHECK(ext_large->byte_len == 16);
   CHECK(model.str(ext_large->external_path) == "weights.bin");
 }
+
+TEST_CASE("external-data: a traversal external_path is confined to model_dir (#85 sec)") {
+  // external_path comes verbatim from the (untrusted) model file. A `../`-escape
+  // or absolute path must NOT be opened when a model_dir context exists — else a
+  // hostile model could read arbitrary local files via the weight inspector.
+  ir::Model model;
+  MappedFile base;  // empty; the external branch never touches base for a hit
+  const std::string model_dir = "tests/fixtures";
+
+  auto try_path = [&](const std::string& p) {
+    ir::TensorRef t;
+    t.name = model.intern("w");
+    t.external_path = model.intern(p);
+    t.file_offset = 0;
+    t.byte_len = 8;
+    return compute_tensor_stats(t, base, model_dir, &model);
+  };
+
+  // Relative escape and absolute path both rejected (no such in-root file read).
+  CHECK_FALSE(try_path("../../../../etc/passwd"));
+  CHECK_FALSE(try_path("/etc/passwd"));
+  CHECK_FALSE(try_path("com.apple.CoreML/../../../../etc/passwd"));
+  // A legitimate in-root sibling still resolves (weights.bin exists in fixtures).
+  {
+    ir::TensorRef t;
+    t.name = model.intern("ok");
+    t.external_path = model.intern("weights.bin");
+    t.file_offset = 8;
+    t.byte_len = 8;
+    auto ok = compute_tensor_stats(t, base, model_dir, &model);
+    CHECK_MESSAGE(ok, "legitimate in-root external path must still resolve");
+  }
+}

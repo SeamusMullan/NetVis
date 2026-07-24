@@ -167,3 +167,52 @@ TEST_CASE("OpenVINO XmlReader: no entity expansion (billion-laughs immunity)") {
   // "&lol;" is copied verbatim (NOT expanded to "boom") — no entity expansion.
   CHECK(*nm == "&lol;");
 }
+
+TEST_CASE("OpenVINO quant: nf4 Const keeps Unknown dtype + dtype_label, no .bin -> note") {
+  const char* kQuantFixture = "tests/fixtures/model_quant.xml";
+  if (!std::filesystem::exists(kQuantFixture)) {
+    WARN_MESSAGE(false, "fixture missing; run tools/gen_fixtures.py");
+    return;
+  }
+
+  ByteReader::payload_read_counter() = 0;
+
+  auto mf = MappedFile::open(kQuantFixture);
+  REQUIRE(mf);
+  ProgressSink progress;
+  auto res = openvino::parse(*mf, progress);
+  REQUIRE_MESSAGE(res, "openvino::parse must succeed (topology kept, missing .bin non-fatal)");
+
+  const ir::Model& model = *res;
+  CHECK(model.str(model.format_name) == "OpenVINO");
+  REQUIRE(model.has_graph);
+  REQUIRE(model.graphs.size() >= 1);
+  const ir::Graph& g = model.graphs[0];
+
+  // --- the nf4 Const initializer: dtype==Unknown, dtype_label=="nf4" ---------
+  REQUIRE(g.initializers.size() >= 1);
+  bool found_nf4 = false;
+  for (const ir::TensorRef& t : g.initializers) {
+    if (t.dtype_label.valid() && model.str(t.dtype_label) == "nf4") {
+      CHECK(t.dtype == ir::DType::Unknown);
+      found_nf4 = true;
+      break;
+    }
+  }
+  CHECK_MESSAGE(found_nf4, "expected an nf4 initializer with dtype_label");
+
+  // --- metadata contains a missing-weights note -------------------------------
+  bool found_note = false;
+  for (const auto& [key, val] : model.metadata) {
+    std::string val_str(model.str(val));
+    if (val_str.find("not found") != std::string::npos ||
+        val_str.find("weights") != std::string::npos) {
+      found_note = true;
+      break;
+    }
+  }
+  CHECK_MESSAGE(found_note, "expected a metadata note about missing .bin");
+
+  // --- the critical invariant: zero payload reads during structural parse ----
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
