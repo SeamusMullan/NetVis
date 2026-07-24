@@ -28,6 +28,7 @@
 #include <utility>
 
 #include "engine/LayoutCache.h"
+#include "engine/ModelPath.h"
 #include "engine/ShapeInference.h"
 #include "engine/ShapeInferenceExt.h"
 
@@ -61,8 +62,12 @@ ModelSession::ModelSession(JobSystem& jobs) : jobs_(jobs) {}
 ModelSession::~ModelSession() { jobs_.bump_generation(); }
 
 std::string ModelSession::model_dir() const {
-  if (path_.empty()) return {};
-  return std::filesystem::path(path_).parent_path().string();
+  // Derive from the mapped file, not the display path: for a .mlpackage bundle
+  // map_path_ is the inner Data/com.apple.CoreML/model.mlmodel, so this points at
+  // the dir that holds weights/weight.bin (external-data resolution, spec §2.1).
+  const std::string& base = map_path_.empty() ? path_ : map_path_;
+  if (base.empty()) return {};
+  return std::filesystem::path(base).parent_path().string();
 }
 
 void ModelSession::open_async(const std::string& path) {
@@ -84,11 +89,18 @@ void ModelSession::open_async(const std::string& path) {
   progress_.set(0.0f, "mapping");
   path_ = path;
 
+  // Resolve a .mlpackage bundle directory to its inner model file (ModelPath.h);
+  // a plain file passes through unchanged. We map map_path_ and keep path_ as the
+  // user-visible path; model_dir() derives from map_path_ so external weights
+  // (weights/weight.bin) resolve inside the bundle.
+  ResolvedModelPath resolved = resolve_model_path(path);
+  map_path_ = resolved.map_path;
+
   // mmap on the MAIN thread: the file becomes interactive the moment the map
   // succeeds (spec §4). This is cheap even for multi-GB files — no bytes are
   // paged in until touched.
   auto t_map = std::chrono::steady_clock::now();
-  auto mapped = MappedFile::open(path);
+  auto mapped = MappedFile::open(map_path_);
   timings_.mmap_ms = ms_since(t_map);
   if (!mapped) {
     stage_ = LoadStage::Failed;
@@ -100,7 +112,9 @@ void ModelSession::open_async(const std::string& path) {
   file_ = std::make_shared<MappedFile>(mapped.take());
   std::shared_ptr<MappedFile> file = file_;  // snapshot captured by the jobs
 
-  const std::string ext = ext_of(path);
+  // Detect from the mapped inner file, not the bundle dir (a .mlpackage's inner
+  // file carries the .mlmodel extension that routes to the CoreML parser).
+  const std::string ext = ext_of(map_path_);
   stage_ = LoadStage::Parsing;
   progress_.set(0.0f, "parsing");
 

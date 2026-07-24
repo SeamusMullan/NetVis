@@ -29,6 +29,7 @@
 #include "engine/LayoutEngine.h"
 
 #include "engine/ModelDiff.h"
+#include "engine/ModelPath.h"
 #include "engine/ModelSession.h"
 #include "parsers/Parser.h"
 
@@ -72,7 +73,11 @@ void DiffLoader::load_comparison(const ModelSession& primary,
   jobs_.submit([this, token, path, primary_ptr] {
     // WORKER. Own the mapping + parse into a job-local model. Reads nothing from
     // model A, so no race with the primary session.
-    auto mapped = MappedFile::open(path);
+    // Resolve a .mlpackage bundle to its inner model file (ModelPath.h); a plain
+    // file passes through. Diff reads topology only, so we do not thread model_dir
+    // through here (model-B external weights are a diff non-goal).
+    ResolvedModelPath resolved = resolve_model_path(path);
+    auto mapped = MappedFile::open(resolved.map_path);
     if (!mapped) {
       std::string msg = mapped.error().message;
       jobs_.post_to_main([this, token, msg] {
@@ -83,7 +88,7 @@ void DiffLoader::load_comparison(const ModelSession& primary,
       return;
     }
     auto mf = std::make_shared<MappedFile>(mapped.take());
-    const std::string ext = ext_of(path);
+    const std::string ext = ext_of(resolved.map_path);
     Result<ir::Model> parsed = parse_model(*mf, ext, progress_);
     if (!parsed) {
       std::string msg = parsed.error().message;

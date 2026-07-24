@@ -48,6 +48,17 @@ struct TensorRef {
   uint64_t byte_len = 0;
   StringId external_path;       // ONNX external data path; empty otherwise
 
+  // v0.6.3 (#85), APPEND-ONLY. ir::DType is frozen at 16 enumerators (the plugin
+  // SDK static_asserts it), so an exact-but-unmapped element type is carried as a
+  // human LABEL rather than a new DType: OpenVINO i4/u4/nf4/u1/f8*, CoreML MIL
+  // sub-byte. Empty => panels fall back to dtype_name(dtype). Layout-inert: not in
+  // structure_hash, never serialized to the layout cache (no kVersion bump).
+  StringId dtype_label;
+  // true => file_offset points at a CoreML MIL blob_metadata header (64 bytes,
+  // sentinel 0xDEADBEEF), NOT the raw payload. TensorStats follows the header to
+  // the real data; structural parsing still records offset+len only (zero reads).
+  bool blob_indirect = false;
+
   // Product of dims (>=0 dims only); 0 if any dim is dynamic/unset.
   int64_t elem_count() const {
     if (shape.empty()) return 0;

@@ -33,9 +33,40 @@ struct Payload {
   MappedFile external;  // holds the mapping alive if external_path was used
 };
 
+// CoreML MIL "blob v2" storage (weight.bin). BlobFileValue.offset points at this
+// 64-byte metadata header, NOT the raw data; the data lives at header.data_offset
+// and is header.size_bytes long. Verified against apple/coremltools
+// MILBlob/Blob/StorageFormat.hpp. We read only the four fields we trust (reserved
+// fields are garbage pre-iOS18) via memcpy (offset may be unaligned).
+constexpr uint32_t kBlobSentinel = 0xDEADBEEFu;
+constexpr uint64_t kBlobMetadataSize = 64;
+
+// Follow a blob_metadata header located at [file_base + hdr_off] within a file of
+// `file_size` bytes. Fills *data_off / *data_len with the raw payload location.
+Result<bool> follow_blob_header(const uint8_t* file_base, uint64_t file_size,
+                                uint64_t hdr_off, uint64_t* data_off,
+                                uint64_t* data_len) {
+  if (hdr_off > file_size || kBlobMetadataSize > file_size - hdr_off)
+    return err("MIL blob metadata header out of range", hdr_off);
+  const uint8_t* h = file_base + hdr_off;
+  uint32_t sentinel;
+  std::memcpy(&sentinel, h + 0, 4);
+  if (sentinel != kBlobSentinel)
+    return err("MIL blob metadata sentinel mismatch", hdr_off);
+  uint64_t size_bytes, off;
+  std::memcpy(&size_bytes, h + 8, 8);   // sizeInBytes
+  std::memcpy(&off, h + 16, 8);         // data_offset
+  if (off > file_size || size_bytes > file_size - off)
+    return err("MIL blob payload out of range", off);
+  *data_off = off;
+  *data_len = size_bytes;
+  return true;
+}
+
 // Resolve the payload for a tensor. external_path nonempty -> open+mmap that
 // file relative to model_dir; else use base.data()+file_offset with a bounds
-// check against base.size().
+// check against base.size(). When t.blob_indirect, file_offset points at a MIL
+// blob_metadata header that we follow to the real data (still one payload read).
 Result<Payload> resolve_payload(const ir::TensorRef& t, const MappedFile& base,
                                 const std::string& model_dir,
                                 const ir::Model* model) {
@@ -43,6 +74,11 @@ Result<Payload> resolve_payload(const ir::TensorRef& t, const MappedFile& base,
 
   std::string ext;
   if (t.external_path.valid() && model) ext = std::string(model->str(t.external_path));
+
+  // Select the backing file (external sibling vs the model's own mmap) and the
+  // starting offset; the blob-indirect follow + bounds are shared below.
+  const uint8_t* file_base = nullptr;
+  uint64_t file_size = 0;
 
   if (!ext.empty()) {
     std::string path = ext;
@@ -55,19 +91,35 @@ Result<Payload> resolve_payload(const ir::TensorRef& t, const MappedFile& base,
     auto mf = MappedFile::open(path);
     if (!mf) return mf.error();
     out.external = std::move(*mf);
-    uint64_t off = (t.file_offset == UINT64_MAX) ? 0 : t.file_offset;
-    if (off > out.external.size() || t.byte_len > out.external.size() - off)
-      return err("external tensor payload out of range", off);
-    out.ptr = out.external.data() + off;
+    file_base = out.external.data();
+    file_size = out.external.size();
+  } else {
+    file_base = base.data();
+    file_size = base.size();
+  }
+
+  if (t.file_offset == UINT64_MAX && !ext.empty()) {
+    // External payload with no explicit offset starts at 0 (legacy behavior).
+    out.ptr = file_base;
     out.len = t.byte_len;
+    if (t.byte_len > file_size) return err("external tensor payload out of range", 0);
+    return out;
+  }
+  if (t.file_offset == UINT64_MAX)
+    return err("tensor has no payload offset", UINT64_MAX);
+
+  if (t.blob_indirect) {
+    uint64_t data_off = 0, data_len = 0;
+    auto ok = follow_blob_header(file_base, file_size, t.file_offset, &data_off, &data_len);
+    if (!ok) return ok.error();
+    out.ptr = file_base + data_off;
+    out.len = data_len;
     return out;
   }
 
-  if (t.file_offset == UINT64_MAX)
-    return err("tensor has no payload offset", UINT64_MAX);
-  if (t.file_offset > base.size() || t.byte_len > base.size() - t.file_offset)
+  if (t.file_offset > file_size || t.byte_len > file_size - t.file_offset)
     return err("tensor payload out of range", t.file_offset);
-  out.ptr = base.data() + t.file_offset;
+  out.ptr = file_base + t.file_offset;
   out.len = t.byte_len;
   return out;
 }

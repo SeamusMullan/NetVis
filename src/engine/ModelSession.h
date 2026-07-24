@@ -119,6 +119,11 @@ class ModelSession {
   // file() dereferences it. Default-constructed to an empty mapping.
   std::shared_ptr<MappedFile> file_ = std::make_shared<MappedFile>();
   std::unique_ptr<ir::Model> model_;
+  // The single file actually mmap'd. Equals path_ for a plain file; for a CoreML
+  // .mlpackage bundle it is the resolved inner model.mlmodel (see ModelPath.h), so
+  // model_dir() points at the bundle's Data/com.apple.CoreML/ and the existing
+  // external-data resolution finds weights/weight.bin. Set in open_async.
+  std::string map_path_;
   CollapseTree collapse_;
   std::unique_ptr<LayoutResult> layout_;
   SearchIndex search_;
