@@ -679,8 +679,17 @@ GraphCostSummary compute_graph_costs(const ir::Model& model, const ir::Graph& g)
       h = mit->second;
     } else {
       std::string_view raw = model.str(node.op_type);
-      h = reg.resolve_op(plugin::normalize_op_key(raw)).handler;
+      std::string key = plugin::normalize_op_key(raw);
+      plugin::OpResolution res = reg.resolve_op(key);
+      h = res.handler;
       handler_memo.emplace(node.op_type.id, h);
+      // §A.1: WORKER thread — warm this op-type's WASM category into the registry
+      // cache ONCE per op-type, so the render thread's resolve_category never enters
+      // the sandbox. (No-op for built-in/declarative; only Origin::Wasm is cached.)
+      if (res.origin == plugin::Origin::Wasm && h) {
+        plugin::OpContext cctx = reg.make_context(model, g, node, {});
+        reg.warm_wasm_category(key, h->category(cctx));
+      }
     }
     plugin::OpContext ctx = reg.make_context(model, g, node, {});
     plugin::FlopResult fr = h->flops(ctx);

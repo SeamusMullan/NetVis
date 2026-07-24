@@ -110,6 +110,15 @@ class Registry {
   // a disabled plugin becomes structurally absent (table-membership gate, §0.4).
   void reset_to_builtins();
 
+  // v0.7.0 (#10, Increment A / §A.1 §0.2): a WASM op handler's category() enters the
+  // sandbox, which must NEVER happen on the render thread (per visible node per
+  // frame) nor race the worker's IM3Environment. So category for Origin::Wasm ops is
+  // resolved ONCE PER OP-TYPE on the worker cost/shape pass and cached here; the
+  // render-thread resolve_category() reads the cached scalar. Both are mutex-guarded
+  // (a plain std::mutex, portable). warm_* is worker-only; cached_* is read anywhere.
+  void warm_wasm_category(std::string_view op_norm, OpCategory cat);
+  std::optional<OpCategory> cached_wasm_category(std::string_view op_norm) const;
+
   void reload(std::shared_ptr<const RegistryTable> next);   // guarded swap
 
  private:
@@ -121,6 +130,12 @@ class Registry {
   // negligible (resolve_op is hoisted once per op-type). [portability-fix]
   mutable std::mutex table_mutex_;
   mutable std::shared_ptr<const RegistryTable> table_;   // lazy-inited in snapshot()
+
+  // WASM per-op-type category cache (§A.1). Separate mutex from table_mutex_ so a
+  // worker warm() never contends the per-frame render reads of the table. Cleared by
+  // reset_to_builtins (a reload may change which op-type a WASM handler answers).
+  mutable std::mutex wasm_cat_mutex_;
+  std::unordered_map<std::string, OpCategory> wasm_cat_;
 };
 
 }  // namespace netvis::plugin
