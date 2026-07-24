@@ -85,6 +85,7 @@
 #include "engine/DiffLoader.h"
 #include "engine/LayoutCache.h"
 #include "engine/plugin/declarative/Manifest.h"  // v0.6.0 #9: plugin discovery
+#include "engine/plugin/Registry.h"               // v0.7.0 #11: reset_to_builtins
 // GraphNav.h defines GraphNavState so ViewState's unique_ptr<GraphNavState>
 // deleter sees the complete type at ~App(); DiffPanel.h for draw_diff_panel.
 #include "engine/CostModel.h"  // complete type for ViewState's unique_ptr<CostReport>
@@ -202,10 +203,10 @@ bool App::init(const std::string& initial_path) {
   // and the heatmap gradient take effect on startup.
   load_prefs();
 
-  // v0.6.0 (#9): discover + register declarative plugins from plugin_dir(). Safe by
-  // construction (JSON manifest + pure DSL, no side effects), so they load freely;
-  // WASM plugins (#10) require explicit per-plugin enable (#11) and are gated there.
-  plugin::discover_and_load_plugins();
+  // v0.6.0 (#9) / v0.7.0 (#11): discover plugins under the trust gate. Declarative
+  // plugins load freely (safe by construction); WASM plugins (#10) register only when
+  // explicitly enabled (persisted in view_prefs "plugins", loaded above).
+  reload_plugins();
 
   apply_theme(view_.dark_theme);
 
@@ -672,6 +673,8 @@ void App::save_prefs() {
   j["gradient_low"] = rgba_to_json(g.low);
   j["gradient_mid"] = rgba_to_json(g.mid);
   j["gradient_high"] = rgba_to_json(g.high);
+  // #11: per-plugin enable overrides (empty object if the user changed nothing).
+  j["plugins"] = plugin_enabled_.to_json();
   std::ofstream f(layout_cache_dir() + "/view_prefs.json");
   if (f) f << j.dump(2);
 }
@@ -715,9 +718,24 @@ void App::load_prefs() {
       if (j.contains("gradient_high"))
         g.high = rgba_from_json(j["gradient_high"], g.high);
     }
+    // #11: per-plugin enable overrides (guarded; never prunes, ignores non-bool).
+    if (j.contains("plugins") && j["plugins"].is_object())
+      plugin_enabled_.load_json(j["plugins"]);
   } catch (...) {
     // Corrupt prefs -> keep defaults.
   }
+}
+
+void App::reload_plugins() {
+  // §0.4/§C.3: reset to built-ins then re-discover under the current gate, so a
+  // disabled plugin is structurally absent from the Registry.
+  plugin::Registry::instance().reset_to_builtins();
+  plugin::discover_and_load_plugins(
+      [this](std::string_view id, plugin::PluginKind k) { return plugin_gate(id, k); });
+  // The Registry table changed, so the cost report (its FLOP/category handlers route
+  // through the registry) is stale. Bump the derived-state epoch so the next
+  // ensure_cost rebuilds against the new table. No file reparse.
+  if (session_) session_->invalidate_derived();
 }
 
 // ---------------------------------------------------------------------------

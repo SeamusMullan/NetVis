@@ -18,6 +18,9 @@
 #include "engine/plugin/OpHandler.h"
 #include "engine/plugin/Registry.h"
 #include "engine/plugin/declarative/Dsl.h"
+#include "engine/plugin/wasm/WasmOpHandler.h"   // load_wasm_op_plugin (#10)
+#include "engine/plugin/wasm/WasmParser.h"      // load_wasm_parser_plugin (#10)
+#include "engine/plugin/wasm/WasmRuntime.h"     // WasmEngine::enabled (#10)
 
 namespace netvis::plugin {
 
@@ -332,9 +335,66 @@ std::vector<LoadedManifest>& manifest_cache() {
 
 const std::vector<LoadedManifest>& loaded_manifests() { return manifest_cache(); }
 
-std::vector<LoadedManifest> discover_and_load_plugins() {
-  std::vector<LoadedManifest> out;
-  std::string root = plugin_dir();
+namespace {
+
+// Peek a manifest's kind (§0.4 trust tier) WITHOUT registering: a "wasm" key marks
+// a WASM op plugin, "parser_wasm" a WASM parser; otherwise declarative. Best-effort
+// (a parse failure -> Declarative, and load_manifest_file will report the error).
+PluginKind peek_kind(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return PluginKind::Declarative;
+  std::stringstream ss; ss << f.rdbuf();
+  json j = json::parse(ss.str(), nullptr, false, /*ignore_comments=*/true);
+  if (j.is_discarded() || !j.is_object()) return PluginKind::Declarative;
+  if (j.contains("wasm") || j.contains("parser_wasm")) return PluginKind::Wasm;
+  return PluginKind::Declarative;
+}
+
+// Load one discovered plugin under the gate. `id` is the stable discovery-dir name.
+LoadedManifest load_gated(const std::string& path, const std::string& id,
+                          const PluginGate& gate) {
+  const PluginKind kind = peek_kind(path);
+  const bool enabled = gate ? gate(id, kind) : plugin_default_enabled(kind);
+
+  LoadedManifest lm;
+  if (kind == PluginKind::Wasm) {
+    // WASM: only load+register when enabled AND the engine is present. A disabled
+    // WASM plugin is structurally absent — its can_parse (code exec) never runs.
+    lm.path = path;
+    lm.id = id;
+    lm.kind = PluginKind::Wasm;
+    lm.enabled = enabled;
+    // Read name/wasm keys for display (no registration on the disabled path).
+    std::ifstream f(path, std::ios::binary);
+    std::stringstream ss; ss << f.rdbuf();
+    json j = json::parse(ss.str(), nullptr, false, true);
+    bool is_parser = false;
+    if (!j.is_discarded() && j.is_object()) {
+      if (j.contains("name") && j["name"].is_string()) lm.name = j["name"].get<std::string>();
+      is_parser = j.contains("parser_wasm");
+      lm.ok = true;
+    } else {
+      lm.error = "JSON parse error";
+    }
+    if (enabled && lm.ok && wasm::WasmEngine::instance().enabled()) {
+      std::string err = is_parser ? wasm::load_wasm_parser_plugin(path)
+                                  : wasm::load_wasm_op_plugin(path);
+      if (err.empty()) { lm.registered = true; }
+      else { lm.error = err; }
+    }
+    return lm;
+  }
+
+  // Declarative: parse+compile always (for panel diagnostics); register only if enabled.
+  lm = load_manifest_file(path, /*register_into=*/enabled);
+  lm.id = id;
+  lm.kind = PluginKind::Declarative;
+  lm.enabled = enabled;
+  lm.registered = enabled && lm.ok;
+  return lm;
+}
+
+std::vector<std::filesystem::path> discover_manifest_paths(const std::string& root) {
   std::error_code ec;
   std::vector<std::filesystem::path> manifests;
   for (auto it = std::filesystem::directory_iterator(root, ec);
@@ -344,9 +404,30 @@ std::vector<LoadedManifest> discover_and_load_plugins() {
     if (std::filesystem::exists(pj, ec)) manifests.push_back(pj);
   }
   std::sort(manifests.begin(), manifests.end());  // deterministic path order
-  for (const auto& p : manifests) out.push_back(load_manifest_file(p.string(), true));
+  return manifests;
+}
+
+}  // namespace
+
+std::vector<LoadedManifest> discover_and_load_plugins(const PluginGate& gate,
+                                                      const std::string& root) {
+  std::vector<LoadedManifest> out;
+  for (const auto& p : discover_manifest_paths(root)) {
+    // The stable enable-key is the discovery SUBDIR name (parent of plugin.json).
+    std::string id = p.parent_path().filename().string();
+    out.push_back(load_gated(p.string(), id, gate));
+  }
   manifest_cache() = out;   // cache for the Plugins panel (#11)
   return out;
+}
+
+std::vector<LoadedManifest> discover_and_load_plugins(const PluginGate& gate) {
+  return discover_and_load_plugins(gate, plugin_dir());
+}
+
+std::vector<LoadedManifest> discover_and_load_plugins() {
+  // Back-compat: no gate => the kind default (declarative on, WASM off).
+  return discover_and_load_plugins(PluginGate{}, plugin_dir());
 }
 
 }  // namespace netvis::plugin

@@ -107,6 +107,14 @@ class ModelSession {
   // forever. Starts at 0; only ever increases within a generation.
   uint64_t enrich_generation() const { return enrich_generation_; }
 
+  // v0.7.0 (#11): a plugin enable/disable reload changed the Registry table, so any
+  // derived state that routes through it (the cost report's FLOP/category handlers)
+  // is stale. Bumping enrich_generation on the main thread folds into the cost
+  // rebuild key (same mechanism as shape-inference completion), so the next
+  // ensure_cost rebuilds against the new table. No file reparse. Safe to call with
+  // no model loaded (no-op effect: the counter just advances).
+  void invalidate_derived() { ++enrich_generation_; }
+
  private:
   JobSystem& jobs_;
 
