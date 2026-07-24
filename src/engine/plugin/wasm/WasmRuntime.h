@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -85,11 +86,20 @@ class WasmEngine {
 
   bool enabled() const;   // false if built without NETVIS_ENABLE_WASM
 
+  // Process-wide lock serializing ALL load/link/call access (design §0.3): wasm3's
+  // IM3Environment is shared mutable state (m3_ParseModule mutates env->funcTypes)
+  // and fuel is a thread-local, so a WASM op-handler resolved on a worker thread and
+  // a parser sniff on another must not race. Callers hold this across the whole
+  // load()+link+call_i32() sequence. Plain std::mutex — portable (inv 2, no
+  // std::atomic<shared_ptr>). Recursive NOT needed: no nested sandbox entry.
+  std::mutex& lock() { return call_mutex_; }
+
  private:
   WasmEngine();
   ~WasmEngine();
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  std::mutex call_mutex_;   // see lock()
 };
 
 }  // namespace netvis::plugin::wasm
