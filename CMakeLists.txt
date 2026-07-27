@@ -128,14 +128,18 @@ if(NETVIS_ENABLE_WASM)
   if(NOT wasm3_POPULATED)
     FetchContent_Populate(wasm3)
   endif()
-  # Patch the loop back-edge ops so the sandbox can kill a tight-loop module (the
-  # weak m3_Yield hook only fires on Call). Idempotent; runs at configure time so
-  # the pinned upstream tag stays pristine. Non-fatal if anchors drift.
+  # Patch the fetched wasm3 source (idempotent; runs at configure time so the
+  # pinned upstream tag stays pristine; non-fatal if anchors drift):
+  #   * m3_exec.h — fuel on the loop back-edge so a tight-loop module is killable
+  #     (the weak m3_Yield hook only fires on Call).
+  #   * m3_core.c — drop wasm3's fallback m3_Yield, which on MSVC (where M3_WEAK is
+  #     empty) is a second STRONG definition and collides with the host's fuel
+  #     m3_Yield at link (LNK2005 -> netvis.exe LNK1169). Host def stays sole.
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     execute_process(
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/patch_wasm3.py
-              ${wasm3_SOURCE_DIR}/source/m3_exec.h)
+              ${wasm3_SOURCE_DIR}/source)
   endif()
   file(GLOB WASM3_SRC ${wasm3_SOURCE_DIR}/source/*.c)
   # Drop the WASI/uvwasi host-API translation units: we expose ZERO syscalls, so
