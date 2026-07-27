@@ -28,6 +28,24 @@ using json = nlohmann::json;
 
 namespace {
 
+// Manifests are tiny config; cap every read at 4 MiB so a huge (or piped) file in
+// the plugin discovery dir can't exhaust memory before parsing. Returns false (and
+// clears `out`) if the file is missing or exceeds the cap. [review-fix]
+constexpr std::size_t kManifestMaxBytes = 4u * 1024 * 1024;
+bool read_manifest_capped(const std::string& path, std::string& out) {
+  out.clear();
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  // Read at most cap+1 bytes: if the file has more, it exceeds the cap. This never
+  // buffers more than ~4 MiB regardless of the on-disk size.
+  out.resize(kManifestMaxBytes + 1);
+  f.read(out.data(), static_cast<std::streamsize>(out.size()));
+  const std::size_t n = static_cast<std::size_t>(f.gcount());
+  if (n > kManifestMaxBytes) { out.clear(); return false; }
+  out.resize(n);
+  return true;
+}
+
 // A compiled variable binding: name + expression + resolved dependency order.
 struct VarBinding {
   std::string name;
@@ -284,11 +302,12 @@ LoadedManifest load_manifest_file(const std::string& path, bool register_into) {
   LoadedManifest lm;
   lm.path = path;
 
-  std::ifstream f(path, std::ios::binary);
-  if (!f) { lm.error = "cannot open file"; return lm; }
-  std::stringstream ss; ss << f.rdbuf();
-  std::string text = ss.str();
-  if (text.size() > 4u * 1024 * 1024) { lm.error = "manifest too large (>4MiB)"; return lm; }
+  std::string text;
+  if (!read_manifest_capped(path, text)) {
+    std::ifstream probe(path, std::ios::binary);
+    lm.error = probe ? "manifest too large (>4MiB)" : "cannot open file";
+    return lm;
+  }
   if (!nesting_ok(text, 64)) { lm.error = "manifest nesting too deep"; return lm; }
 
   json j = json::parse(text, nullptr, /*allow_exceptions=*/false, /*ignore_comments=*/true);
@@ -341,10 +360,9 @@ namespace {
 // a WASM op plugin, "parser_wasm" a WASM parser; otherwise declarative. Best-effort
 // (a parse failure -> Declarative, and load_manifest_file will report the error).
 PluginKind peek_kind(const std::string& path) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) return PluginKind::Declarative;
-  std::stringstream ss; ss << f.rdbuf();
-  json j = json::parse(ss.str(), nullptr, false, /*ignore_comments=*/true);
+  std::string text;
+  if (!read_manifest_capped(path, text)) return PluginKind::Declarative;
+  json j = json::parse(text, nullptr, false, /*ignore_comments=*/true);
   if (j.is_discarded() || !j.is_object()) return PluginKind::Declarative;
   if (j.contains("wasm") || j.contains("parser_wasm")) return PluginKind::Wasm;
   return PluginKind::Declarative;
@@ -365,9 +383,10 @@ LoadedManifest load_gated(const std::string& path, const std::string& id,
     lm.kind = PluginKind::Wasm;
     lm.enabled = enabled;
     // Read name/wasm keys for display (no registration on the disabled path).
-    std::ifstream f(path, std::ios::binary);
-    std::stringstream ss; ss << f.rdbuf();
-    json j = json::parse(ss.str(), nullptr, false, true);
+    std::string text;
+    json j = read_manifest_capped(path, text)
+                 ? json::parse(text, nullptr, false, true)
+                 : json(json::value_t::discarded);
     bool is_parser = false;
     if (!j.is_discarded() && j.is_object()) {
       if (j.contains("name") && j["name"].is_string()) lm.name = j["name"].get<std::string>();

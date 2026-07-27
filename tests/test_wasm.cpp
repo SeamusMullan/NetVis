@@ -124,6 +124,24 @@ TEST_CASE("wasm: a huge declared memory is capped at load, not OOM (review fix)"
   CHECK(memsz <= lim.max_memory_pages * 65536u);   // capped, not 30000 pages
 }
 
+TEST_CASE("wasm: a parse-OK/load-fail module frees the orphaned module (leak fix)") {
+  if (!WasmEngine::instance().enabled()) return;
+  std::vector<uint8_t> img = read_file(fixture("plugin_loadfail.wasm"));
+  REQUIRE(img.size() > 8);
+  SandboxLimits lim;
+  RunResult lerr;
+  // m3_ParseModule succeeds (the module is well-formed) but m3_LoadModule fails:
+  // its active data segment lands past the 1-page initial memory, so
+  // InitDataSegments throws and the parsed module is never linked into
+  // runtime->modules. The host must m3_FreeModule it or LeakSanitizer flags a leak
+  // that recurs per facet call. Repeat to make any per-load leak obvious under LSan.
+  for (int rep = 0; rep < 8; ++rep) {
+    WasmModule mod = WasmEngine::instance().load(img, lim, nullptr, &lerr);
+    CHECK(mod.loaded() == false);
+    CHECK(lerr.status == RunStatus::LoadError);
+  }
+}
+
 TEST_CASE("wasm: a garbage image fails to load cleanly (no crash)") {
   if (!WasmEngine::instance().enabled()) return;
   std::vector<uint8_t> junk = {0x00, 0x61, 0x73, 0x6d, 0xff, 0xff, 0xff, 0xff,

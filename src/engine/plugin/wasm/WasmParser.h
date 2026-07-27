@@ -42,6 +42,14 @@ struct ParseLimits {
   uint32_t max_tensors = 5'000'000;
   uint32_t max_metadata = 4096;
   uint32_t max_intern_calls = 2'000'000;
+  // Aggregate (whole-Model) caps closing the unbounded-host-allocation DoS: a
+  // hostile guest can call the attribute / graph-IO / node imports in a fuel-metered
+  // loop, and imported-call fuel is NOT metered, so each must bound cumulative growth
+  // itself. Counted across ALL graphs (not per-graph) so max_graphs can't multiply them.
+  uint32_t max_attributes = 4'000'000;      // total ir::Attribute records
+  uint64_t max_attr_ints = 16'000'000;      // total int64 elements across attr-ints
+  uint64_t max_edge_refs = 40'000'000;      // total node input/output edge refs
+  uint32_t max_graph_io = 65'536;           // per-graph graph_inputs / graph_outputs
 };
 
 // A WASM parser plugin backed by an immutable .wasm image exporting netvis_can_parse

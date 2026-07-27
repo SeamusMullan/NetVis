@@ -1446,6 +1446,7 @@ def build_wasm_toyparser():
     #  t3 (iiIIiii)->i host_record_tensor
     #  t4 (iii)->()   host_set_model_info
     #  t5 ()->i       exports
+    #  t6 (iiiI)->i   host_add_attr_int (guards the attr-cap fix stays happy-path)
     i, I = b"\x7f", b"\x7e"
     def ftype(params, results):
         return b"\x60" + _uleb(len(params)) + b"".join(params) + _uleb(len(results)) + b"".join(results)
@@ -1455,31 +1456,35 @@ def build_wasm_toyparser():
     t3 = ftype([i, i, I, I, i, i, i], [i])
     t4 = ftype([i, i, i], [])
     t5 = ftype([], [i])
-    types = _uleb(6) + t0 + t1 + t2 + t3 + t4 + t5
+    t6 = ftype([i, i, i, I], [i])
+    types = _uleb(7) + t0 + t1 + t2 + t3 + t4 + t5 + t6
 
     def nm(s):
         b = s.encode(); return _uleb(len(b)) + b
 
-    imp = _uleb(5)
+    imp = _uleb(6)
     imp += nm("netvis") + nm("host_intern_range") + b"\x00" + _uleb(0)   # func 0
     imp += nm("netvis") + nm("host_begin_graph") + b"\x00" + _uleb(1)    # func 1
     imp += nm("netvis") + nm("host_add_node") + b"\x00" + _uleb(2)       # func 2
     imp += nm("netvis") + nm("host_record_tensor") + b"\x00" + _uleb(3)  # func 3
     imp += nm("netvis") + nm("host_set_model_info") + b"\x00" + _uleb(4) # func 4
-    # three local funcs, all type 5 () -> i32 (indices 5,6,7).
+    imp += nm("netvis") + nm("host_add_attr_int") + b"\x00" + _uleb(6)   # func 5 (type t6)
+    # three local funcs, all type 5 () -> i32 (indices 6,7,8 after 6 imported).
     funcs = _uleb(3) + _uleb(5) + _uleb(5) + _uleb(5)
     exp = _uleb(3)
-    exp += nm("netvis_parser_abi_version") + b"\x00" + _uleb(5)
-    exp += nm("netvis_can_parse") + b"\x00" + _uleb(6)
-    exp += nm("netvis_parse") + b"\x00" + _uleb(7)
+    exp += nm("netvis_parser_abi_version") + b"\x00" + _uleb(6)
+    exp += nm("netvis_can_parse") + b"\x00" + _uleb(7)
+    exp += nm("netvis_parse") + b"\x00" + _uleb(8)
 
-    # func 5 abi_version: i32.const 1 ; end
+    # func 6 abi_version: i32.const 1 ; end
     b_abi = _uleb(0) + b"\x41\x01\x0b"
-    # func 6 can_parse: i32.const 1 ; end (always claims)
+    # func 7 can_parse: i32.const 1 ; end (always claims)
     b_can = _uleb(0) + b"\x41\x01\x0b"
-    # func 7 parse:
+    # func 8 parse:
     #   g = host_begin_graph(0)               ; drop
     #   host_record_tensor(0,0, 0, 0, 15/*Unknown*/, 0, 0)  ; drop
+    #   host_add_node(0,0,0, 0,0, 0,0)        ; drop   (node 0, no I/O)
+    #   host_add_attr_int(0,0,0, 42)          ; drop   (one int attr on node 0)
     #   host_set_model_info(0,0,0)
     #   return 0
     # (name_id 0 = empty StringId; offsets 0/len 0 -> a zero-length in-bounds tensor)
@@ -1488,6 +1493,12 @@ def build_wasm_toyparser():
     # record_tensor(g=0,name=0,off=0(i64),len=0(i64),dtype=15,dims=0,rank=0)
     b_par += b"\x41\x00" + b"\x41\x00" + b"\x42\x00" + b"\x42\x00" + b"\x41" + _sleb(15) + b"\x41\x00" + b"\x41\x00"
     b_par += b"\x10" + _uleb(3) + b"\x1a"                        # call record_tensor; drop
+    # add_node(g=0,op=0,name=0,in_ptr=0,nin=0,out_ptr=0,nout=0); drop
+    b_par += b"\x41\x00\x41\x00\x41\x00\x41\x00\x41\x00\x41\x00\x41\x00"
+    b_par += b"\x10" + _uleb(2) + b"\x1a"                        # call add_node; drop
+    # add_attr_int(g=0,node=0,name=0,val=42(i64)); drop
+    b_par += b"\x41\x00\x41\x00\x41\x00" + b"\x42" + _sleb(42)
+    b_par += b"\x10" + _uleb(5) + b"\x1a"                        # call add_attr_int; drop
     b_par += b"\x41\x00\x41\x00\x41\x00" + b"\x10" + _uleb(4)    # set_model_info(0,0,0)
     b_par += b"\x41\x00\x0b"                                     # return 0 ; end
     code = _uleb(3)
@@ -1605,6 +1616,34 @@ def build_wasm_bigmem():
     return bytes(out)
 
 
+def build_wasm_loadfail():
+    """A module that PARSES cleanly but FAILS m3_LoadModule: memory min=1 page
+    (64 KiB) + an active data segment at offset 1 MiB, which is past the initial
+    memory, so InitDataSegments throws 'data segment out of bounds'. m3_LoadModule
+    hits its _catch AFTER m3_ParseModule already allocated the module but BEFORE
+    linking it into runtime->modules, so the parsed module is orphaned unless the
+    host frees it. Regression for the parse-OK/load-fail IM3Module leak [review-fix]."""
+    types = _uleb(1) + b"\x60" + _uleb(0) + _uleb(1) + b"\x7f"   # ()->i32
+    funcs = _uleb(1) + _uleb(0)
+    mem = _uleb(1) + b"\x00" + _uleb(1)                          # min 1 page, no max
+    name = b"run"
+    exports = _uleb(1) + _uleb(len(name)) + name + b"\x00" + _uleb(0)
+    body = _uleb(0) + b"\x41\x00\x0b"                            # i32.const 0; end
+    code = _uleb(1) + _uleb(len(body)) + body
+    # Active data segment: index 0, offset expr = i32.const 0x100000 (1 MiB), 1 byte.
+    OFF = 0x100000
+    data = _uleb(1) + _uleb(0) + b"\x41" + _sleb(OFF) + b"\x0b" + _uleb(1) + b"\xff"
+    # order: type(1) func(3) memory(5) export(7) code(10) data(11)
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(5, mem)
+    out += _wasm_section(7, exports)
+    out += _wasm_section(10, code)
+    out += _wasm_section(11, data)
+    return bytes(out)
+
+
 def build_wasm_loop():
     """A HOSTILE module: export "run" : () -> i32 with an infinite loop
     (loop; br 0; end). Must be KILLED by the sandbox fuel cap, not hang."""
@@ -1714,6 +1753,7 @@ def main():
     write("plugin_start_loop.wasm", build_wasm_start_loop())
     write("plugin_badsig.wasm", build_wasm_badsig())
     write("plugin_bigmem.wasm", build_wasm_bigmem())
+    write("plugin_loadfail.wasm", build_wasm_loadfail())
     write("plugin_pass.wasm", build_wasm_pass())
     # WASM op-handler + parser adapter fixtures (#10, Increments A/B).
     write("plugin_ophandler.wasm", build_wasm_ophandler(hostile=False))
