@@ -190,7 +190,17 @@ WasmModule WasmEngine::load(const std::vector<uint8_t>& wasm, const SandboxLimit
   if (r) { err.status = RunStatus::LoadError; err.message = r; m3_FreeRuntime(impl->runtime); if (out_err) *out_err = err; return mod; }
 
   r = m3_LoadModule(impl->runtime, m);
-  if (r) { err.status = RunStatus::LoadError; err.message = r; m3_FreeRuntime(impl->runtime); if (out_err) *out_err = err; return mod; }
+  if (r) {
+    // LoadModule failure (e.g. a data/element segment out of the capped memory)
+    // hits its _catch BEFORE linking `m` into runtime->modules and nulls
+    // m->runtime, so m3_FreeRuntime never reaches `m`. Free the orphaned parsed
+    // module here or it leaks once per facet-call (unbounded over a session). [review-fix]
+    err.status = RunStatus::LoadError; err.message = r;
+    m3_FreeModule(m);
+    m3_FreeRuntime(impl->runtime);
+    if (out_err) *out_err = err;
+    return mod;
+  }
   impl->module = m;
 
   mod.impl_ = std::move(impl);

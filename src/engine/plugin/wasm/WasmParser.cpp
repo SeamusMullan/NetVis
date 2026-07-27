@@ -77,6 +77,11 @@ struct ParseHostCtx {
   std::string error;
   bool aborted = false;
   uint32_t intern_calls = 0;
+  // Aggregate growth counters (whole-Model) — enforce ParseLimits caps that close
+  // the unbounded-host-allocation DoS. Counted across every graph.
+  uint32_t attr_count = 0;       // total attributes appended
+  uint64_t attr_ints_total = 0;  // total int64 elements across all attr-ints
+  uint64_t edge_ref_total = 0;   // total edge refs pushed by host_add_node
 
   // Is [off,off+len) entirely inside the up-front sniff window (head OR tail)?
   bool in_window(uint64_t off, uint64_t len) const {
@@ -282,6 +287,10 @@ m3ApiRawFunction(host_add_node) {
       nin >= 0 && nin <= kMaxNodeIO && nout >= 0 && nout <= kMaxNodeIO) {
     ir::Graph& gr = h->model->graphs[static_cast<size_t>(g)];
     if (gr.nodes.size() >= h->limits.max_nodes) { m3ApiReturn(ni); }
+    // Cumulative edge-ref cap (across all graphs): a worst-case fully-connected
+    // node can push up to 2*kMaxNodeIO refs, so bound the total to keep the DoS shut.
+    if (h->edge_ref_total + static_cast<uint64_t>(nin) + static_cast<uint64_t>(nout) >
+        h->limits.max_edge_refs) { m3ApiReturn(ni); }
     // Validate the (clamped) input/output index arrays before touching them.
     if (nin > 0) {
       if (m3ApiIsNullPtr(in_ptr) ||
@@ -309,6 +318,7 @@ m3ApiRawFunction(host_add_node) {
       if (v < gr.values.size()) { gr.edge_refs.push_back(v); gr.values[v].producer = ni; }
     }
     node.outputs.count = static_cast<uint32_t>(gr.edge_refs.size()) - node.outputs.begin;
+    h->edge_ref_total += static_cast<uint64_t>(node.inputs.count) + node.outputs.count;
     gr.nodes.push_back(std::move(node));
   }
   m3ApiReturn(ni);
@@ -332,8 +342,15 @@ m3ApiRawFunction(host_set_graph_io) {
         ((uint64_t)(uintptr_t)(out_ptr) + static_cast<uint64_t>(nout) * 4u) >
             ((uint64_t)(uintptr_t)(_mem) + m3_GetMemorySize(runtime)))) ok = false;
     if (ok) {
-      for (int32_t i = 0; i < nin; ++i) { uint32_t v = in_ptr[i]; if (v < gr.values.size()) gr.graph_inputs.push_back(v); }
-      for (int32_t i = 0; i < nout; ++i) { uint32_t v = out_ptr[i]; if (v < gr.values.size()) gr.graph_outputs.push_back(v); }
+      const size_t cap = static_cast<size_t>(h->limits.max_graph_io);
+      for (int32_t i = 0; i < nin; ++i) {
+        if (gr.graph_inputs.size() >= cap) break;
+        uint32_t v = in_ptr[i]; if (v < gr.values.size()) gr.graph_inputs.push_back(v);
+      }
+      for (int32_t i = 0; i < nout; ++i) {
+        if (gr.graph_outputs.size() >= cap) break;
+        uint32_t v = out_ptr[i]; if (v < gr.values.size()) gr.graph_outputs.push_back(v);
+      }
     }
   }
   m3ApiSuccess();
@@ -355,7 +372,7 @@ m3ApiRawFunction(host_add_attr_int) {
   m3ApiGetArg(int64_t, val);
   ParseHostCtx* h = pctx(_ctx);
   int32_t ok = -1;
-  if (h && name_id >= 0) {
+  if (h && name_id >= 0 && h->attr_count < h->limits.max_attributes) {
     if (ir::Node* n = last_node(h, g, node)) {
       ir::Graph& gr = h->model->graphs[static_cast<size_t>(g)];
       if (n->attributes.count == 0) n->attributes.begin = static_cast<uint32_t>(gr.attributes.size());
@@ -363,6 +380,7 @@ m3ApiRawFunction(host_add_attr_int) {
       a.value.kind = ir::AttrValue::Kind::Int; a.value.i = val;
       gr.attributes.push_back(std::move(a));
       n->attributes.count++;
+      ++h->attr_count;
       ok = 0;
     }
   }
@@ -377,7 +395,7 @@ m3ApiRawFunction(host_add_attr_float) {
   m3ApiGetArg(double, val);
   ParseHostCtx* h = pctx(_ctx);
   int32_t ok = -1;
-  if (h && name_id >= 0) {
+  if (h && name_id >= 0 && h->attr_count < h->limits.max_attributes) {
     if (ir::Node* n = last_node(h, g, node)) {
       ir::Graph& gr = h->model->graphs[static_cast<size_t>(g)];
       if (n->attributes.count == 0) n->attributes.begin = static_cast<uint32_t>(gr.attributes.size());
@@ -385,6 +403,7 @@ m3ApiRawFunction(host_add_attr_float) {
       a.value.kind = ir::AttrValue::Kind::Float; a.value.f = val;
       gr.attributes.push_back(std::move(a));
       n->attributes.count++;
+      ++h->attr_count;
       ok = 0;
     }
   }
@@ -399,7 +418,7 @@ m3ApiRawFunction(host_add_attr_string) {
   m3ApiGetArg(int32_t, val_id);
   ParseHostCtx* h = pctx(_ctx);
   int32_t ok = -1;
-  if (h && name_id >= 0 && val_id >= 0) {
+  if (h && name_id >= 0 && val_id >= 0 && h->attr_count < h->limits.max_attributes) {
     if (ir::Node* n = last_node(h, g, node)) {
       ir::Graph& gr = h->model->graphs[static_cast<size_t>(g)];
       if (n->attributes.count == 0) n->attributes.begin = static_cast<uint32_t>(gr.attributes.size());
@@ -407,6 +426,7 @@ m3ApiRawFunction(host_add_attr_string) {
       a.value.kind = ir::AttrValue::Kind::String; a.value.s = StringId{static_cast<uint32_t>(val_id)};
       gr.attributes.push_back(std::move(a));
       n->attributes.count++;
+      ++h->attr_count;
       ok = 0;
     }
   }
@@ -422,7 +442,9 @@ m3ApiRawFunction(host_add_attr_ints) {
   m3ApiGetArg(int32_t, count);
   ParseHostCtx* h = pctx(_ctx);
   int32_t ok = -1;
-  if (h && name_id >= 0 && count >= 0 && count <= kMaxAttrLen) {
+  if (h && name_id >= 0 && count >= 0 && count <= kMaxAttrLen &&
+      h->attr_count < h->limits.max_attributes &&
+      h->attr_ints_total + static_cast<uint64_t>(count) <= h->limits.max_attr_ints) {
     if (ir::Node* n = last_node(h, g, node)) {
       bool mem_ok = true;
       if (count > 0 && (m3ApiIsNullPtr(ptr) ||
@@ -437,6 +459,8 @@ m3ApiRawFunction(host_add_attr_ints) {
         for (int32_t i = 0; i < count; ++i) a.value.ints.push_back(ptr[i]);
         gr.attributes.push_back(std::move(a));
         n->attributes.count++;
+        ++h->attr_count;
+        h->attr_ints_total += static_cast<uint64_t>(count);
         ok = 0;
       }
     }
@@ -562,7 +586,17 @@ class WasmParserPlugin final : public ParserPlugin {
     if (!abi_ok(mod)) return err("wasm parser abi mismatch", 0);
 
     int32_t ret = 0;
-    RunResult rr = mod.call_i32("netvis_parse", &ret);
+    // ParseLimits bound cumulative host allocation, but wrap the guest call so any
+    // std::bad_alloc/other host-side throw is a clean parse failure, never a
+    // terminate() unwinding through wasm3's C interpreter frame.
+    RunResult rr;
+    try {
+      rr = mod.call_i32("netvis_parse", &ret);
+    } catch (const std::exception& e) {
+      return err(std::string("wasm parser: host aborted: ") + e.what(), 0);
+    } catch (...) {
+      return err("wasm parser: host aborted", 0);
+    }
     if (rr.status != RunStatus::Ok)
       return err("wasm parser trapped: " + rr.message, 0);  // partial Model discarded
     if (ret != 0 || hc.aborted)

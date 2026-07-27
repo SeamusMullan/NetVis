@@ -98,6 +98,35 @@ TEST_CASE("declarative gate: disabled plugin is structurally absent from Registr
   fs::remove_all(root);
 }
 
+TEST_CASE("manifest read is size-capped: an oversized plugin.json is rejected, no OOM") {
+  namespace fs = std::filesystem;
+  fs::path root = fs::temp_directory_path() / "nv_plugtest_big";
+  fs::remove_all(root);
+  fs::create_directories(root / "huge");
+  // Write a >4 MiB plugin.json (valid JSON prefix, then megabytes of filler). The
+  // capped reader must reject it up front rather than buffer the whole file. [review-fix]
+  {
+    std::ofstream f((root / "huge" / "plugin.json").string(), std::ios::binary);
+    f << "{\"api_version\":1,\"name\":\"huge\",\"pad\":\"";
+    std::string chunk(64 * 1024, 'x');
+    for (int i = 0; i < 80; ++i) f << chunk;   // ~5 MiB of padding
+    f << "\"}";
+  }
+
+  plugin::Registry& reg = plugin::Registry::instance();
+  reg.reset_to_builtins();
+  auto manifests = plugin::discover_and_load_plugins(
+      [](std::string_view, PluginKind) { return true; }, root.string());
+
+  // Discovered (for the panel) but not ok — rejected as too large, nothing registered.
+  REQUIRE(manifests.size() == 1);
+  CHECK_FALSE(manifests[0].ok);
+  CHECK(manifests[0].error.find("too large") != std::string::npos);
+
+  reg.reset_to_builtins();
+  fs::remove_all(root);
+}
+
 TEST_CASE("reset_to_builtins drops a registered declarative plugin") {
   namespace fs = std::filesystem;
   fs::path root = fs::temp_directory_path() / "nv_plugtest2";

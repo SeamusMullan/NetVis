@@ -67,6 +67,13 @@ TEST_CASE("WASM parser: can_parse + parse builds a model, zero payload reads") {
   // The toy created one graph and recorded one tensor.
   REQUIRE(m.graphs.size() >= 1);
   CHECK(m.graphs[0].initializers.size() == 1);
+  // It also adds one node with one int attribute — exercising the attribute /
+  // edge-ref caps' happy path (the caps must not reject a legitimate single attr).
+  REQUIRE(m.graphs[0].nodes.size() == 1);
+  CHECK(m.graphs[0].nodes[0].attributes.count == 1);
+  REQUIRE(m.graphs[0].attributes.size() == 1);
+  CHECK(m.graphs[0].attributes[0].value.kind == ir::AttrValue::Kind::Int);
+  CHECK(m.graphs[0].attributes[0].value.i == 42);
   // The structural parse reads NO weight payload (the toy records offset+len only;
   // host_read_range is never called, so the counter stays 0).
   CHECK(ByteReader::payload_read_counter() == 0);
