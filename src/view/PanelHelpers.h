@@ -52,5 +52,13 @@ int32_t display_index_for_node(const CollapseTree& collapse, uint32_t ir_node);
 struct BoxCenter { float x = 0.0f; float y = 0.0f; };
 BoxCenter box_center_for_display(const LayoutResult* layout, int32_t display_id);
 
+// #57 (v0.8.2): serialize one leaf node to a JSON string — op_type, name,
+// attributes (typed), and input/output value shapes+dtypes. Structural only (no
+// payload bytes; a Tensor attribute is emitted as its dtype+shape, not values).
+// Hand-built (no nlohmann in the view hot-path headers); values are JSON-escaped.
+// `gi` is the graph index the node lives in; returns "{}" if indices are OOB.
+std::string node_to_json(const ir::Model& model, const ir::Graph& g,
+                         const ir::Node& node);
+
 }  // namespace panel_detail
 }  // namespace netvis

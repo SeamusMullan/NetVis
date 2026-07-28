@@ -169,6 +169,12 @@ struct ViewState {
   bool show_layer_bands = false;
   // #18: show a shape/dtype tooltip when hovering an edge (no click). Persisted.
   bool edge_tooltips = true;
+
+  // --- v0.8.2 additions (append-only) ----------------------------------------
+  // #53: persistent search-results panel visibility (dockable; distinct from the
+  // transient Ctrl+F overlay). Its query is shared with the overlay via
+  // search_query, so typing in either updates both. Toggled from the View menu.
+  bool show_search_results = false;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather
@@ -269,6 +275,16 @@ class App {
   // Prompt for a path then export (used by the File menu + command palette).
   void export_view_dialog();
 
+  // #56 (v0.8.2): a shareable view-state file (.netvis-view JSON) capturing the
+  // camera pose, nav filters/overlays, and selection so a view can be reproduced.
+  // save_ writes the ACTIVE tab's state; load_ applies it to the active tab (best-
+  // effort; unknown/missing fields keep current values). The *_dialog variants
+  // prompt for a path (File menu + command palette).
+  void save_view_state(const std::string& path);
+  void load_view_state(const std::string& path);
+  void save_view_state_dialog();
+  void load_view_state_dialog();
+
   // Recent files (persisted next to layout cache, spec §8.7).
   const std::vector<std::string>& recent_files() const { return recent_; }
 
@@ -327,7 +343,8 @@ class App {
 void draw_graph_canvas(App& app);       // GraphCanvas.cpp (ImDrawList + culling)
 void draw_properties_panel(App& app);   // PropertiesPanel.cpp
 void draw_weight_inspector(App& app);   // WeightInspector.cpp
-void draw_search_bar(App& app);         // SearchBar.cpp
+void draw_search_bar(App& app);         // SearchBar.cpp (Ctrl+F overlay)
+void draw_search_results_panel(App& app); // SearchBar.cpp (#53 persistent panel)
 void draw_minimap(App& app);            // Minimap.cpp (drawn inside canvas)
 void draw_tensor_table(App& app);       // TensorTable.cpp (has_graph == false)
 void draw_status_bar(App& app);         // StatusBar.cpp

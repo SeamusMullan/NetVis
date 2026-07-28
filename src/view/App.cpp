@@ -92,6 +92,7 @@
 #include "view/CostPanel.h"
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
+#include "view/PanelHelpers.h"  // #56: display_index_for_node (re-select on load)
 #include "view/PluginsPanel.h"
 
 // tinyfiledialogs ships only a .c/.h that is NOT on our include path; its two
@@ -431,6 +432,9 @@ void App::frame() {
       }
       ImGui::Separator();
       if (ImGui::MenuItem("Export View PNG...")) export_view_dialog();
+      // #56 (v0.8.2): shareable view-state file (camera + filters + selection).
+      if (ImGui::MenuItem("Save View State...")) save_view_state_dialog();
+      if (ImGui::MenuItem("Load View State...")) load_view_state_dialog();
       ImGui::Separator();
       if (ImGui::MenuItem("Exit")) glfwSetWindowShouldClose(window_, GLFW_TRUE);
       ImGui::EndMenu();
@@ -464,6 +468,8 @@ void App::frame() {
         ImGui::MenuItem("Op legend", nullptr, &view().nav->show_legend);
         ImGui::MenuItem("Bookmarks", nullptr, &view().nav->show_bookmarks);
       }
+      // #53 (v0.8.2): persistent search-results panel (all hits, click to fly).
+      ImGui::MenuItem("Search results", nullptr, &view().show_search_results);
       ImGui::Separator();
       // #21 (v0.8.1): global collapse/expand of all repeated-block groups.
       if (ImGui::MenuItem("Collapse all blocks", "C"))
@@ -513,6 +519,7 @@ void App::frame() {
   draw_properties_panel(*this);
   draw_weight_inspector(*this);
   draw_search_bar(*this);
+  draw_search_results_panel(*this);  // #53: persistent results panel (self-hides)
   draw_status_bar(*this);
   draw_toasts(*this);
   draw_command_palette(*this);   // #59: Ctrl+P fuzzy action palette (drawn on top)
@@ -745,6 +752,132 @@ void App::export_view_dialog() {
   char* out =
       tinyfd_saveFileDialog("Export view", "netvis.png", 1, filters, "PNG image");
   if (out != nullptr) export_view_png(out);
+}
+
+// --- #56 shareable view-state file (.netvis-view JSON) ----------------------
+void App::save_view_state_dialog() {
+  const char* filters[] = {"*.netvis-view"};
+  char* out = tinyfd_saveFileDialog("Save view state", "view.netvis-view", 1,
+                                    filters, "NetVis view");
+  if (out != nullptr) save_view_state(out);
+}
+
+void App::load_view_state_dialog() {
+  const char* filters[] = {"*.netvis-view"};
+  char* picked = tinyfd_openFileDialog("Load view state", "", 1, filters,
+                                       "NetVis view", 0);
+  if (picked != nullptr) load_view_state(picked);
+}
+
+void App::save_view_state(const std::string& path) {
+  ViewState& vs = view();
+  ModelSession& s = session();
+  nlohmann::json j;
+  j["kind"] = "netvis-view";
+  j["version"] = 1;
+  j["model"] = s.path();          // informational — which model this view was for
+  j["graph"] = s.current_graph();
+  j["cam"] = {{"pan_x", vs.cam.pan.x}, {"pan_y", vs.cam.pan.y},
+              {"zoom", vs.cam.zoom}};
+  j["hide_const_edges"] = vs.hide_const_edges;
+  j["show_layer_bands"] = vs.show_layer_bands;
+  if (vs.nav) {
+    j["category_mask"] = vs.nav->category_mask;
+    j["path_a"] = vs.nav->path_a;   // stable IR node indices (see GraphNav.h #15)
+    j["path_b"] = vs.nav->path_b;
+  }
+  // Selection stored as a STABLE IR node index (display ids shift on collapse).
+  int32_t sel_ir = -1;
+  const auto& disp = s.collapse().display_nodes();
+  if (vs.selected_display >= 0 &&
+      static_cast<size_t>(vs.selected_display) < disp.size() &&
+      !disp[static_cast<size_t>(vs.selected_display)].is_group)
+    sel_ir = static_cast<int32_t>(disp[static_cast<size_t>(vs.selected_display)].ir_node);
+  j["selected_ir_node"] = sel_ir;
+
+  std::ofstream f(path);
+  if (f) {
+    f << j.dump(2);
+    add_toast("View saved", false);
+  } else {
+    add_toast("Could not write view file", true);
+  }
+}
+
+void App::load_view_state(const std::string& path) {
+  std::ifstream f(path);
+  if (!f) { add_toast("Could not open view file", true); return; }
+  ViewState& vs = view();
+  ModelSession& s = session();
+  try {
+    nlohmann::json j;
+    f >> j;
+    if (!j.is_object() || j.value("kind", "") != "netvis-view") {
+      add_toast("Not a NetVis view file", true);
+      return;
+    }
+
+    // Model-agnostic view state (camera, display toggles, category filter) always
+    // applies. Model-SPECIFIC state (graph dive, selection, path endpoints — all
+    // keyed by IR node index) only applies when the file was saved for the model
+    // currently loaded; otherwise those indices denote unrelated nodes in a
+    // different model (bounds-checked, so no UB, but a confidently-wrong view).
+    if (j.contains("cam") && j["cam"].is_object()) {
+      const auto& c = j["cam"];
+      vs.cam.pan.x = c.value("pan_x", vs.cam.pan.x);
+      vs.cam.pan.y = c.value("pan_y", vs.cam.pan.y);
+      vs.cam.zoom = c.value("zoom", vs.cam.zoom);
+      vs.animating = false;
+    }
+    if (j.contains("hide_const_edges") && j["hide_const_edges"].is_boolean())
+      vs.hide_const_edges = j["hide_const_edges"].get<bool>();
+    if (j.contains("show_layer_bands") && j["show_layer_bands"].is_boolean())
+      vs.show_layer_bands = j["show_layer_bands"].get<bool>();
+    if (!vs.nav) vs.nav = std::make_unique<GraphNavState>();
+    if (j.contains("category_mask") && j["category_mask"].is_number_unsigned())
+      vs.nav->category_mask = j["category_mask"].get<uint32_t>();
+
+    const ir::Model* m = s.model();
+    const std::string saved_model = j.value("model", std::string());
+    const bool same_model = m != nullptr && saved_model == s.path();
+    if (!same_model) {
+      add_toast(m == nullptr ? "View loaded (open a model to restore selection)"
+                             : "View loaded (camera only — saved for another model)",
+                false);
+      return;
+    }
+
+    // Same model: restore the graph dive, path endpoints, and selection.
+    uint32_t g = s.current_graph();
+    if (j.contains("graph") && j["graph"].is_number_unsigned()) {
+      uint32_t gg = j["graph"].get<uint32_t>();
+      if (gg < m->graphs.size() && gg != s.current_graph()) {
+        s.push_graph(gg);
+        g = gg;
+      }
+    }
+    if (j.contains("path_a") && j["path_a"].is_number_integer())
+      vs.nav->path_a = j["path_a"].get<int32_t>();
+    if (j.contains("path_b") && j["path_b"].is_number_integer())
+      vs.nav->path_b = j["path_b"].get<int32_t>();
+    // Bind nav ownership to the graph we just applied IR-index state for, so
+    // ensure_nav's cross-graph guard does not wipe path_a/path_b this frame (it
+    // clears IR-index nav collections when owner_graph != current graph — the
+    // just-loaded endpoints belong to `g`, so claim ownership).
+    vs.nav->owner_generation = s.generation();
+    vs.nav->owner_graph = g;
+    if (j.contains("selected_ir_node") && j["selected_ir_node"].is_number_integer()) {
+      int32_t ir_node = j["selected_ir_node"].get<int32_t>();
+      if (ir_node >= 0) {
+        int32_t d = panel_detail::display_index_for_node(
+            s.collapse(), static_cast<uint32_t>(ir_node));
+        if (d >= 0) vs.selected_display = d;
+      }
+    }
+    add_toast("View loaded", false);
+  } catch (...) {
+    add_toast("Corrupt view file", true);
+  }
 }
 
 void App::export_view_png(const std::string& path) {

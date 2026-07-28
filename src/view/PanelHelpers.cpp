@@ -2,6 +2,7 @@
 #include "view/PanelHelpers.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 
 namespace netvis {
@@ -91,6 +92,153 @@ BoxCenter box_center_for_display(const LayoutResult* layout, int32_t display_id)
       return out;
     }
   }
+  return out;
+}
+
+namespace {
+
+// Append `s` as a JSON string literal (quotes + minimal escaping) to `out`.
+void json_escape_to(std::string& out, std::string_view s) {
+  out.push_back('"');
+  for (char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out.push_back(c);
+        }
+    }
+  }
+  out.push_back('"');
+}
+
+// "dtype [shape]" — a value's type summary as a JSON object {"name","dtype","shape"}.
+void append_value_json(std::string& out, const ir::Model& model,
+                       const ir::Graph& g, uint32_t value_idx) {
+  out += "{";
+  if (value_idx < g.values.size()) {
+    const ir::ValueInfo& vi = g.values[value_idx];
+    out += "\"name\":";
+    json_escape_to(out, model.str(vi.name));
+    out += ",\"dtype\":";
+    json_escape_to(out, ir::dtype_name(vi.dtype));
+    out += ",\"shape\":";
+    json_escape_to(out, shape_string(vi.shape));
+  } else {
+    out += "\"name\":null";
+  }
+  out += "}";
+}
+
+}  // namespace
+
+std::string node_to_json(const ir::Model& model, const ir::Graph& g,
+                         const ir::Node& node) {
+  std::string out;
+  out.reserve(256);
+  out += "{\"op\":";
+  json_escape_to(out, model.str(node.op_type));
+  out += ",\"name\":";
+  json_escape_to(out, model.str(node.name));
+
+  // Attributes (typed). Reuse the same one-line rendering rules as the panel.
+  out += ",\"attributes\":{";
+  bool first = true;
+  for (uint32_t a = 0; a < node.attributes.count; ++a) {
+    uint32_t ai = node.attributes.begin + a;
+    if (ai >= g.attributes.size()) break;
+    const ir::Attribute& attr = g.attributes[ai];
+    if (!first) out += ",";
+    first = false;
+    json_escape_to(out, model.str(attr.name));
+    out += ":";
+    const ir::AttrValue& v = attr.value;
+    char buf[64];
+    switch (v.kind) {
+      case ir::AttrValue::Kind::None: out += "null"; break;
+      case ir::AttrValue::Kind::Int:
+        out += std::to_string(v.i);
+        break;
+      case ir::AttrValue::Kind::Float:
+        // JSON has no inf/nan literal; emit null for non-finite so the output
+        // stays parseable.
+        if (std::isfinite(v.f)) {
+          std::snprintf(buf, sizeof(buf), "%g", v.f);
+          out += buf;
+        } else {
+          out += "null";
+        }
+        break;
+      case ir::AttrValue::Kind::String:
+        json_escape_to(out, model.str(v.s));
+        break;
+      case ir::AttrValue::Kind::Ints: {
+        out += "[";
+        for (size_t i = 0; i < v.ints.size(); ++i) {
+          if (i) out += ",";
+          out += std::to_string(v.ints[i]);
+        }
+        out += "]";
+        break;
+      }
+      case ir::AttrValue::Kind::Floats: {
+        out += "[";
+        for (size_t i = 0; i < v.floats.size(); ++i) {
+          if (i) out += ",";
+          if (std::isfinite(v.floats[i])) {
+            std::snprintf(buf, sizeof(buf), "%g", v.floats[i]);
+            out += buf;
+          } else {
+            out += "null";
+          }
+        }
+        out += "]";
+        break;
+      }
+      case ir::AttrValue::Kind::Strings: {
+        out += "[";
+        for (size_t i = 0; i < v.strings.size(); ++i) {
+          if (i) out += ",";
+          json_escape_to(out, model.str(v.strings[i]));
+        }
+        out += "]";
+        break;
+      }
+      case ir::AttrValue::Kind::Tensor: {
+        out += "{\"dtype\":";
+        json_escape_to(out, ir::dtype_name(v.tensor.dtype));
+        out += ",\"shape\":";
+        json_escape_to(out, shape_string(v.tensor.shape));
+        out += "}";
+        break;
+      }
+      case ir::AttrValue::Kind::Graph:
+        out += "\"<subgraph>\"";
+        break;
+    }
+  }
+  out += "}";
+
+  // Input / output value type summaries (structural — no payload reads).
+  out += ",\"inputs\":[";
+  for (uint32_t s = 0; s < node.inputs.count; ++s) {
+    if (s) out += ",";
+    append_value_json(out, model, g, resolve_edge_value(g, node.inputs, s));
+  }
+  out += "],\"outputs\":[";
+  for (uint32_t s = 0; s < node.outputs.count; ++s) {
+    if (s) out += ",";
+    append_value_json(out, model, g, resolve_edge_value(g, node.outputs, s));
+  }
+  out += "]}";
   return out;
 }
 
