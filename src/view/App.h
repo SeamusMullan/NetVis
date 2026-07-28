@@ -154,6 +154,14 @@ struct ViewState {
   // key loads as Flops (backward compatible with pre-0.4.0 pref files). Enum lives
   // in engine/HeatmapGradient.h, already included by this header.
   HeatmapMetric heatmap_metric = HeatmapMetric::Flops;
+
+  // --- v0.8.0 additions (append-only) ----------------------------------------
+  // #60: Properties-panel attribute-name filter. Per-tab (lives here rather than
+  // as a panel-local static) so switching tabs never carries a stale filter onto
+  // another model's node. Cleared by draw_attributes when the selected node
+  // changes; attr_filter_key records what node the text was typed against.
+  std::string attr_filter;
+  uint64_t attr_filter_key = UINT64_MAX;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather

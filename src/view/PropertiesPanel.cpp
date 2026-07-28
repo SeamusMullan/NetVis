@@ -80,9 +80,9 @@ void draw_value_row(App& app, const ir::Model& model, const ir::Graph& g,
 
 // Render the typed attribute table for a node (spec §8.2). #60: a filter box lets
 // the user narrow long attribute lists by name (match on attr name; a common ask
-// for big fused ops with dozens of attrs). Filter state is a panel-local static
-// (single Properties panel, main-thread ImGui) so App's frozen ViewState is
-// untouched; it is cleared whenever the selected node changes.
+// for big fused ops with dozens of attrs). Filter state lives in the active tab's
+// ViewState (per-tab, v0.8.0 #62) so switching tabs never carries a stale filter
+// onto another model; it is also cleared whenever the selected node changes.
 void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
                      const ir::Node& node) {
   if (node.attributes.count == 0) {
@@ -90,26 +90,31 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
     return;
   }
 
-  // Panel-local filter buffer, reset when the selected node changes so the box
-  // never carries a stale filter onto a different node. Keyed by (graph,node).
-  static char filter_buf[64] = {0};
-  static uint64_t filter_key = UINT64_MAX;
+  ViewState& vs = app.view();
+
+  // Reset the filter when the selected node changes so the box never carries a
+  // stale filter onto a different node. Keyed by (graph,node).
   const uint64_t this_key =
       (static_cast<uint64_t>(app.session().current_graph()) << 32) |
       static_cast<uint64_t>(&node - g.nodes.data());
-  if (this_key != filter_key) {
-    filter_key = this_key;
-    filter_buf[0] = '\0';
+  if (this_key != vs.attr_filter_key) {
+    vs.attr_filter_key = this_key;
+    vs.attr_filter.clear();
   }
 
   // Only show the filter box once there are enough attributes to warrant it.
+  // Char buffer synced to vs.attr_filter (imgui_stdlib not built), as in the
+  // tensor table.
   const bool show_filter = node.attributes.count > 6;
   if (show_filter) {
+    char filter_buf[64];
+    std::snprintf(filter_buf, sizeof(filter_buf), "%s", vs.attr_filter.c_str());
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputTextWithHint("##attr_filter", "filter attributes...", filter_buf,
-                             sizeof(filter_buf));
+    if (ImGui::InputTextWithHint("##attr_filter", "filter attributes...",
+                                 filter_buf, sizeof(filter_buf)))
+      vs.attr_filter = filter_buf;
   }
-  const std::string_view needle(filter_buf);  // icontains folds case on both sides
+  const std::string_view needle(vs.attr_filter);  // icontains folds case both sides
 
   const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                 ImGuiTableFlags_SizingStretchProp;
@@ -205,7 +210,7 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
   }
   ImGui::EndTable();
   if (shown == 0 && !needle.empty())
-    ImGui::TextDisabled("(no attributes match \"%s\")", filter_buf);
+    ImGui::TextDisabled("(no attributes match \"%s\")", vs.attr_filter.c_str());
 }
 
 // The MODEL ROOT view shown when nothing is selected (spec §8.2).
