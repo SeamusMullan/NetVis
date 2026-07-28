@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"  // ImBezierCubicClosestPoint (#18 edge hit-test)
 
 #include "engine/OpCategory.h"
 #include "engine/plugin/Registry.h"
@@ -119,6 +120,40 @@ const ReadabilityCache& readability_cache(App& app) {
   return cache;
 }
 
+// #20 depth-ruler cache: per-Sugiyama-layer world-space vertical extents [lo,hi].
+// These are a pure function of the published layout (independent of the camera),
+// so we rebuild them ONLY when a new layout is published — keyed by the layout's
+// structure+collapse hashes — rather than re-scanning all boxes every frame.
+struct LayerBandCache {
+  uint64_t key_structure = UINT64_MAX;
+  uint64_t key_collapse = UINT64_MAX;
+  bool valid = false;
+  std::vector<float> lo, hi;  // indexed by layer
+};
+
+const LayerBandCache& layer_band_cache(const LayoutResult& layout) {
+  static LayerBandCache cache;
+  if (cache.valid && cache.key_structure == layout.structure_hash &&
+      cache.key_collapse == layout.collapse_hash)
+    return cache;
+  cache.key_structure = layout.structure_hash;
+  cache.key_collapse = layout.collapse_hash;
+  cache.valid = true;
+  cache.lo.clear();
+  cache.hi.clear();
+  for (const NodeBox& b : layout.boxes) {
+    if (b.layer < 0) continue;
+    size_t L = static_cast<size_t>(b.layer);
+    if (L >= cache.lo.size()) {
+      cache.lo.resize(L + 1, FLT_MAX);
+      cache.hi.resize(L + 1, -FLT_MAX);
+    }
+    cache.lo[L] = std::min(cache.lo[L], b.pos.y);
+    cache.hi[L] = std::max(cache.hi[L], b.pos.y + b.size.y);
+  }
+  return cache;
+}
+
 // Badge glyph size tracks zoom like the node label text (clamped).
 float text_px_for_badge(float zoom) {
   return std::clamp(11.0f * zoom, 11.0f * 0.5f, 11.0f * 3.0f);
@@ -147,6 +182,17 @@ float ease(float t) { return t * t * (3.0f - 2.0f * t); }
 bool aabb_overlap(ImVec2 amin, ImVec2 amax, ImVec2 bmin, ImVec2 bmax) {
   return amin.x <= bmax.x && amax.x >= bmin.x && amin.y <= bmax.y &&
          amax.y >= bmin.y;
+}
+
+// Squared distance from `p` to the cubic bezier (p0..p3), via ImGui's
+// closest-point helper (samples `steps` segments). Used by the #18 edge-hover
+// hit-test; only called for visible edges when the tooltip is enabled and no node
+// is under the cursor.
+float dist_sq_point_bezier(ImVec2 p, ImVec2 p0, ImVec2 p1, ImVec2 p2, ImVec2 p3,
+                           int steps) {
+  ImVec2 c = ImBezierCubicClosestPoint(p0, p1, p2, p3, p, steps);
+  float dx = c.x - p.x, dy = c.y - p.y;
+  return dx * dx + dy * dy;
 }
 
 // Blend two packed colors by t in [0,1].
@@ -330,6 +376,30 @@ void draw_graph_canvas(App& app) {
 
   const Fonts& fonts = app.fonts();
 
+  // --- #20 Depth ruler: faint per-layer bands --------------------------------
+  // Reads NodeBox::layer (already produced by the Sugiyama layout). We derive each
+  // layer's world-space vertical extent [top,bottom] in one O(boxes) pass, then
+  // draw alternating faint bands so graph DEPTH is legible at a glance. Toggle via
+  // view().show_layer_bands (View menu). Skipped at very low zoom (bands would be
+  // sub-pixel) and drawn UNDER edges/nodes.
+  if (vs.show_layer_bands && zoom >= kZoomFlat) {
+    // Per-layer extents are cached (rebuilt only on a new layout), so per frame we
+    // just transform + draw O(layers) bands — no O(boxes) rescan.
+    const LayerBandCache& lb = layer_band_cache(*layout);
+    const ImU32 band = dark ? IM_COL32(255, 255, 255, 8)
+                            : IM_COL32(20, 30, 50, 10);
+    for (size_t L = 0; L < lb.lo.size(); ++L) {
+      if (L % 2 == 1) continue;             // every other layer gets a tint.
+      if (lb.lo[L] == FLT_MAX) continue;    // empty layer.
+      // World y-range -> screen; the band spans the full canvas width.
+      ImVec2 top = world_to_screen(cam, origin, ImVec2(vw_min.x, lb.lo[L]));
+      ImVec2 bot = world_to_screen(cam, origin, ImVec2(vw_max.x, lb.hi[L]));
+      // Cull bands fully outside the canvas vertically.
+      if (bot.y < origin.y || top.y > canvas_max.y) continue;
+      dl->AddRectFilled(ImVec2(origin.x, top.y), ImVec2(canvas_max.x, bot.y), band);
+    }
+  }
+
   // --- Navigation masks + readability cache (display-id indexed) -------------
   // ensure_nav() (called from App::frame before us) keeps these in sync; guard
   // for a null nav or a stale-size mask across a display-list rebuild this frame.
@@ -382,8 +452,16 @@ void draw_graph_canvas(App& app) {
   // --- Draw edges first (under nodes) ----------------------------------------
   // PERF: skip any edge whose endpoints' bounding box is fully outside view.
   const float edge_thick = std::clamp(1.5f * zoom, 0.75f, 3.0f);
-  const bool draw_edge_labels = zoom > kZoomFull;
+  // #18 edge hover: only hit-test edges when the tooltip is enabled, the canvas is
+  // hovered, and NO node is under the cursor (nodes win). Track the nearest edge.
+  const bool want_edge_hover =
+      vs.edge_tooltips && canvas_hovered && hover_box < 0 && zoom >= kZoomFlat;
+  int32_t hover_edge = -1;
+  float hover_edge_d2 = FLT_MAX;
+  const float kEdgePickPx = 6.0f;  // pointer must be within this many px of a curve
+  int32_t edge_idx = -1;
   for (const EdgeCurve& e : layout->edges) {
+    ++edge_idx;
     // Feature 2: skip edges whose source is a hidden constant/initializer box.
     // Also cull edges touching a nav-hidden endpoint.
     if (is_const_source(e.from_display_id)) continue;
@@ -407,10 +485,34 @@ void draw_graph_canvas(App& app) {
     if (edge_dim && !touches_hover) ec = with_alpha_mul(ec, kDimAlpha);
     dl->AddBezierCubic(p0, p1, p2, p3, ec, th);
 
-    // Edge shape label (highest LOD only) placed near the curve midpoint.
-    if (draw_edge_labels && fonts.small != nullptr) {
-      // Only bother when there's room; label the producing value's shape later.
-      // (Shape text is model-derived; kept minimal here to stay O(visible).)
+    // #18: track the nearest edge under the cursor (screen space).
+    if (want_edge_hover) {
+      float d2 = dist_sq_point_bezier(mouse, p0, p1, p2, p3, 12);
+      if (d2 < hover_edge_d2) {
+        hover_edge_d2 = d2;
+        hover_edge = edge_idx;
+      }
+    }
+  }
+
+  // #18: shape/dtype tooltip for the hovered edge. Uses the value_index the layout
+  // recorded on the edge (frozen Layout.h contract) to look up the ValueInfo in the
+  // current graph — pure structural read, no payload bytes.
+  if (want_edge_hover && hover_edge >= 0 &&
+      hover_edge_d2 <= kEdgePickPx * kEdgePickPx) {
+    const EdgeCurve& e = layout->edges[static_cast<size_t>(hover_edge)];
+    const ir::Model* m = session.model();
+    uint32_t gi = session.current_graph();
+    if (m != nullptr && gi < m->graphs.size() &&
+        e.value_index != UINT32_MAX &&
+        e.value_index < m->graphs[gi].values.size()) {
+      const ir::ValueInfo& vi = m->graphs[gi].values[e.value_index];
+      std::string_view nm = m->str(vi.name);
+      ImGui::BeginTooltip();
+      if (!nm.empty()) ImGui::TextUnformatted(std::string(nm).c_str());
+      ImGui::Text("%s  %s", panel_detail::shape_string(vi.shape).c_str(),
+                  ir::dtype_name(vi.dtype));
+      ImGui::EndTooltip();
     }
   }
 
@@ -571,9 +673,20 @@ void draw_graph_canvas(App& app) {
   dl->PopClipRect();
 
   // --- Interactions ----------------------------------------------------------
+  // #17: record a leaf-node selection in the focus history so back/forward can
+  // step through visited nodes. Maps a display id to its stable IR node index.
+  auto record_focus_for_display = [&](int32_t disp_id) {
+    if (disp_id < 0) return;
+    const auto& disp = session.collapse().display_nodes();
+    if (static_cast<size_t>(disp_id) >= disp.size()) return;
+    const DisplayNode& dn = disp[static_cast<size_t>(disp_id)];
+    if (!dn.is_group) nav_record_focus(app, dn.ir_node);
+  };
+
   if (canvas_hovered) {
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !space) {
       vs.selected_display = hover_box;  // -1 clears when clicking empty space.
+      record_focus_for_display(hover_box);
     }
     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hover_box >= 0) {
       const auto& disp = session.collapse().display_nodes();
@@ -604,10 +717,35 @@ void draw_graph_canvas(App& app) {
         const DisplayNode& dn = disp[static_cast<size_t>(vs.selected_display)];
         if (dn.is_group && ImGui::MenuItem("Expand / collapse"))
           session.toggle_group(dn.group_index);
+
+        // #15 path-between + #19 pin operate on a leaf node's STABLE IR index (a
+        // display id would be repointed by a later collapse/expand — see #15 in
+        // GraphNav.h). vs.nav is non-null here (ensure_nav ran before the canvas).
+        if (!dn.is_group && vs.nav) {
+          ImGui::Separator();
+          if (ImGui::MenuItem("Path: set as A"))
+            vs.nav->path_a = static_cast<int32_t>(dn.ir_node);
+          if (ImGui::MenuItem("Path: set as B"))
+            vs.nav->path_b = static_cast<int32_t>(dn.ir_node);
+          if (vs.nav->path_active() && ImGui::MenuItem("Path: clear")) {
+            vs.nav->path_a = -1;
+            vs.nav->path_b = -1;
+          }
+          ImGui::Separator();
+          const bool pinned =
+              std::find(vs.nav->pinned.begin(), vs.nav->pinned.end(),
+                        dn.ir_node) != vs.nav->pinned.end();
+          if (ImGui::MenuItem(pinned ? "Unpin node" : "Pin node"))
+            nav_toggle_pin(app, dn.ir_node);
+        }
       }
     }
     ImGui::EndPopup();
   }
+
+  // #19: pinned-node strip along the canvas top edge (screen-space overlay). Drawn
+  // over nodes so pins stay visible while panning a huge graph.
+  draw_pinned_strip(app, origin, canvas_size);
 
   // Minimap is drawn inside the same child region, inset bottom-right.
   draw_minimap(app);

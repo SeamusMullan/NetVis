@@ -162,6 +162,13 @@ struct ViewState {
   // changes; attr_filter_key records what node the text was typed against.
   std::string attr_filter;
   uint64_t attr_filter_key = UINT64_MAX;
+
+  // --- v0.8.1 additions (append-only) ----------------------------------------
+  // #20: draw faint per-Sugiyama-layer bands in the canvas (depth ruler). Pure
+  // view toggle over NodeBox::layer; persisted in view_prefs.json.
+  bool show_layer_bands = false;
+  // #18: show a shape/dtype tooltip when hovering an edge (no click). Persisted.
+  bool edge_tooltips = true;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather

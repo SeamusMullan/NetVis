@@ -300,15 +300,23 @@ void ModelSession::cancel_layout() {
   if (stage_ == LoadStage::Laying) progress_.request_cancel();
 }
 
-void ModelSession::toggle_group(uint32_t group_index) {
-  // MAIN THREAD. Toggle then re-layout the whole current collapse view. A full
-  // re-layout is fine here: at collapsed sizes the display-node count is small,
-  // so recomputing everything is sub-frame — simpler than region-incremental.
-  if (collapse_.toggle_group(group_index)) {
-    stage_ = (stage_ == LoadStage::Ready) ? LoadStage::Laying : stage_;
-    request_layout();
-  }
+void ModelSession::relayout_if_changed(bool display_changed) {
+  // MAIN THREAD. Shared by toggle_group/collapse_all/expand_all: when a collapse
+  // op changed the display list, re-layout the whole current collapse view. A full
+  // re-layout is fine here: at collapsed sizes the display-node count is small, so
+  // recomputing everything is sub-frame — simpler than region-incremental.
+  if (!display_changed) return;
+  stage_ = (stage_ == LoadStage::Ready) ? LoadStage::Laying : stage_;
+  request_layout();
 }
+
+void ModelSession::toggle_group(uint32_t group_index) {
+  relayout_if_changed(collapse_.toggle_group(group_index));
+}
+
+void ModelSession::collapse_all() { relayout_if_changed(collapse_.collapse_all()); }
+
+void ModelSession::expand_all() { relayout_if_changed(collapse_.expand_all()); }
 
 void ModelSession::push_graph(uint32_t graph_index) {
   // MAIN THREAD: dive into a subgraph, remembering where we came from.

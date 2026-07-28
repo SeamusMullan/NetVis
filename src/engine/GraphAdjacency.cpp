@@ -146,4 +146,45 @@ std::vector<uint32_t> GraphAdjacency::reachable_pred(uint32_t start,
   return bfs(pred_off_, pred_val_, node_count_, start, max_hops, cap);
 }
 
+std::vector<uint32_t> GraphAdjacency::nodes_on_paths_between(uint32_t a,
+                                                             uint32_t b,
+                                                             uint32_t cap) const {
+  std::vector<uint32_t> out;
+  if (a == b || a >= node_count_ || b >= node_count_) return out;
+
+  // Mark, in `on_path`, every node lying on some directed path for a given
+  // orientation (up -> .. -> down). A node n qualifies iff n is forward-
+  // reachable from `up` (inclusive of up) AND backward-reachable from `down`
+  // (inclusive of down). We first require `down` to be forward-reachable from
+  // `up`, else no connecting path exists for this orientation and it adds
+  // nothing. Both BFS walks are cap-bounded to protect the frame budget.
+  std::vector<uint8_t> on_path(node_count_, 0);
+  auto accumulate = [&](uint32_t up, uint32_t down) {
+    std::vector<uint32_t> fwd = reachable_succ(up, UINT32_MAX, cap);
+    // Connecting forward path exists only if `down` is among up's successors.
+    if (!std::binary_search(fwd.begin(), fwd.end(), down)) return;
+
+    // S = forward-reachable from up, inclusive of up.
+    std::vector<uint8_t> in_s(node_count_, 0);
+    in_s[up] = 1;
+    for (uint32_t n : fwd) in_s[n] = 1;
+
+    // P = backward-reachable from down, inclusive of down. Intersect with S.
+    // up and down bound the path and are in S∩P, so include them directly.
+    on_path[up] = 1;
+    on_path[down] = 1;
+    std::vector<uint32_t> bwd = reachable_pred(down, UINT32_MAX, cap);
+    for (uint32_t n : bwd)
+      if (in_s[n]) on_path[n] = 1;
+  };
+
+  accumulate(a, b);  // ordering 1: a upstream, b downstream
+  accumulate(b, a);  // ordering 2: b upstream, a downstream
+
+  // Collect set bits: naturally ascending and deduped.
+  for (uint32_t n = 0; n < node_count_; ++n)
+    if (on_path[n]) out.push_back(n);
+  return out;
+}
+
 }  // namespace netvis

@@ -53,6 +53,16 @@ class CollapseTree {
   // display list changed (view should request a re-layout of the region).
   bool toggle_group(uint32_t group_index);
 
+  // #21: global collapse/expand. collapse_all() collapses EVERY detected group;
+  // expand_all() expands them all (the default post-build state). Rebuilds the
+  // display list. Returns true if the display list actually changed (so the view
+  // knows to request a re-layout) — false if already in that state or no groups
+  // exist. Groups are FLAT (not nested), so "expand to depth N" degenerates to
+  // expand_all here; reading graph DEPTH at a glance is the layer-band ruler
+  // (#20), a view overlay over NodeBox::layer, not a collapse operation.
+  bool collapse_all();
+  bool expand_all();
+
   // Hash of the current collapse state (which groups are expanded) — part of the
   // layout cache key (spec §7.2.7).
   uint64_t collapse_hash() const;

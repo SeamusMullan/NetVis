@@ -36,6 +36,13 @@ struct EdgeCurve {
   uint32_t to_display_id = 0;
   Vec2 p0, p1, p2, p3;
   bool reversed = false;   // set if this edge was reversed to break a cycle
+  // #18: a representative IR value index carried on this edge (the producer's
+  // output consumed by the destination), or UINT32_MAX if none was recorded.
+  // Display edges are deduped per (producer,consumer) display pair, so a single
+  // curve may stand for several IR values between the same two boxes; this holds
+  // the FIRST such value (ascending), enough for the hover shape/dtype tooltip.
+  // Indexes into ir::Graph::values of the layout's graph.
+  uint32_t value_index = UINT32_MAX;
 };
 
 // A completed layout for one collapse level. Published atomically by LayoutJob;
