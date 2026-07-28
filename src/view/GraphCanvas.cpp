@@ -712,6 +712,21 @@ void draw_graph_canvas(App& app) {
             lab.secondary.empty() ? lab.primary : lab.secondary;
         ImGui::SetClipboardText(nm.c_str());
       }
+      // #57: copy the node's op/attrs/input-output shapes as JSON to the clipboard.
+      const ir::Model* cm = session.model();
+      uint32_t cgi = session.current_graph();
+      const auto& cdisp = session.collapse().display_nodes();
+      if (cm != nullptr && cgi < cm->graphs.size() &&
+          static_cast<size_t>(vs.selected_display) < cdisp.size()) {
+        const DisplayNode& cdn = cdisp[static_cast<size_t>(vs.selected_display)];
+        if (!cdn.is_group && cdn.ir_node < cm->graphs[cgi].nodes.size() &&
+            ImGui::MenuItem("Copy as JSON")) {
+          const ir::Graph& cg = cm->graphs[cgi];
+          std::string js =
+              panel_detail::node_to_json(*cm, cg, cg.nodes[cdn.ir_node]);
+          ImGui::SetClipboardText(js.c_str());
+        }
+      }
       const auto& disp = session.collapse().display_nodes();
       if (static_cast<size_t>(vs.selected_display) < disp.size()) {
         const DisplayNode& dn = disp[static_cast<size_t>(vs.selected_display)];

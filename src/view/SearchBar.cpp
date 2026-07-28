@@ -168,6 +168,8 @@ void draw_search_bar(App& app) {
   ImGui::SetNextItemWidth(-FLT_MIN);
   bool changed = ImGui::InputText("##search_query", buf, sizeof(buf),
                                   ImGuiInputTextFlags_EnterReturnsTrue);
+  // #52/#54: field-query syntax hint (kept subtle; the plain fuzzy path still works).
+  ImGui::TextDisabled("op:Conv  name:layer*  dtype:fp16  shape:*224*  params:>1M");
   bool enter_pressed = changed;  // EnterReturnsTrue -> `changed` means submit
   // Detect edits separately (InputText w/ EnterReturnsTrue returns true only on
   // Enter, so compare buffer to the stored query to catch typing).
@@ -179,10 +181,15 @@ void draw_search_bar(App& app) {
   }
 
   // Run the query fresh each frame — cheap enough per spec §7.4 and keeps results
-  // in sync with the live buffer without extra caching state.
+  // in sync with the live buffer without extra caching state. #52/#54: the field-
+  // aware overload handles op:/name:/dtype:/shape:/params: predicates against the
+  // live model, and falls back to the fuzzy path for a bare query.
   std::vector<SearchHit> hits;
   if (model && !vs.search_query.empty()) {
-    hits = index.query(vs.search_query, 100);
+    // types_ready gates dtype/shape/params predicates on shape inference having
+    // published (else those fields are worker-mutated — a data race to read).
+    const bool types_ready = app.session().stage() == LoadStage::Ready;
+    hits = index.query(vs.search_query, *model, types_ready, 100);
   }
 
   // Keyboard navigation over the results.
@@ -237,6 +244,64 @@ void draw_search_bar(App& app) {
   } else if (!vs.search_query.empty()) {
     ImGui::TextDisabled("No matches.");
   }
+
+  ImGui::End();
+}
+
+// #53: persistent, dockable results panel — shows ALL hits for the shared query
+// (not just the fly-to-first overlay). Shares vs.search_query with the Ctrl+F
+// overlay, so typing in either updates both. Self-hides unless show_search_results.
+void draw_search_results_panel(App& app) {
+  ViewState& vs = app.view();
+  if (!vs.show_search_results) return;
+
+  if (!ImGui::Begin("Search results", &vs.show_search_results)) {
+    ImGui::End();
+    return;
+  }
+
+  const ir::Model* model = app.session().model();
+  const SearchIndex& index = app.session().search();
+
+  // Editable query, synced to the SAME vs.search_query the overlay uses.
+  static char buf[256];
+  std::snprintf(buf, sizeof(buf), "%s", vs.search_query.c_str());
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  if (ImGui::InputTextWithHint("##results_query", "search (op:/name:/dtype:/...)",
+                               buf, sizeof(buf)))
+    vs.search_query = buf;
+  ImGui::TextDisabled("op:Conv  name:layer*  dtype:fp16  params:>1M");
+  ImGui::Separator();
+
+  if (model == nullptr || vs.search_query.empty()) {
+    ImGui::TextDisabled("Type a query above.");
+    ImGui::End();
+    return;
+  }
+
+  // Unbounded-ish list (cap generous); click any row to fly there.
+  const bool types_ready = app.session().stage() == LoadStage::Ready;
+  std::vector<SearchHit> hits =
+      index.query(vs.search_query, *model, types_ready, 500);
+  ImGui::TextDisabled("%zu match%s", hits.size(), hits.size() == 1 ? "" : "es");
+
+  if (ImGui::BeginChild("##results_list")) {
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (hits[i].entry >= index.entries().size()) continue;
+      const SearchEntry& e = index.entries()[hits[i].entry];
+      ImGui::PushID(static_cast<int>(i));
+      std::string label = e.display.empty() ? "(anon)" : e.display;
+      if (ImGui::Selectable(label.c_str(), false,
+                            ImGuiSelectableFlags_SpanAllColumns)) {
+        // resolve_hit clears search_open (overlay) but leaves this panel open.
+        resolve_hit(app, e);
+      }
+      ImGui::SameLine();
+      ImGui::TextDisabled("  [%s g%u]", kind_tag(e.kind), e.graph);
+      ImGui::PopID();
+    }
+  }
+  ImGui::EndChild();
 
   ImGui::End();
 }

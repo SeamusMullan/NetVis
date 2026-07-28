@@ -37,6 +37,7 @@ namespace {
 using panel_detail::display_index_for_node;
 using panel_detail::grouped_count;
 using panel_detail::human_bytes;
+using panel_detail::node_to_json;
 using panel_detail::resolve_edge_value;
 using panel_detail::shape_string;
 
@@ -333,6 +334,11 @@ void draw_properties_panel(App& app) {
   ImGui::Text("op:       %s", op.empty() ? "?" : std::string(op).c_str());
   ImGui::Text("name:     %s", name.empty() ? "(unnamed)" : std::string(name).c_str());
   ImGui::Text("category: %s", category_name(cat));
+  // #57: copy the whole node (op/attrs/input-output shapes) as JSON.
+  if (ImGui::SmallButton("Copy as JSON")) {
+    std::string js = panel_detail::node_to_json(*model, g, node);
+    ImGui::SetClipboardText(js.c_str());
+  }
 
   ImGui::SeparatorText("Attributes");
   draw_attributes(app, *model, g, node);
