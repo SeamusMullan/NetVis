@@ -75,6 +75,16 @@ class DiffLoader {
   uint64_t primary_generation() const { return primary_generation_; }
   bool active() const { return state_ == DiffLoadState::Ready && diff_; }
 
+  // Identity of the primary ModelSession this diff was loaded against (#62: with
+  // multi-model tabs, each tab has its OWN session, and per-session generation
+  // counters both start at 0 — so a generation+graph match no longer uniquely
+  // identifies the model. The view must additionally require this equals the
+  // address of the session it is about to tint, or a diff computed for tab A
+  // would paint tab B's unrelated graph). Pointer identity only — NEVER
+  // dereferenced by the view; App clears the diff when this session's tab closes
+  // so the pointer can't dangle. nullptr when no comparison is loaded.
+  const ModelSession* primary_session() const { return primary_session_; }
+
  private:
   JobSystem& jobs_;
   MappedFile file_;
@@ -87,6 +97,7 @@ class DiffLoader {
   std::string path_;
   uint32_t primary_graph_ = 0;
   uint64_t primary_generation_ = UINT64_MAX;  // primary gen at diff-compute time
+  const ModelSession* primary_session_ = nullptr;  // #62: which session (identity)
   uint64_t token_ = 0;  // newest load wins
 };
 

@@ -164,6 +164,27 @@ struct Fonts {
   ImFont* bold = nullptr;    // node op_type / headers
 };
 
+// v0.8.0 (#62): one open model = one Tab. App owns a vector of these and an
+// active index; session()/view()/jobs()/decode() redirect to the active tab so
+// every panel free-function is UNCHANGED. Each tab owns its OWN JobSystem: the
+// generation counter is per-pool, so a slow parse/layout in tab A must never
+// cross-cancel tab B's in-flight jobs (the exact reason the diff pipeline has its
+// own JobSystem — see App.h/DiffLoader.h). Order matters: jobs_ is declared
+// BEFORE session_ so the session (which holds a JobSystem&) is destroyed first;
+// ~Tab shuts the pool down before either dies.
+struct Tab {
+  std::unique_ptr<JobSystem> jobs;
+  std::unique_ptr<ModelSession> session;
+  ViewState view;
+  PendingDecode decode;
+  std::string title;   // basename shown on the tab; "(empty)" until a file opens
+
+  Tab();
+  ~Tab();
+  Tab(const Tab&) = delete;
+  Tab& operator=(const Tab&) = delete;
+};
+
 class App {
  public:
   App();
@@ -187,15 +208,40 @@ class App {
 
   void add_toast(const std::string& text, bool is_error);
 
-  // Accessors used by panel free functions.
-  ModelSession& session() { return *session_; }
-  JobSystem& jobs() { return *jobs_; }
+  // Accessors used by panel free functions — all redirect to the ACTIVE tab
+  // (#62), so panels are agnostic to how many models are open.
+  ModelSession& session() { return *tabs_[active_tab_]->session; }
+  JobSystem& jobs() { return *tabs_[active_tab_]->jobs; }
   // Comparison-model loader for diff mode (v0.2.0). Backed by its OWN JobSystem
   // (diff_jobs_) so its generation counter never cross-cancels the primary
-  // session's in-flight parse/layout/shape jobs.
+  // session's in-flight parse/layout/shape jobs. Shared across tabs (one diff at
+  // a time, always against the active tab's model).
   DiffLoader& diff_loader() { return *diff_loader_; }
-  ViewState& view() { return view_; }
-  PendingDecode& decode() { return decode_; }
+  ViewState& view() { return tabs_[active_tab_]->view; }
+  PendingDecode& decode() { return tabs_[active_tab_]->decode; }
+
+  // --- v0.8.0 (#62) multi-model tabs -----------------------------------------
+  // Number of open tabs (always >= 1: an empty tab exists at startup).
+  size_t tab_count() const { return tabs_.size(); }
+  size_t active_tab() const { return active_tab_; }
+  const std::string& tab_title(size_t i) const { return tabs_[i]->title; }
+  // Switch the active tab (no reload — each tab keeps its fully-loaded state).
+  void switch_tab(size_t i);
+  // Open a brand-new empty tab and make it active.
+  void new_tab();
+  // Close tab `i`; if it was the last tab, a fresh empty one is created so the
+  // app always has at least one. Adjusts active_tab_ to stay in range.
+  void close_tab(size_t i);
+
+  // --- v0.8.0 (#59) command palette ------------------------------------------
+  // App-global (not per-tab) open flag for the Ctrl+P fuzzy command palette.
+  // draw_command_palette() reads/clears it; handle_shortcuts() toggles it.
+  bool& command_palette_open() { return command_palette_open_; }
+  // Toggle dark/light theme + persist (used by a palette action and the menu).
+  void set_theme(bool dark) { view().dark_theme = dark; apply_theme(dark); save_prefs(); }
+  // Open the OS file dialog (used by a palette action + the File menu).
+  void open_file_dialog();
+
   const Fonts& fonts() const { return fonts_; }
   std::vector<Toast>& toasts() { return toasts_; }
   GLFWwindow* window() const { return window_; }
@@ -205,6 +251,8 @@ class App {
 
   // Export the current canvas view to PNG at 2x (spec §8.7).
   void export_view_png(const std::string& path);
+  // Prompt for a path then export (used by the File menu + command palette).
+  void export_view_dialog();
 
   // Recent files (persisted next to layout cache, spec §8.7).
   const std::vector<std::string>& recent_files() const { return recent_; }
@@ -227,25 +275,35 @@ class App {
 
  private:
   GLFWwindow* window_ = nullptr;
-  std::unique_ptr<JobSystem> jobs_;
-  std::unique_ptr<ModelSession> session_;
+  // #62: open models. Always non-empty (an empty tab is created at startup and
+  // whenever the last tab closes). active_tab_ indexes the currently shown one.
+  std::vector<std::unique_ptr<Tab>> tabs_;
+  size_t active_tab_ = 0;
+  // Set when active_tab_ is moved programmatically (new_tab/close_tab/switch_tab/
+  // open_file); tells draw_tab_bar to force ImGui's selection to match for ONE
+  // frame, then it is cleared so user clicks own selection thereafter.
+  bool want_tab_sync_ = false;
+  bool command_palette_open_ = false;  // #59: Ctrl+P palette visibility
   // Second JobSystem dedicated to the comparison-model load/diff pipeline, kept
-  // separate from jobs_ so the two generation counters never interfere.
+  // separate from the tabs' pools so the generation counters never interfere.
   std::unique_ptr<JobSystem> diff_jobs_;
   std::unique_ptr<DiffLoader> diff_loader_;
-  ViewState view_;
-  PendingDecode decode_;
   Fonts fonts_;
   std::vector<Toast> toasts_;
   std::vector<std::string> recent_;
   plugin::PluginEnableSet plugin_enabled_;   // #11: persisted per-plugin enable state
 
+  // Install the font-metric SizeFn on a tab's session (used by layout to measure
+  // node label extents). Factored out so new_tab()/init() share one definition.
+  void install_size_fn(Tab& tab);
+
   void frame();                 // one UI frame
+  void draw_tab_bar();          // #62: the row of model tabs
   void apply_theme(bool dark);
   void handle_shortcuts();
   void load_recent();
   void save_recent();
-  void load_prefs();  // read view_prefs.json into view_ (best-effort)
+  void load_prefs();  // read view_prefs.json into the active tab's view (best-effort)
   void add_recent(const std::string& path);
 };
 
@@ -259,6 +317,7 @@ void draw_minimap(App& app);            // Minimap.cpp (drawn inside canvas)
 void draw_tensor_table(App& app);       // TensorTable.cpp (has_graph == false)
 void draw_status_bar(App& app);         // StatusBar.cpp
 void draw_toasts(App& app);             // StatusBar.cpp
+void draw_command_palette(App& app);    // CommandPalette.cpp (#59)
 
 // Camera helpers shared by canvas / search / minimap (Camera.cpp).
 ImVec2 world_to_screen(const Camera& c, ImVec2 origin, ImVec2 world);

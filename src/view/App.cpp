@@ -142,19 +142,86 @@ ImFont* try_load_font(ImGuiIO& io, float size) {
 
 }  // namespace
 
+// --- Tab (#62) -------------------------------------------------------------
+// A tab owns its JobSystem, its ModelSession (which takes the pool by ref), its
+// ViewState, and its PendingDecode. Construction order: pool first, then session.
+Tab::Tab()
+    : jobs(std::make_unique<JobSystem>()),
+      session(std::make_unique<ModelSession>(*jobs)),
+      title("(empty)") {}
+
+Tab::~Tab() {
+  // Stop this tab's workers BEFORE session is destroyed: a still-running decode
+  // job could touch session->file() after session is gone. shutdown() joins
+  // every worker first. (session is declared after jobs, so it destructs first
+  // anyway, but a running job could be mid-callback — shutdown closes that.)
+  if (jobs) jobs->shutdown();
+}
+
 App::App() = default;
 
 App::~App() {
-  // DECISION (threading): stop all workers BEFORE any member is destroyed.
-  // Member destruction order is session_ then jobs_ (reverse declaration), so a
-  // still-running decode job could touch session_->file() after session_ is
-  // gone. shutdown() joins every worker first, closing that window.
-  if (jobs_) jobs_->shutdown();
+  // DECISION (threading): stop all workers BEFORE any member is destroyed. Each
+  // tab shuts its own pool down in ~Tab; do it here explicitly first so nothing
+  // races teardown of shared state.
+  for (auto& t : tabs_)
+    if (t && t->jobs) t->jobs->shutdown();
   // diff_loader_ owns jobs on diff_jobs_; stop those workers before diff_loader_
   // (and its captured shared_ptr<const ir::Model>) is destroyed. Members destruct
   // in reverse declaration order (diff_loader_ then diff_jobs_), so shutting the
   // pool down here first closes the window on a still-running diff job.
   if (diff_jobs_) diff_jobs_->shutdown();
+}
+
+// Install the font-metric size function on a tab's session (spec §8.1). Layout
+// workers call this to measure each display node's box. It reads only glyph
+// advance widths from the pre-baked atlas (immutable after init) plus the
+// tab's own model/collapse state (published on the main thread before a layout
+// job is queued). Captures the specific ModelSession* so a tab's layout always
+// measures against ITS model, never the active tab's.
+void App::install_size_fn(Tab& tab) {
+  ModelSession* sess = tab.session.get();
+  tab.session->set_size_fn([this, sess](const DisplayNode& dn) -> Vec2 {
+    const float kPadX = 24.0f;   // horizontal breathing room around the label
+    const float kLineH = 18.0f;  // one text line incl. leading
+    const float kPadY = 14.0f;   // vertical padding (header strip + margins)
+
+    std::string primary, secondary;
+    const ir::Model* m = sess->model();  // a Tab always holds a non-null session
+    if (dn.is_group) {
+      const auto& groups = sess->collapse().groups();
+      if (dn.group_index < groups.size()) {
+        const auto& g = groups[dn.group_index];
+        primary = g.label;
+        secondary = "x" + std::to_string(g.instances);
+      }
+    } else if (m != nullptr) {
+      uint32_t gi = sess->current_graph();
+      if (gi < m->graphs.size()) {
+        const auto& nodes = m->graphs[gi].nodes;
+        if (dn.ir_node < nodes.size()) {
+          const auto& n = nodes[dn.ir_node];
+          primary = std::string(m->str(n.op_type));
+          secondary = std::string(m->str(n.name));
+        }
+      }
+    }
+    if (primary.empty()) primary = "node";
+
+    float w = 0.0f;
+    if (fonts_.body != nullptr) {
+      ImVec2 a = fonts_.bold->CalcTextSizeA(16.0f, FLT_MAX, 0.0f, primary.c_str());
+      ImVec2 b = fonts_.small->CalcTextSizeA(12.0f, FLT_MAX, 0.0f,
+                                             secondary.c_str());
+      w = std::max(a.x, b.x);
+    } else {
+      w = 8.0f * static_cast<float>(std::max(primary.size(), secondary.size()));
+    }
+    Vec2 out;
+    out.x = w + kPadX;
+    out.y = 2.0f * kLineH + kPadY;  // ~two lines: op_type + name/subtitle.
+    return out;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -199,8 +266,18 @@ bool App::init(const std::string& initial_path) {
   if (fonts_.small == nullptr) fonts_.small = fonts_.body;
   if (fonts_.bold == nullptr) fonts_.bold = fonts_.body;
 
+  // #62: start with a single empty tab FIRST — session()/view() resolve to the
+  // active tab, and load_prefs/reload_plugins/apply_theme below all use them, so
+  // the tab must exist before they run. Each tab owns its own JobSystem +
+  // ModelSession (see Tab). install_size_fn wires the font-metric measurer.
+  tabs_.clear();
+  tabs_.push_back(std::make_unique<Tab>());
+  active_tab_ = 0;
+  install_size_fn(*tabs_.back());
+
   // Load persisted view prefs BEFORE applying the theme so a saved theme choice
-  // and the heatmap gradient take effect on startup.
+  // and the heatmap gradient take effect on startup. Writes into the active
+  // tab's ViewState via view().
   load_prefs();
 
   // v0.6.0 (#9) / v0.7.0 (#11): discover plugins under the trust gate. Declarative
@@ -208,70 +285,17 @@ bool App::init(const std::string& initial_path) {
   // explicitly enabled (persisted in view_prefs "plugins", loaded above).
   reload_plugins();
 
-  apply_theme(view_.dark_theme);
+  apply_theme(view().dark_theme);
 
   // Route OS file drops to open_file() via the window user pointer.
   glfwSetWindowUserPointer(window_, this);
   glfwSetDropCallback(window_, drop_callback);
 
-  // jobs_ before session_ (session_ takes a JobSystem&; it must outlive nothing
-  // it references and must be destroyed before jobs_ — see ~App).
-  jobs_ = std::make_unique<JobSystem>();
-  session_ = std::make_unique<ModelSession>(*jobs_);
-
   // Comparison-model diff pipeline runs on its OWN JobSystem so its generation
-  // counter never cross-cancels the primary session's in-flight parse/layout/
-  // shape jobs (see App.h / DiffLoader.h).
+  // counter never cross-cancels a tab's in-flight parse/layout/shape jobs
+  // (see App.h / DiffLoader.h).
   diff_jobs_ = std::make_unique<JobSystem>();
   diff_loader_ = std::make_unique<DiffLoader>(*diff_jobs_);
-
-  // Font-metric-based node sizing (spec §8.1): the layout worker calls this to
-  // measure each display node's box. It reads only glyph advance widths from the
-  // pre-baked atlas (immutable after init), plus the model/collapse state which
-  // is published on the main thread before a layout job is queued.
-  session_->set_size_fn([this](const DisplayNode& dn) -> Vec2 {
-    const float kPadX = 24.0f;   // horizontal breathing room around the label
-    const float kLineH = 18.0f;  // one text line incl. leading
-    const float kPadY = 14.0f;   // vertical padding (header strip + margins)
-
-    // Resolve the two label lines for this display node.
-    std::string primary, secondary;
-    const ir::Model* m = session_ ? session_->model() : nullptr;
-    if (dn.is_group) {
-      const auto& groups = session_->collapse().groups();
-      if (dn.group_index < groups.size()) {
-        const auto& g = groups[dn.group_index];
-        primary = g.label;
-        secondary = "x" + std::to_string(g.instances);
-      }
-    } else if (m != nullptr) {
-      uint32_t gi = session_->current_graph();
-      if (gi < m->graphs.size()) {
-        const auto& nodes = m->graphs[gi].nodes;
-        if (dn.ir_node < nodes.size()) {
-          const auto& n = nodes[dn.ir_node];
-          primary = std::string(m->str(n.op_type));
-          secondary = std::string(m->str(n.name));
-        }
-      }
-    }
-    if (primary.empty()) primary = "node";
-
-    // Measure with real font metrics when available, else a char-count estimate.
-    float w = 0.0f;
-    if (fonts_.body != nullptr) {
-      ImVec2 a = fonts_.bold->CalcTextSizeA(16.0f, FLT_MAX, 0.0f, primary.c_str());
-      ImVec2 b = fonts_.small->CalcTextSizeA(12.0f, FLT_MAX, 0.0f,
-                                             secondary.c_str());
-      w = std::max(a.x, b.x);
-    } else {
-      w = 8.0f * static_cast<float>(std::max(primary.size(), secondary.size()));
-    }
-    Vec2 out;
-    out.x = w + kPadX;
-    out.y = 2.0f * kLineH + kPadY;  // ~two lines: op_type + name/subtitle.
-    return out;
-  });
 
   load_recent();
 
@@ -285,7 +309,10 @@ bool App::init(const std::string& initial_path) {
 int App::run() {
   while (!glfwWindowShouldClose(window_)) {
     glfwPollEvents();
-    session_->update();  // drain job completions once per frame (spec §4).
+    // Drain EVERY tab's completions, not just the active one (#62): a background
+    // tab's parse/layout/shape jobs must still land so switching to it shows a
+    // finished model rather than a frozen loading state.
+    for (auto& t : tabs_) t->session->update();
     if (diff_loader_) diff_loader_->update();  // drain diff completions after.
     frame();
 
@@ -309,6 +336,53 @@ int App::run() {
   window_ = nullptr;
   glfwTerminate();
   return 0;
+}
+
+// #62: the row of open-model tabs, drawn just under the menu bar. Uses an ImGui
+// tab bar with a close button per tab and a trailing "+" to open a new empty
+// tab. Switching is instant (each tab holds its fully-loaded session). Hidden
+// entirely when there is a single still-empty tab so the startup UI is clean.
+void App::draw_tab_bar() {
+  const bool single_empty = tabs_.size() == 1 &&
+                            session().stage() == LoadStage::Empty &&
+                            session().path().empty();
+  if (single_empty) return;
+
+  const ImGuiTabBarFlags flags = ImGuiTabBarFlags_AutoSelectNewTabs |
+                                 ImGuiTabBarFlags_Reorderable |
+                                 ImGuiTabBarFlags_FittingPolicyScroll |
+                                 ImGuiTabBarFlags_TabListPopupButton;
+  if (ImGui::BeginTabBar("##model_tabs", flags)) {
+    size_t to_close = tabs_.size();  // sentinel: nothing to close
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+      ImGui::PushID(static_cast<int>(i));
+      bool open = true;
+      // Label carries the title + a stable id so identical basenames don't merge.
+      std::string label = tabs_[i]->title + "###tab" + std::to_string(i);
+      // SetSelected only when a programmatic switch (command palette / new_tab)
+      // has moved active_tab_ ahead of ImGui's own selection — force it that ONE
+      // frame, then let ImGui own selection so user clicks are not fought.
+      ImGuiTabItemFlags item_flags =
+          (i == active_tab_ && want_tab_sync_) ? ImGuiTabItemFlags_SetSelected : 0;
+      if (ImGui::BeginTabItem(label.c_str(), &open, item_flags)) {
+        // A tab becomes active when its item is the selected one this frame.
+        active_tab_ = i;
+        ImGui::EndTabItem();
+      }
+      if (!open) to_close = i;  // user clicked the tab's close (x)
+      ImGui::PopID();
+    }
+    // "+" trailing button opens a fresh empty tab.
+    if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing |
+                                      ImGuiTabItemFlags_NoTooltip)) {
+      new_tab();
+    }
+    ImGui::EndTabBar();
+    // Apply a close AFTER the loop so we never mutate tabs_ mid-iteration.
+    if (to_close < tabs_.size()) close_tab(to_close);
+  }
+  // One-frame programmatic-selection sync consumed; user clicks own it now.
+  want_tab_sync_ = false;
 }
 
 void App::frame() {
@@ -348,14 +422,7 @@ void App::frame() {
   // --- Menu bar -------------------------------------------------------------
   if (ImGui::BeginMainMenuBar()) {
     if (ImGui::BeginMenu("File")) {
-      if (ImGui::MenuItem("Open...", "Ctrl+O")) {
-        const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors",
-                                  "*.gguf", "*.pt",     "*.pth",
-                                  "*.bin"};
-        char* picked = tinyfd_openFileDialog(
-            "Open model", "", 7, filters, "Model files", 0);
-        if (picked != nullptr) open_file(picked);
-      }
+      if (ImGui::MenuItem("Open...", "Ctrl+O")) open_file_dialog();
       if (ImGui::BeginMenu("Recent", !recent_.empty())) {
         for (const std::string& r : recent_) {
           if (ImGui::MenuItem(r.c_str())) open_file(r);
@@ -363,32 +430,27 @@ void App::frame() {
         ImGui::EndMenu();
       }
       ImGui::Separator();
-      if (ImGui::MenuItem("Export View PNG...")) {
-        const char* filters[] = {"*.png"};
-        char* out = tinyfd_saveFileDialog("Export view", "netvis.png", 1,
-                                          filters, "PNG image");
-        if (out != nullptr) export_view_png(out);
-      }
+      if (ImGui::MenuItem("Export View PNG...")) export_view_dialog();
       ImGui::Separator();
       if (ImGui::MenuItem("Exit")) glfwSetWindowShouldClose(window_, GLFW_TRUE);
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
-      if (ImGui::MenuItem("Dark theme", nullptr, view_.dark_theme)) {
-        view_.dark_theme = !view_.dark_theme;
-        apply_theme(view_.dark_theme);
+      if (ImGui::MenuItem("Dark theme", nullptr, view().dark_theme)) {
+        view().dark_theme = !view().dark_theme;
+        apply_theme(view().dark_theme);
         save_prefs();
       }
-      if (ImGui::MenuItem("Light theme", nullptr, !view_.dark_theme)) {
-        view_.dark_theme = false;
+      if (ImGui::MenuItem("Light theme", nullptr, !view().dark_theme)) {
+        view().dark_theme = false;
         apply_theme(false);
         save_prefs();
       }
       ImGui::Separator();
-      if (ImGui::MenuItem("Minimap", nullptr, &view_.show_minimap)) save_prefs();
+      if (ImGui::MenuItem("Minimap", nullptr, &view().show_minimap)) save_prefs();
       // Layout-readability toggle (v0.2.0 Feature 2): hide constant/initializer
       // input edges + source boxes; consumers get a "+N" badge instead.
-      ImGui::MenuItem("Hide constant edges", nullptr, &view_.hide_const_edges);
+      ImGui::MenuItem("Hide constant edges", nullptr, &view().hide_const_edges);
       ImGui::Separator();
       // Graph navigation controls (v0.2.0): highlight/focus + category filter.
       if (ImGui::BeginMenu("Navigation")) {
@@ -396,18 +458,21 @@ void App::frame() {
         ImGui::EndMenu();
       }
       // Model diff panel visibility (v0.2.0).
-      ImGui::MenuItem("Model diff panel", nullptr, &view_.diff_panel_open);
+      ImGui::MenuItem("Model diff panel", nullptr, &view().diff_panel_open);
       // Plugins management panel (v0.6.0 #11).
-      ImGui::MenuItem("Plugins", nullptr, &view_.show_plugins);
+      ImGui::MenuItem("Plugins", nullptr, &view().show_plugins);
       ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
   }
 
+  // --- Model tabs (#62) -----------------------------------------------------
+  draw_tab_bar();
+
   // --- Content --------------------------------------------------------------
   // With a compute graph, the canvas owns the center; otherwise (GGUF / weight-
   // only files) we present the flat tensor table instead (spec §8.6).
-  if (session_->has_graph()) {
+  if (session().has_graph()) {
     // Refresh nav adjacency + display-space masks BEFORE the canvas reads them
     // (cheap no-op unless the nav cache key changed).
     ensure_nav(*this);
@@ -415,7 +480,7 @@ void App::frame() {
     // no-op unless generation/graph/collapse changed).
     ensure_cost(*this);
     draw_graph_canvas(*this);
-  } else if (session_->model() != nullptr && !session_->has_graph()) {
+  } else if (session().model() != nullptr && !session().has_graph()) {
     ensure_cost(*this);  // table-mode report (dtype/quant totals) for Properties
     draw_tensor_table(*this);
   }
@@ -428,6 +493,7 @@ void App::frame() {
   draw_search_bar(*this);
   draw_status_bar(*this);
   draw_toasts(*this);
+  draw_command_palette(*this);   // #59: Ctrl+P fuzzy action palette (drawn on top)
 
   handle_shortcuts();
 
@@ -448,27 +514,102 @@ void App::handle_shortcuts() {
   const bool typing = io.WantTextInput;
 
   if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
-    view_.search_open = !view_.search_open;
+    view().search_open = !view().search_open;
+  }
+  // #59: Ctrl+P opens (toggles) the command palette. Allowed even while typing so
+  // it can be summoned from any focused field; the palette grabs focus itself.
+  if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+    command_palette_open_ = !command_palette_open_;
+  }
+  // Ctrl+O opens a model (mirrors the File menu; a common muscle-memory chord).
+  if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+    open_file_dialog();
   }
   if (!typing && !io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
-    view_.request_fit = true;  // 'F' fits the whole graph next frame.
+    view().request_fit = true;  // 'F' fits the whole graph next frame.
   }
   if (!typing && ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
-    view_.cam = Camera{};      // Home resets pan/zoom to identity.
-    view_.animating = false;
+    view().cam = Camera{};      // Home resets pan/zoom to identity.
+    view().animating = false;
   }
   if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-    view_.search_open = false;
+    view().search_open = false;
+    command_palette_open_ = false;
   }
 }
 
 // ---------------------------------------------------------------------------
 // File open / recent / inspect
 // ---------------------------------------------------------------------------
+namespace {
+// Basename for a tab title: the file name without directory. Falls back to the
+// whole path if there is no separator.
+std::string basename_of(const std::string& path) {
+  auto slash = path.find_last_of("/\\");
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+}  // namespace
+
+void App::open_file_dialog() {
+  const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors",
+                           "*.gguf", "*.pt",     "*.pth", "*.bin"};
+  char* picked =
+      tinyfd_openFileDialog("Open model", "", 7, filters, "Model files", 0);
+  if (picked != nullptr) open_file(picked);
+}
+
 void App::open_file(const std::string& path) {
   if (path.empty()) return;
-  session_->open_async(path);  // non-blocking (spec §4): pipeline kicks off.
+  // #62: reuse the active tab if it is still empty (never loaded a file); else
+  // open the model in a fresh tab so the current one is not clobbered. This makes
+  // "Open" additive once you already have a model up, matching the tabs mental
+  // model, while the very first Open (startup empty tab) loads in place.
+  if (session().stage() != LoadStage::Empty || !session().path().empty())
+    new_tab();
+  session().open_async(path);  // non-blocking (spec §4): pipeline kicks off.
+  tabs_[active_tab_]->title = basename_of(path);
   add_recent(path);
+}
+
+// --- Tabs (#62) ------------------------------------------------------------
+void App::switch_tab(size_t i) {
+  if (i < tabs_.size()) { active_tab_ = i; want_tab_sync_ = true; }
+}
+
+void App::new_tab() {
+  tabs_.push_back(std::make_unique<Tab>());
+  active_tab_ = tabs_.size() - 1;
+  want_tab_sync_ = true;
+  install_size_fn(*tabs_.back());
+  // A new tab inherits the current theme/toggles so the view is consistent; the
+  // persisted prefs already live in the active view we are leaving, and per-tab
+  // divergence (e.g. a different heatmap metric) is intentional and harmless.
+}
+
+void App::close_tab(size_t i) {
+  if (i >= tabs_.size()) return;
+  // #62: if the diff was loaded against THIS tab's session, clear it first — the
+  // DiffLoader holds that session's address for identity comparison, and erasing
+  // the tab frees the session, which would leave primary_session() dangling.
+  if (diff_loader_ &&
+      diff_loader_->primary_session() == tabs_[i]->session.get()) {
+    diff_loader_->clear();
+    tabs_[i]->view.diff_panel_open = false;
+  }
+  // ~Tab shuts the pool down (joins workers) before the ModelSession dies.
+  tabs_.erase(tabs_.begin() + static_cast<long>(i));
+  want_tab_sync_ = true;
+  if (tabs_.empty()) {
+    // Always keep at least one tab so session()/view() never dereference an
+    // empty vector.
+    tabs_.push_back(std::make_unique<Tab>());
+    install_size_fn(*tabs_.back());
+    active_tab_ = 0;
+    return;
+  }
+  // Keep active_tab_ pointing at a sensible neighbor.
+  if (active_tab_ >= tabs_.size()) active_tab_ = tabs_.size() - 1;
+  else if (active_tab_ > i) --active_tab_;
 }
 
 void App::add_toast(const std::string& text, bool is_error) {
@@ -480,37 +621,46 @@ void App::add_toast(const std::string& text, bool is_error) {
 }
 
 void App::inspect_tensor(const ir::TensorRef& t) {
+  // #62: bind the decode to the tab that is active RIGHT NOW. If the user
+  // switches tabs mid-decode, the completion must update THAT tab's PendingDecode
+  // (and read THAT tab's session/file), never the newly-active one. Capture the
+  // Tab* and its ModelSession/JobSystem by pointer; the Tab outlives the job
+  // because ~Tab joins its workers before the Tab is destroyed.
+  Tab* tab = tabs_[active_tab_].get();
+  PendingDecode& decode = tab->decode;
+  ModelSession* sess = tab->session.get();
+  JobSystem* jobs = tab->jobs.get();
+
   // Mark the inspector busy for this tensor and bump the token so any older
   // in-flight decode's completion is ignored when it eventually lands.
-  decode_.tensor = t;
-  decode_.active = true;
-  decode_.in_flight = true;
-  decode_.done = false;
-  decode_.ok = false;
-  decode_.error.clear();
-  const uint64_t token = ++decode_.token;
+  decode.tensor = t;
+  decode.active = true;
+  decode.in_flight = true;
+  decode.done = false;
+  decode.ok = false;
+  decode.error.clear();
+  const uint64_t token = ++decode.token;
 
   // Copy the tensor by value into the job (a captured reference would dangle).
   // TensorStats is the ONLY payload-reading path (spec §7.5); it runs on a
   // worker so the UI never blocks decoding a multi-GB tensor. The token guards
-  // against a stale result overwriting a newer inspection; ~App joins workers
-  // before session_ dies so session_->file() stays valid for the job's life.
+  // against a stale result overwriting a newer inspection; ~Tab joins workers
+  // before sess dies so sess->file() stays valid for the job's life.
   ir::TensorRef tc = t;
-  jobs_->submit([this, token, tc]() {
+  jobs->submit([sess, jobs, &decode, token, tc]() {
     Result<TensorStats> r =
-        compute_tensor_stats(tc, session_->file(), session_->model_dir(),
-                             session_->model());
+        compute_tensor_stats(tc, sess->file(), sess->model_dir(), sess->model());
     bool ok = r.ok();
     TensorStats stats = ok ? *r : TensorStats{};
     std::string errmsg = ok ? std::string() : r.error().message;
-    jobs_->post_to_main(
-        [this, token, ok, stats, errmsg]() {
-          if (decode_.token != token) return;  // superseded — drop it.
-          decode_.stats = stats;
-          decode_.ok = ok;
-          decode_.error = errmsg;
-          decode_.done = true;
-          decode_.in_flight = false;
+    jobs->post_to_main(
+        [&decode, token, ok, stats, errmsg]() {
+          if (decode.token != token) return;  // superseded — drop it.
+          decode.stats = stats;
+          decode.ok = ok;
+          decode.error = errmsg;
+          decode.done = true;
+          decode.in_flight = false;
         });
   });
 }
@@ -551,6 +701,13 @@ ImU32 App::category_color(OpCategory c, bool dark) {
 // ---------------------------------------------------------------------------
 // PNG export (spec §8.7): read back the rendered window and write a PNG.
 // ---------------------------------------------------------------------------
+void App::export_view_dialog() {
+  const char* filters[] = {"*.png"};
+  char* out =
+      tinyfd_saveFileDialog("Export view", "netvis.png", 1, filters, "PNG image");
+  if (out != nullptr) export_view_png(out);
+}
+
 void App::export_view_png(const std::string& path) {
   // DECISION (portability): read back the DEFAULT framebuffer (the just-rendered
   // window) with glReadPixels instead of rendering into an offscreen 2x FBO. The
@@ -661,13 +818,13 @@ GradientPreset preset_from_name(const std::string& s) {
 }  // namespace
 
 void App::save_prefs() {
-  const HeatmapGradient& g = view_.heatmap_gradient;
+  const HeatmapGradient& g = view().heatmap_gradient;
   nlohmann::json j;
-  j["dark_theme"] = view_.dark_theme;
-  j["show_minimap"] = view_.show_minimap;
-  j["cost_heatmap"] = view_.cost_heatmap;
-  j["heatmap_log_scale"] = view_.heatmap_log_scale;
-  j["heatmap_metric"] = heatmap_metric_name(view_.heatmap_metric);
+  j["dark_theme"] = view().dark_theme;
+  j["show_minimap"] = view().show_minimap;
+  j["cost_heatmap"] = view().cost_heatmap;
+  j["heatmap_log_scale"] = view().heatmap_log_scale;
+  j["heatmap_metric"] = heatmap_metric_name(view().heatmap_metric);
   j["gradient_preset"] = gradient_preset_name(g.preset);
   j["gradient_reverse"] = g.reverse;
   j["gradient_low"] = rgba_to_json(g.low);
@@ -688,18 +845,18 @@ void App::load_prefs() {
     f >> j;
     if (!j.is_object()) return;
     if (j.contains("dark_theme") && j["dark_theme"].is_boolean())
-      view_.dark_theme = j["dark_theme"].get<bool>();
+      view().dark_theme = j["dark_theme"].get<bool>();
     if (j.contains("show_minimap") && j["show_minimap"].is_boolean())
-      view_.show_minimap = j["show_minimap"].get<bool>();
+      view().show_minimap = j["show_minimap"].get<bool>();
     if (j.contains("cost_heatmap") && j["cost_heatmap"].is_boolean())
-      view_.cost_heatmap = j["cost_heatmap"].get<bool>();
+      view().cost_heatmap = j["cost_heatmap"].get<bool>();
     if (j.contains("heatmap_log_scale") && j["heatmap_log_scale"].is_boolean())
-      view_.heatmap_log_scale = j["heatmap_log_scale"].get<bool>();
+      view().heatmap_log_scale = j["heatmap_log_scale"].get<bool>();
     if (j.contains("heatmap_metric") && j["heatmap_metric"].is_string())
-      view_.heatmap_metric =
+      view().heatmap_metric =
           heatmap_metric_from_name(j["heatmap_metric"].get<std::string>().c_str());
 
-    HeatmapGradient& g = view_.heatmap_gradient;
+    HeatmapGradient& g = view().heatmap_gradient;
     if (j.contains("gradient_preset") && j["gradient_preset"].is_string()) {
       GradientPreset preset = preset_from_name(j["gradient_preset"].get<std::string>());
       gradient_set_preset(g, preset);  // fills stops for a built-in preset
@@ -735,7 +892,13 @@ void App::reload_plugins() {
   // The Registry table changed, so the cost report (its FLOP/category handlers route
   // through the registry) is stale. Bump the derived-state epoch so the next
   // ensure_cost rebuilds against the new table. No file reparse.
-  if (session_) session_->invalidate_derived();
+  // The plugin Registry is a global singleton, so a reset+re-discover changes the
+  // FLOP/category routing for EVERY tab's cost report — not just the active one.
+  // Invalidate all tabs' derived state (bumps each session's enrich epoch) so each
+  // rebuilds against the new table when next drawn. (#62: invalidating only the
+  // active tab would leave background tabs serving a cost report built against the
+  // old plugin table until some unrelated key change.)
+  for (auto& t : tabs_) t->session->invalidate_derived();
 }
 
 // ---------------------------------------------------------------------------

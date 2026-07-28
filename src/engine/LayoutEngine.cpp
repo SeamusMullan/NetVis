@@ -56,6 +56,18 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   out.structure_hash = collapse.structure_hash();
   out.collapse_hash = collapse.collapse_hash();
 
+  // #61: cooperative cancellation. The main thread flips the ProgressSink's
+  // cancel flag; we poll it ONLY at the coarse `progress->set(...)` checkpoints
+  // below (and once per barycenter sweep) — never in the tight per-node inner
+  // loops — so the poll stays O(checkpoints) and the layout stays deterministic.
+  // On cancel we return a fresh result flagged cancelled (no usable boxes); the
+  // caller must not publish it. Poll only when a sink was supplied.
+  auto make_cancelled = []() {
+    LayoutResult c;
+    c.cancelled = true;
+    return c;
+  };
+
   const std::vector<DisplayNode>& disp = collapse.display_nodes();
   const uint32_t V = static_cast<uint32_t>(disp.size());
 
@@ -69,6 +81,7 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     out.boxes[i].size = sz;
   }
   if (progress) progress->set(0.1f, "layout: measure");
+  if (progress && progress->cancelled()) return make_cancelled();
 
   if (V == 0 || graph_index >= model.graphs.size()) {
     out.bounds_min = Vec2{0, 0};
@@ -129,6 +142,7 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     }
   }
   if (progress) progress->set(0.3f, "layout: edges");
+  if (progress && progress->cancelled()) return make_cancelled();
 
   // Adjacency (out) for DFS cycle-break and layering.
   std::vector<std::vector<uint32_t>> out_adj(V);  // -> edge indices
@@ -347,6 +361,7 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   for (uint32_t v = 0; v < M; ++v) max_layer = std::max(max_layer, nlayer[v]);
   const size_t L = static_cast<size_t>(max_layer) + 1;
   if (progress) progress->set(0.5f, "layout: layering");
+  if (progress && progress->cancelled()) return make_cancelled();
 
   // Layer membership over ALL layout nodes; order index within a layer.
   std::vector<std::vector<uint32_t>> layers(L);
@@ -436,6 +451,9 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     uint64_t best = count_crossings();
     int sweeps = std::max(0, params.barycenter_sweeps);
     for (int s = 0; s < sweeps; ++s) {
+      // #61: poll cancellation once per sweep (the sweep loop is the dominant
+      // cost on large graphs). Coarse-grained: never inside the per-layer loops.
+      if (progress && progress->cancelled()) return make_cancelled();
       // Down sweep: order each layer by predecessor barycenters, top->bottom.
       for (size_t li = 1; li < L; ++li) barycenter_sort(li, /*use_preds=*/true);
       refresh_order();
@@ -448,6 +466,7 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     }
   }
   if (progress) progress->set(0.75f, "layout: ordering");
+  if (progress && progress->cancelled()) return make_cancelled();
 
   // -- 5) Coordinate assignment, on the internal per-layout-node arrays.
   std::vector<Vec2> npos(M);

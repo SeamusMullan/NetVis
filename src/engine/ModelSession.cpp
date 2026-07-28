@@ -219,6 +219,10 @@ void ModelSession::request_layout() {
   // layout worker needs. Layout is a pure function of (model, graph, collapse
   // view, sizes) so the worker only reads state that does not change under it.
   if (!model_) return;
+  // #61: clear any stale cancel flag from a prior layout BEFORE submitting, so a
+  // cancel that fired against the previous job can never poison this fresh one.
+  // MAIN THREAD, before the worker can observe the sink.
+  progress_.reset_cancel();
   const uint64_t gen = generation_;
   const uint64_t structure_hash = collapse_.structure_hash();
   const uint64_t collapse_hash = collapse_.collapse_hash();
@@ -232,6 +236,13 @@ void ModelSession::request_layout() {
       layout->from_cache = true;
       jobs_.post_to_main([this, gen, layout]() mutable {
         if (jobs_.generation() != gen) return;  // stale: drop
+        // The cache-hit path does no cancellable work, but guard uniformly: a
+        // cancelled result must never become the published layout (#61).
+        if (layout->cancelled) {
+          stage_ = LoadStage::Failed;
+          error_ = "layout cancelled";
+          return;
+        }
         layout_ = std::make_unique<LayoutResult>(std::move(*layout));
         if (stage_ != LoadStage::Enriching) stage_ = LoadStage::Ready;
       });
@@ -244,12 +255,30 @@ void ModelSession::request_layout() {
         compute_layout(*model_, current_graph_, collapse_, size_fn_, {}, &progress_);
     double layout_ms = ms_since(t_layout);
 
-    // Best-effort persist; a write failure is non-fatal (spec §7.2.7).
-    store_cached_layout(result);
+    // Best-effort persist; a write failure is non-fatal (spec §7.2.7). Skip when
+    // cancelled — a partial/empty result must never enter the persistent cache.
+    if (!result.cancelled) store_cached_layout(result);
 
     auto layout = std::make_shared<LayoutResult>(std::move(result));
     jobs_.post_to_main([this, gen, layout_ms, layout]() mutable {
       if (jobs_.generation() != gen) return;  // stale: drop
+      // #61: a cancelled layout carries no usable geometry — do NOT store it as
+      // layout_. Rely on the explicit flag, not on emptiness. Outcome depends on
+      // whether this was the FIRST layout or a re-layout (toggle/dive):
+      //   - re-layout (a valid layout_ already exists): keep the prior geometry
+      //     and return to Ready, so the canvas keeps showing the last good graph
+      //     instead of a "Failed" state over a stale drawing.
+      //   - first layout (no layout_ yet): surface it as Failed.
+      if (layout->cancelled) {
+        if (layout_) {
+          stage_ = (stage_ == LoadStage::Enriching) ? LoadStage::Enriching
+                                                    : LoadStage::Ready;
+        } else {
+          stage_ = LoadStage::Failed;
+          error_ = "layout cancelled";
+        }
+        return;
+      }
       timings_.layout_ms = layout_ms;
       layout_ = std::make_unique<LayoutResult>(std::move(*layout));
       // Ready unless we are still enriching (ONNX shapes not done yet).
@@ -261,6 +290,14 @@ void ModelSession::request_layout() {
 void ModelSession::update() {
   // MAIN THREAD: run all completions queued by workers this frame.
   jobs_.drain_completions();
+}
+
+void ModelSession::cancel_layout() {
+  // MAIN THREAD (#61). Only a running layout is cancellable; flipping the sink's
+  // flag is cheap and the layout worker observes it at its next checkpoint. The
+  // completion then drops the cancelled result (stage -> Failed). No-op in any
+  // other stage so an errant Cancel click cannot disturb parsing/enriching.
+  if (stage_ == LoadStage::Laying) progress_.request_cancel();
 }
 
 void ModelSession::toggle_group(uint32_t group_index) {

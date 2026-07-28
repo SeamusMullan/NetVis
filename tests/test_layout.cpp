@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "core/JobSystem.h"
 #include "engine/CollapseTree.h"
 #include "engine/Layout.h"
 #include "engine/LayoutEngine.h"
@@ -155,4 +156,41 @@ TEST_CASE("constants are placed next to their consumer, not pinned to layer 0") 
   // One layer gap = node height (40) + rank_sep (default 60) = 100. Allow a
   // couple of layers of slack; a pinned-constant hairball would be ~N*100.
   CHECK(max_span < 100.0f * 3.0f);
+}
+
+TEST_CASE("compute_layout bails out when the ProgressSink is cancelled") {
+  // #61 regression: request_cancel() BEFORE compute_layout runs must make it
+  // return promptly with .cancelled == true and no usable geometry. Polling
+  // happens at the first coarse checkpoint (measure, 0.1), so cancel is observed
+  // early. Unit test on the pure function — no threading/timing dependence.
+  ir::Model model = make_chain_model();
+
+  CollapseTree collapse;
+  collapse.build(model, 0);
+
+  ProgressSink progress;
+  progress.request_cancel();
+
+  LayoutResult r = compute_layout(model, 0, collapse, headless_size, {}, &progress);
+  CHECK(r.cancelled == true);
+  CHECK(r.boxes.empty());
+  CHECK(r.edges.empty());
+}
+
+TEST_CASE("a normal (non-cancelled) layout reports cancelled == false") {
+  // The negative case: with a fresh sink (never cancelled) the layout completes
+  // and the flag stays false, so a good result is never mistaken for cancelled.
+  ir::Model model = make_chain_model();
+
+  CollapseTree collapse;
+  collapse.build(model, 0);
+
+  ProgressSink progress;  // not cancelled
+  LayoutResult r = compute_layout(model, 0, collapse, headless_size, {}, &progress);
+  CHECK(r.cancelled == false);
+  CHECK(r.boxes.size() == collapse.display_nodes().size());
+
+  // And with no sink at all (the common test path), also not cancelled.
+  LayoutResult r2 = compute_layout(model, 0, collapse, headless_size, {}, nullptr);
+  CHECK(r2.cancelled == false);
 }

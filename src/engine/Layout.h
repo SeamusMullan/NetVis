@@ -48,6 +48,11 @@ struct LayoutResult {
   uint64_t structure_hash = 0;  // key this layout was computed for
   uint64_t collapse_hash = 0;
   bool from_cache = false;
+  // Set true when compute_layout bailed out early because the ProgressSink was
+  // cancelled (#61). A cancelled result carries no usable boxes/edges and must
+  // NOT be published as a layout — the session drops it. Distinct from an empty
+  // result: rely on this flag, not on boxes.empty().
+  bool cancelled = false;
 };
 
 }  // namespace netvis

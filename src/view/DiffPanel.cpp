@@ -46,6 +46,10 @@ DiffTint diff_tint_for_display(App& app, int32_t display_id) {
   if (!dl.active()) return out;
 
   ModelSession& s = app.session();
+  // #62: only tint if the diff was computed against the ACTIVE tab's session. With
+  // per-tab sessions, generation+graph both start at 0 per tab, so without this a
+  // diff loaded for tab A would paint tab B's coincidentally-matching graph.
+  if (dl.primary_session() != &s) return out;
   // Only tint if the diff was computed against the CURRENT primary model+graph.
   // Generation guards a primary RELOAD (current_graph resets to 0 on open, so a
   // graph-index match alone would paint a fresh model with stale diff status).

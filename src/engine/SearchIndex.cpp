@@ -12,11 +12,10 @@
 
 namespace netvis {
 
-namespace {
-
 // Lowercase an ASCII/UTF-8 string. We only fold ASCII (model identifiers are
 // effectively ASCII); non-ASCII bytes pass through unchanged so bytes still
-// compare consistently between query and entry.
+// compare consistently between query and entry. Declared in SearchIndex.h so
+// the command palette and other callers share this one fold.
 std::string to_lower(std::string_view s) {
   std::string out;
   out.resize(s.size());
@@ -26,6 +25,8 @@ std::string to_lower(std::string_view s) {
   }
   return out;
 }
+
+namespace {
 
 // True if `c` is a word-boundary separator: a match starting right after one of
 // these (or at position 0) is a "word start".

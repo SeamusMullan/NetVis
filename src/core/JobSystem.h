@@ -133,10 +133,20 @@ class ProgressSink {
     return stage_;
   }
 
+  // Cooperative cancellation (#61): the main thread flips the flag with
+  // request_cancel(); a long job polls cancelled() at its coarse checkpoints and
+  // bails out. reset_cancel() is called on the main thread before a fresh job is
+  // submitted so a prior cancel never poisons the next one. Deliberately NOT
+  // cleared inside set() — a checkpoint must be able to observe the flag.
+  void request_cancel() { cancel_.store(true, std::memory_order_relaxed); }
+  bool cancelled() const { return cancel_.load(std::memory_order_relaxed); }
+  void reset_cancel() { cancel_.store(false, std::memory_order_relaxed); }
+
  private:
   std::atomic<float> fraction_{0.0f};
   mutable std::mutex mu_;
   std::string stage_;
+  std::atomic<bool> cancel_{false};
 };
 
 }  // namespace netvis
