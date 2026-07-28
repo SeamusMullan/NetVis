@@ -39,6 +39,18 @@ class GraphAdjacency {
   std::vector<uint32_t> reachable_pred(uint32_t start, uint32_t max_hops,
                                        uint32_t cap) const;
 
+  // #15 (path-between): IR nodes lying on ANY directed path connecting `a` and
+  // `b`, in EITHER direction (a->..->b or b->..->a), inclusive of a and b when a
+  // connecting path exists. Computed as the intersection of forward reachability
+  // from the upstream endpoint with backward reachability from the downstream
+  // endpoint, tried both orderings and unioned (the caller need not know which of
+  // a/b is upstream). Bounded to `cap` visited nodes per BFS (frame-budget guard,
+  // as with reachable_*). Result is ascending and deduped. Empty if a==b, either
+  // is out of range, or no directed path connects them. Pure over the built
+  // adjacency; safe on the main thread.
+  std::vector<uint32_t> nodes_on_paths_between(uint32_t a, uint32_t b,
+                                               uint32_t cap) const;
+
  private:
   uint32_t node_count_ = 0;
   std::vector<uint32_t> succ_off_, succ_val_;

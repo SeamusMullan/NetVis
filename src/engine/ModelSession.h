@@ -88,6 +88,12 @@ class ModelSession {
   // Toggle a collapse group and request an incremental re-layout (spec §7.2.6).
   void toggle_group(uint32_t group_index);
 
+  // #21: collapse/expand ALL repeated-block groups, then re-layout if the display
+  // list changed. MAIN THREAD. No-op (no re-layout) if already in that state or
+  // there are no groups (CollapseTree::collapse_all/expand_all return false).
+  void collapse_all();
+  void expand_all();
+
   // Cancel an in-flight first/re-layout (#61). MAIN THREAD. Only meaningful
   // while stage_ == Laying: sets the ProgressSink cancel flag so the layout
   // worker bails at its next checkpoint. Cheap; the worker's cancelled result is
@@ -158,6 +164,10 @@ class ModelSession {
 
   // Kick a layout job for the current collapse view (used after parse + expand).
   void request_layout();
+
+  // Shared tail of toggle_group/collapse_all/expand_all: re-layout the current
+  // collapse view iff the display list changed (Ready -> Laying, then request).
+  void relayout_if_changed(bool display_changed);
 };
 
 }  // namespace netvis

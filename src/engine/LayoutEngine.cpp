@@ -42,6 +42,10 @@ struct DEdge {
   uint32_t from = 0;
   uint32_t to = 0;
   bool reversed = false;
+  // #18: representative IR value index for this (from,to) display pair — the
+  // SMALLEST value index (ascending) among all values producer->consumer, or
+  // UINT32_MAX if none. Carried to the emitted EdgeCurve for the hover tooltip.
+  uint32_t value_index = UINT32_MAX;
 };
 
 }  // namespace
@@ -112,9 +116,15 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   // produces a value consumed by an IR node mapped to B (A != B). Dedup edges.
   std::vector<DEdge> edges;
   {
-    // Build a set of (from<<32|to) for dedup; reserve conservatively.
-    std::vector<uint64_t> keys;
-    keys.reserve(g.edge_refs.size());
+    // Each entry: a packed (producer<<32|consumer) dedup key + the IR value
+    // index that realizes that display edge. Sorted by (key, vidx) so the FIRST
+    // entry for each unique key carries the SMALLEST value index (#18). Edge
+    // ORDER is byte-identical to the old key-only sort: the primary sort key
+    // (the packed producer/consumer) is unchanged, and we still emit exactly one
+    // edge per unique key in ascending key order — vidx is only a tiebreak that
+    // never reorders across keys.
+    std::vector<std::pair<uint64_t, uint32_t>> refs;  // (key, vidx)
+    refs.reserve(g.edge_refs.size());
     for (uint32_t ni = 0; ni < nIR; ++ni) {
       uint32_t consumer = ir_to_disp[ni];
       if (consumer == UINT32_MAX) continue;
@@ -128,16 +138,22 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
         if (p < 0 || static_cast<size_t>(p) >= nIR) continue;
         uint32_t producer = ir_to_disp[static_cast<uint32_t>(p)];
         if (producer == UINT32_MAX || producer == consumer) continue;
-        keys.push_back((static_cast<uint64_t>(producer) << 32) | consumer);
+        uint64_t key = (static_cast<uint64_t>(producer) << 32) | consumer;
+        refs.push_back({key, vidx});
       }
     }
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-    edges.reserve(keys.size());
-    for (uint64_t k : keys) {
+    std::sort(refs.begin(), refs.end());
+    edges.reserve(refs.size());
+    // Producer/consumer are never UINT32_MAX here (both filtered above), so a
+    // real key can never equal UINT64_MAX — safe "no previous key" sentinel.
+    uint64_t prev_key = UINT64_MAX;
+    for (const auto& rf : refs) {
+      if (rf.first == prev_key) continue;  // dedup: keep first (smallest vidx)
+      prev_key = rf.first;
       DEdge de;
-      de.from = static_cast<uint32_t>(k >> 32);
-      de.to = static_cast<uint32_t>(k & 0xffffffffu);
+      de.from = static_cast<uint32_t>(rf.first >> 32);
+      de.to = static_cast<uint32_t>(rf.first & 0xffffffffu);
+      de.value_index = rf.second;
       edges.push_back(de);
     }
   }
@@ -276,12 +292,16 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     uint32_t from_disp, to_disp;
     bool reversed;
     std::vector<uint32_t> chain;
+    // #18: representative IR value index for this display edge, carried straight
+    // through from DEdge. Independent of layout direction/reversal and of dummy
+    // insertion — it only names WHICH value the edge stands for.
+    uint32_t value_index;
   };
   std::vector<RouteEdge> routes;
   routes.reserve(edges.size());
   for (const DEdge& e : edges)
     routes.push_back(RouteEdge{eff_from(e), eff_to(e), e.from, e.to, e.reversed,
-                               {}});
+                               {}, e.value_index});
 
   // -- Multi-consumer source duplication. A real, non-group source (effective
   // in-degree 0) feeding >=2 consumers emits one long edge per consumer (the
@@ -621,6 +641,7 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
     c.from_display_id = r.from_disp;
     c.to_display_id = r.to_disp;
     c.reversed = r.reversed;
+    c.value_index = r.value_index;  // #18: representative IR value on this edge
     c.p0 = bottom_center(r.u);
     c.p3 = top_center(r.v);
     float dy = (c.p3.y - c.p0.y) * 0.5f;

@@ -451,6 +451,25 @@ void App::frame() {
       // Layout-readability toggle (v0.2.0 Feature 2): hide constant/initializer
       // input edges + source boxes; consumers get a "+N" badge instead.
       ImGui::MenuItem("Hide constant edges", nullptr, &view().hide_const_edges);
+      // #20 depth ruler + #18 edge tooltips (v0.8.1). Both persisted.
+      if (ImGui::MenuItem("Layer bands (depth ruler)", nullptr,
+                          &view().show_layer_bands))
+        save_prefs();
+      if (ImGui::MenuItem("Edge shape tooltips", nullptr, &view().edge_tooltips))
+        save_prefs();
+      ImGui::Separator();
+      // #13/#16 (v0.8.1): op-type legend + saved-view bookmarks panels. Held in
+      // the per-tab GraphNavState; ensure it exists so the toggle has a target.
+      if (view().nav) {
+        ImGui::MenuItem("Op legend", nullptr, &view().nav->show_legend);
+        ImGui::MenuItem("Bookmarks", nullptr, &view().nav->show_bookmarks);
+      }
+      ImGui::Separator();
+      // #21 (v0.8.1): global collapse/expand of all repeated-block groups.
+      if (ImGui::MenuItem("Collapse all blocks", "C"))
+        session().collapse_all();
+      if (ImGui::MenuItem("Expand all blocks", "E"))
+        session().expand_all();
       ImGui::Separator();
       // Graph navigation controls (v0.2.0): highlight/focus + category filter.
       if (ImGui::BeginMenu("Navigation")) {
@@ -488,6 +507,9 @@ void App::frame() {
   // Panels + overlays are always present (they self-hide when empty).
   draw_diff_panel(*this);
   draw_plugins_panel(*this);
+  // #13/#16 (v0.8.1): op legend + bookmarks panels (self-hide via their toggles).
+  draw_legend_panel(*this);
+  draw_bookmarks_panel(*this);
   draw_properties_panel(*this);
   draw_weight_inspector(*this);
   draw_search_bar(*this);
@@ -531,6 +553,23 @@ void App::handle_shortcuts() {
   if (!typing && ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
     view().cam = Camera{};      // Home resets pan/zoom to identity.
     view().animating = false;
+  }
+  // #17 focus history: Alt+Left / Alt+Right step back/forward through visited
+  // nodes (browser-style). Guarded so they no-op at the ends of the history.
+  if (!typing && io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) {
+    nav_focus_back(*this);
+  }
+  if (!typing && io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) {
+    nav_focus_forward(*this);
+  }
+  // #21 collapse/expand all repeated-block groups (no modifier; canvas focus).
+  if (!typing && !io.KeyCtrl && !io.KeyAlt &&
+      ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+    session().collapse_all();
+  }
+  if (!typing && !io.KeyCtrl && !io.KeyAlt &&
+      ImGui::IsKeyPressed(ImGuiKey_E, false)) {
+    session().expand_all();
   }
   if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
     view().search_open = false;
@@ -822,6 +861,8 @@ void App::save_prefs() {
   nlohmann::json j;
   j["dark_theme"] = view().dark_theme;
   j["show_minimap"] = view().show_minimap;
+  j["show_layer_bands"] = view().show_layer_bands;  // #20 (v0.8.1)
+  j["edge_tooltips"] = view().edge_tooltips;        // #18 (v0.8.1)
   j["cost_heatmap"] = view().cost_heatmap;
   j["heatmap_log_scale"] = view().heatmap_log_scale;
   j["heatmap_metric"] = heatmap_metric_name(view().heatmap_metric);
@@ -848,6 +889,10 @@ void App::load_prefs() {
       view().dark_theme = j["dark_theme"].get<bool>();
     if (j.contains("show_minimap") && j["show_minimap"].is_boolean())
       view().show_minimap = j["show_minimap"].get<bool>();
+    if (j.contains("show_layer_bands") && j["show_layer_bands"].is_boolean())
+      view().show_layer_bands = j["show_layer_bands"].get<bool>();  // #20
+    if (j.contains("edge_tooltips") && j["edge_tooltips"].is_boolean())
+      view().edge_tooltips = j["edge_tooltips"].get<bool>();        // #18
     if (j.contains("cost_heatmap") && j["cost_heatmap"].is_boolean())
       view().cost_heatmap = j["cost_heatmap"].get<bool>();
     if (j.contains("heatmap_log_scale") && j["heatmap_log_scale"].is_boolean())

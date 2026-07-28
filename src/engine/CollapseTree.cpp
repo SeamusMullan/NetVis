@@ -417,6 +417,41 @@ bool CollapseTree::toggle_group(uint32_t group_index) {
 }
 
 // ---------------------------------------------------------------------------
+// collapse_all
+// ---------------------------------------------------------------------------
+// #21: collapse EVERY detected group. Returns true only if the display list
+// actually changed. If there are no groups, or every group is already collapsed,
+// nothing changes -> return false without a needless rebuild.
+bool CollapseTree::collapse_all() {
+  if (groups_.empty()) return false;
+  // Already fully collapsed iff no bit is expanded.
+  if (std::none_of(expanded_.begin(), expanded_.end(), [](bool b) { return b; }))
+    return false;
+  expanded_.assign(expanded_.size(), false);
+  if (model_ && graph_index_ < model_->graphs.size())
+    rebuild_display(model_->graphs[graph_index_]);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// expand_all
+// ---------------------------------------------------------------------------
+// #21: expand EVERY detected group (the default post-build state). Groups are
+// FLAT, so "expand to depth N" degenerates to this. Returns true only if the
+// display list actually changed; false if there are no groups or every group is
+// already expanded.
+bool CollapseTree::expand_all() {
+  if (groups_.empty()) return false;
+  // Already fully expanded iff every bit is set.
+  if (std::all_of(expanded_.begin(), expanded_.end(), [](bool b) { return b; }))
+    return false;
+  expanded_.assign(expanded_.size(), true);
+  if (model_ && graph_index_ < model_->graphs.size())
+    rebuild_display(model_->graphs[graph_index_]);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // collapse_hash
 // ---------------------------------------------------------------------------
 uint64_t CollapseTree::collapse_hash() const {
