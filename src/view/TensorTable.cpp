@@ -33,28 +33,8 @@ namespace netvis {
 namespace {
 
 using panel_detail::human_bytes;
+using panel_detail::icontains;
 using panel_detail::shape_string;
-
-// Case-insensitive ASCII substring test (spec §8.6 filter). Cheap and locale
-// free — model names are ASCII identifiers.
-bool icontains(std::string_view hay, std::string_view needle) {
-  if (needle.empty()) return true;
-  if (needle.size() > hay.size()) return false;
-  auto lower = [](char c) {
-    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  };
-  for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
-    bool m = true;
-    for (size_t j = 0; j < needle.size(); ++j) {
-      if (lower(hay[i + j]) != lower(needle[j])) {
-        m = false;
-        break;
-      }
-    }
-    if (m) return true;
-  }
-  return false;
-}
 
 // A node in the name hierarchy tree. Children keyed by path segment; `tensor`
 // is set on leaves. Built each frame from flat_tensors — cheap for typical

@@ -88,6 +88,13 @@ class ModelSession {
   // Toggle a collapse group and request an incremental re-layout (spec §7.2.6).
   void toggle_group(uint32_t group_index);
 
+  // Cancel an in-flight first/re-layout (#61). MAIN THREAD. Only meaningful
+  // while stage_ == Laying: sets the ProgressSink cancel flag so the layout
+  // worker bails at its next checkpoint. Cheap; the worker's cancelled result is
+  // dropped on completion (stage -> Failed, "layout cancelled"). A no-op in any
+  // other stage.
+  void cancel_layout();
+
   const SearchIndex& search() const { return search_; }
 
   const MappedFile& file() const { return *file_; }

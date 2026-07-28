@@ -1,10 +1,27 @@
 // view/PanelHelpers.cpp — implementations of the module-private panel helpers.
 #include "view/PanelHelpers.h"
 
+#include <cctype>
 #include <cstdio>
 
 namespace netvis {
 namespace panel_detail {
+
+bool icontains(std::string_view hay, std::string_view needle) {
+  if (needle.empty()) return true;
+  if (needle.size() > hay.size()) return false;
+  auto lower = [](char c) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  };
+  for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+    bool m = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      if (lower(hay[i + j]) != lower(needle[j])) { m = false; break; }
+    }
+    if (m) return true;
+  }
+  return false;
+}
 
 std::string shape_string(const Shape& shape) {
   if (shape.empty()) return "[]";

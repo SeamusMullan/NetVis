@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "core/SmallVec.h"
 #include "engine/CollapseTree.h"
@@ -26,6 +27,11 @@ std::string shape_string(const Shape& shape);
 
 // Human byte size, e.g. "3.5 MB". Always 64-bit input.
 std::string human_bytes(uint64_t bytes);
+
+// Case-insensitive ASCII substring test (locale-free; model/attr names are ASCII
+// identifiers). Empty needle matches everything. Shared by the tensor-table
+// filter (§8.6) and the attribute-inspector filter (#60).
+bool icontains(std::string_view hay, std::string_view needle);
 
 // Grouping-separator decimal for large counts, e.g. "12,345,678".
 std::string grouped_count(int64_t n);

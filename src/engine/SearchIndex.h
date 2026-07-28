@@ -52,4 +52,9 @@ class SearchIndex {
 // Returns a positive score on match, or -1 if no match. Exposed for testing.
 int fuzzy_score(std::string_view query, std::string_view text);
 
+// Lowercase an ASCII string (non-ASCII bytes pass through unchanged). The one
+// canonical fold used to prepare inputs for fuzzy_score; shared so callers
+// (search bar, command palette) don't each re-implement the loop.
+std::string to_lower(std::string_view s);
+
 }  // namespace netvis

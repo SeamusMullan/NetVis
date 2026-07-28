@@ -11,9 +11,12 @@
 // payload-reading job (spec §2.1). Param counts sum TensorRef::elem_count(),
 // which is pure shape arithmetic, so "total params" costs nothing at the bytes
 // level even for multi-GB models.
+#include <cctype>
+#include <cfloat>
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 #include "imgui.h"
 
@@ -75,13 +78,39 @@ void draw_value_row(App& app, const ir::Model& model, const ir::Graph& g,
   ImGui::PopID();
 }
 
-// Render the typed attribute table for a node (spec §8.2).
+// Render the typed attribute table for a node (spec §8.2). #60: a filter box lets
+// the user narrow long attribute lists by name (match on attr name; a common ask
+// for big fused ops with dozens of attrs). Filter state is a panel-local static
+// (single Properties panel, main-thread ImGui) so App's frozen ViewState is
+// untouched; it is cleared whenever the selected node changes.
 void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
                      const ir::Node& node) {
   if (node.attributes.count == 0) {
     ImGui::TextDisabled("(no attributes)");
     return;
   }
+
+  // Panel-local filter buffer, reset when the selected node changes so the box
+  // never carries a stale filter onto a different node. Keyed by (graph,node).
+  static char filter_buf[64] = {0};
+  static uint64_t filter_key = UINT64_MAX;
+  const uint64_t this_key =
+      (static_cast<uint64_t>(app.session().current_graph()) << 32) |
+      static_cast<uint64_t>(&node - g.nodes.data());
+  if (this_key != filter_key) {
+    filter_key = this_key;
+    filter_buf[0] = '\0';
+  }
+
+  // Only show the filter box once there are enough attributes to warrant it.
+  const bool show_filter = node.attributes.count > 6;
+  if (show_filter) {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##attr_filter", "filter attributes...", filter_buf,
+                             sizeof(filter_buf));
+  }
+  const std::string_view needle(filter_buf);  // icontains folds case on both sides
+
   const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                 ImGuiTableFlags_SizingStretchProp;
   if (!ImGui::BeginTable("attrs", 2, flags)) return;
@@ -89,10 +118,14 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
   ImGui::TableSetupColumn("value");
   ImGui::TableHeadersRow();
 
+  uint32_t shown = 0;
   for (uint32_t a = 0; a < node.attributes.count; ++a) {
     uint32_t ai = node.attributes.begin + a;
     if (ai >= g.attributes.size()) break;  // defensive: malformed range
     const ir::Attribute& attr = g.attributes[ai];
+    if (!needle.empty() && !panel_detail::icontains(model.str(attr.name), needle))
+      continue;  // #60: filtered out by name
+    ++shown;
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     std::string_view aname = model.str(attr.name);
@@ -171,6 +204,8 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
     ImGui::PopID();
   }
   ImGui::EndTable();
+  if (shown == 0 && !needle.empty())
+    ImGui::TextDisabled("(no attributes match \"%s\")", filter_buf);
 }
 
 // The MODEL ROOT view shown when nothing is selected (spec §8.2).

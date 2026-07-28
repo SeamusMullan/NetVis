@@ -93,6 +93,12 @@ void draw_status_bar(App& app) {
     }
     ImGui::SetNextItemWidth(180.0f);
     ImGui::ProgressBar(session.progress(), ImVec2(180.0f, h - 6.0f));
+    // #61: layout is the long cancellable stage; offer a Cancel button only
+    // during Laying (mapping/parsing/enriching are not user-cancellable).
+    if (stage == LoadStage::Laying) {
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Cancel")) session.cancel_layout();
+    }
   } else {
     // Timings string (omit stages that never ran, spec §8.7).
     const StageTimings& t = session.timings();

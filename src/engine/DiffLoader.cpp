@@ -120,6 +120,10 @@ void DiffLoader::load_comparison(const ModelSession& primary,
           // Pin the primary generation the diff was computed against, so the
           // view stops tinting the moment the primary model is reloaded.
           primary_generation_ = primary_ptr->generation();
+          // #62: pin the session IDENTITY too — with per-tab sessions a matching
+          // generation+graph no longer means "same model". The view requires this
+          // equals the session it is tinting. Pointer stored for comparison ONLY.
+          primary_session_ = primary_ptr;
           state_ = DiffLoadState::Ready;
         } else {
           state_ = DiffLoadState::Failed;
@@ -154,6 +158,7 @@ void DiffLoader::clear() {
   file_ = MappedFile{};
   primary_graph_ = 0;
   primary_generation_ = UINT64_MAX;
+  primary_session_ = nullptr;
 }
 
 }  // namespace netvis
