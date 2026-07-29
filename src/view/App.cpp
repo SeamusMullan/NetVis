@@ -432,6 +432,7 @@ void App::frame() {
       }
       ImGui::Separator();
       if (ImGui::MenuItem("Export View PNG...")) export_view_dialog();
+      if (ImGui::MenuItem("Export View SVG...")) export_view_svg_dialog();  // #55
       // #56 (v0.8.2): shareable view-state file (camera + filters + selection).
       if (ImGui::MenuItem("Save View State...")) save_view_state_dialog();
       if (ImGui::MenuItem("Load View State...")) load_view_state_dialog();
@@ -461,6 +462,14 @@ void App::frame() {
         save_prefs();
       if (ImGui::MenuItem("Edge shape tooltips", nullptr, &view().edge_tooltips))
         save_prefs();
+      // #22 (v0.9.0): edge routing style.
+      if (ImGui::BeginMenu("Edge routing")) {
+        int& er = view().edge_routing;
+        if (ImGui::MenuItem("Bezier", nullptr, er == 0)) { er = 0; save_prefs(); }
+        if (ImGui::MenuItem("Orthogonal", nullptr, er == 1)) { er = 1; save_prefs(); }
+        if (ImGui::MenuItem("Straight", nullptr, er == 2)) { er = 2; save_prefs(); }
+        ImGui::EndMenu();
+      }
       ImGui::Separator();
       // #13/#16 (v0.8.1): op-type legend + saved-view bookmarks panels. Held in
       // the per-tab GraphNavState; ensure it exists so the toggle has a target.
@@ -470,6 +479,8 @@ void App::frame() {
       }
       // #53 (v0.8.2): persistent search-results panel (all hits, click to fly).
       ImGui::MenuItem("Search results", nullptr, &view().show_search_results);
+      // #14 (v0.9.0): critical-path highlight (heaviest FLOP chain).
+      ImGui::MenuItem("Critical path", nullptr, &view().show_critical_path);
       ImGui::Separator();
       // #21 (v0.8.1): global collapse/expand of all repeated-block groups.
       if (ImGui::MenuItem("Collapse all blocks", "C"))
@@ -754,6 +765,13 @@ void App::export_view_dialog() {
   if (out != nullptr) export_view_png(out);
 }
 
+void App::export_view_svg_dialog() {
+  const char* filters[] = {"*.svg"};
+  char* out = tinyfd_saveFileDialog("Export SVG", "netvis.svg", 1, filters,
+                                    "SVG vector");
+  if (out != nullptr) export_view_svg(out);
+}
+
 // --- #56 shareable view-state file (.netvis-view JSON) ----------------------
 void App::save_view_state_dialog() {
   const char* filters[] = {"*.netvis-view"};
@@ -1007,6 +1025,7 @@ void App::save_prefs() {
   // #11: per-plugin enable overrides (empty object if the user changed nothing).
   j["plugins"] = plugin_enabled_.to_json();
   // #4/#30 (v0.8.3): custom roofline ridge + named machine profiles.
+  j["edge_routing"] = view().edge_routing;  // #22 (v0.9.0)
   if (view().custom_ridge > 0.0) j["custom_ridge"] = view().custom_ridge;
   if (!view().machine_profiles.empty()) {
     nlohmann::json profs = nlohmann::json::array();
@@ -1065,6 +1084,10 @@ void App::load_prefs() {
     if (j.contains("plugins") && j["plugins"].is_object())
       plugin_enabled_.load_json(j["plugins"]);
     // #4/#30: custom ridge + named machine profiles.
+    if (j.contains("edge_routing") && j["edge_routing"].is_number_integer()) {
+      int er = j["edge_routing"].get<int>();
+      if (er >= 0 && er <= 2) view().edge_routing = er;
+    }
     if (j.contains("custom_ridge") && j["custom_ridge"].is_number())
       view().custom_ridge = j["custom_ridge"].get<double>();
     if (j.contains("machine_profiles") && j["machine_profiles"].is_array()) {

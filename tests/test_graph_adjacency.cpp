@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "engine/GraphAdjacency.h"
@@ -15,6 +16,44 @@
 using namespace netvis;
 
 namespace {
+
+// Build a model with `n` nodes where node i produces value i (value idx == node
+// idx, matching the make_diamond convention). `edges` are directed (producer,
+// consumer) NODE pairs: the consumer gets the producer's value on an input slot.
+ir::Model make_model(uint32_t n,
+                     const std::vector<std::pair<uint32_t, uint32_t>>& edges) {
+  ir::Model m;
+  m.has_graph = true;
+  m.format_name = m.intern("TEST");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  for (uint32_t i = 0; i < n; ++i) {
+    ir::ValueInfo v;
+    v.name = m.intern("v" + std::to_string(i));
+    v.producer = static_cast<int32_t>(i);
+    g.values.push_back(v);
+  }
+
+  std::vector<std::vector<uint32_t>> ins(n);  // consumer -> producer value idxs
+  for (const auto& e : edges) {
+    if (e.second < n) ins[e.second].push_back(e.first);
+  }
+
+  for (uint32_t i = 0; i < n; ++i) {
+    ir::Node nd;
+    nd.op_type = m.intern("Op");
+    nd.name = m.intern("n" + std::to_string(i));
+    nd.inputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    for (uint32_t p : ins[i]) g.edge_refs.push_back(p);
+    nd.inputs.count = static_cast<uint32_t>(ins[i].size());
+    nd.outputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    g.edge_refs.push_back(i);  // node i outputs value i
+    nd.outputs.count = 1;
+    g.nodes.push_back(nd);
+  }
+  return m;
+}
 
 // Diamond + tail:  A -> B, A -> C, B -> D, C -> D, D -> E.
 // Node indices: A=0 B=1 C=2 D=3 E=4. One value per producer.
@@ -270,4 +309,100 @@ TEST_CASE("adjacency: nodes_on_paths_between — degenerate + OOB cases") {
   GraphAdjacency empty;
   empty.build(m, 99);
   CHECK(empty.nodes_on_paths_between(0, 1, 100).empty());
+}
+
+// =============================================================================
+//  #14 — longest_cost_path (critical path: source->sink maximizing sum(weight)).
+// =============================================================================
+
+TEST_CASE("longest_cost_path: simple chain A->B->C->D returns whole chain") {
+  // 0->1->2->3, uniform weights -> the whole chain is the max-cost path.
+  ir::Model m = make_model(4, {{0, 1}, {1, 2}, {2, 3}});
+  GraphAdjacency adj;
+  adj.build(m, 0);
+
+  std::vector<uint64_t> w{5, 5, 5, 5};
+  CHECK(adj.longest_cost_path(w) == std::vector<uint32_t>{0, 1, 2, 3});
+}
+
+TEST_CASE("longest_cost_path: diamond picks the higher-weight branch") {
+  // A(0)->{B(1),C(2)}->D(3). B heavier than C -> path is A,B,D not A,C,D.
+  ir::Model m = make_model(4, {{0, 1}, {0, 2}, {1, 3}, {2, 3}});
+  GraphAdjacency adj;
+  adj.build(m, 0);
+
+  //         A  B  C  D
+  std::vector<uint64_t> w{1, 10, 2, 1};
+  CHECK(adj.longest_cost_path(w) == std::vector<uint32_t>{0, 1, 3});
+
+  // Flip the bias: C heavier -> path goes through C.
+  std::vector<uint64_t> w2{1, 2, 10, 1};
+  CHECK(adj.longest_cost_path(w2) == std::vector<uint32_t>{0, 2, 3});
+}
+
+TEST_CASE("longest_cost_path: weights bias the sink selection") {
+  // A(0)->B(1)->D(3) and A(0)->C(2)->E(4): two sink candidates (D and E). The
+  // higher-weight branch's sink wins.
+  ir::Model m = make_model(5, {{0, 1}, {1, 3}, {0, 2}, {2, 4}});
+  GraphAdjacency adj;
+  adj.build(m, 0);
+
+  //         A  B  C  D   E
+  std::vector<uint64_t> w{1, 1, 1, 2, 50};  // E-branch far heavier
+  CHECK(adj.longest_cost_path(w) == std::vector<uint32_t>{0, 2, 4});
+
+  // Bias the other sink: D-branch wins.
+  std::vector<uint64_t> w2{1, 1, 1, 100, 2};
+  CHECK(adj.longest_cost_path(w2) == std::vector<uint32_t>{0, 1, 3});
+}
+
+TEST_CASE("longest_cost_path: empty graph returns empty") {
+  ir::Model m = make_model(0, {});
+  GraphAdjacency adj;
+  adj.build(m, 0);
+  CHECK(adj.node_count() == 0);
+  CHECK(adj.longest_cost_path({}).empty());
+  CHECK(adj.longest_cost_path({1, 2, 3}).empty());
+
+  // Out-of-range build is also empty and safe.
+  GraphAdjacency oob;
+  oob.build(m, 99);
+  CHECK(oob.longest_cost_path({}).empty());
+}
+
+TEST_CASE("longest_cost_path: weight shorter than node_count treats missing as 0") {
+  // Chain 0->1->2->3, weight covers only nodes 0,1,2 (size 3) -> node 3 counts as
+  // 0. best = [1,2,7,7]: node 3 adds nothing so it ties node 2, and the sink
+  // tie-break (smallest index) stops the chain at node 2. Result is a valid,
+  // ascending source->sink chain and demonstrates the i<weight.size() guard.
+  ir::Model m = make_model(4, {{0, 1}, {1, 2}, {2, 3}});
+  GraphAdjacency adj;
+  adj.build(m, 0);
+
+  std::vector<uint64_t> w{1, 1, 5};  // shorter than node_count()==4 (node 3 -> 0)
+  std::vector<uint32_t> path = adj.longest_cost_path(w);
+  CHECK(path == std::vector<uint32_t>{0, 1, 2});
+  // Order is source->sink (strictly ascending topo on this chain).
+  for (size_t i = 1; i < path.size(); ++i) CHECK(path[i - 1] < path[i]);
+
+  // Empty weight => all zeros; still returns a valid chain (best[v]==0 for all,
+  // sink is the smallest-index argmax = node 0, a length-1 source path).
+  std::vector<uint32_t> zpath = adj.longest_cost_path({});
+  CHECK(zpath == std::vector<uint32_t>{0});
+}
+
+TEST_CASE("longest_cost_path: a residual back-edge cycle still terminates") {
+  // 0->1->2 plus a back-edge 2->1 forms a cycle {1,2}. indegree(1)=2, indegree(2)
+  // =1: after popping 0 and relaxing 0->1, indeg(1) drops 2->1 (never 0), so the
+  // queue drains without visiting the cycle body via a second relaxation. The
+  // pass must terminate and return a valid (best-effort) chain.
+  ir::Model m = make_model(3, {{0, 1}, {1, 2}, {2, 1}});
+  GraphAdjacency adj;
+  adj.build(m, 0);
+
+  std::vector<uint64_t> w{1, 1, 1};
+  std::vector<uint32_t> path = adj.longest_cost_path(w);  // must not hang/crash
+  CHECK_FALSE(path.empty());
+  // Whatever chain is returned, it is ascending (source->sink) and has no repeats.
+  for (size_t i = 1; i < path.size(); ++i) CHECK(path[i - 1] < path[i]);
 }

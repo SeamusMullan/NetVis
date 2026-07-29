@@ -51,6 +51,16 @@ class GraphAdjacency {
   std::vector<uint32_t> nodes_on_paths_between(uint32_t a, uint32_t b,
                                                uint32_t cap) const;
 
+  // #14 (critical path): the node chain, source→sink, that maximizes the summed
+  // per-node `weight`. `weight` is indexed by node (size must be node_count();
+  // shorter/empty => treated as 0 for missing entries). Computed by DP over a
+  // Kahn topological order of the CSR forward edges (a DAG after the layout's
+  // cycle handling; any back-edge that would form a cycle is simply not relaxed,
+  // so the pass always terminates). Returns the chain in source→sink order
+  // (ascending topo), or empty if the graph is empty. Deterministic: ties broken
+  // by smallest node index. Pure over the built adjacency; O(V+E); never throws.
+  std::vector<uint32_t> longest_cost_path(const std::vector<uint64_t>& weight) const;
+
  private:
   uint32_t node_count_ = 0;
   std::vector<uint32_t> succ_off_, succ_val_;

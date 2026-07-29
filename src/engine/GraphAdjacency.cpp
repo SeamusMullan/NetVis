@@ -14,6 +14,8 @@
 #include <queue>
 #include <utility>
 
+#include "core/SafeMath.h"  // safe_add (single source for saturating arithmetic)
+
 namespace netvis {
 
 void GraphAdjacency::build(const ir::Model& model, uint32_t graph_index) {
@@ -185,6 +187,75 @@ std::vector<uint32_t> GraphAdjacency::nodes_on_paths_between(uint32_t a,
   for (uint32_t n = 0; n < node_count_; ++n)
     if (on_path[n]) out.push_back(n);
   return out;
+}
+
+std::vector<uint32_t> GraphAdjacency::longest_cost_path(
+    const std::vector<uint64_t>& weight) const {
+  std::vector<uint32_t> result;
+  const uint32_t n = node_count_;
+  if (n == 0) return result;  // empty graph => empty chain
+
+  // Missing weight entries are 0 (weight may be shorter/empty than node_count()).
+  auto w_at = [&](uint32_t i) -> uint64_t {
+    return i < weight.size() ? weight[i] : 0;
+  };
+  // Saturating add (core/SafeMath, the codebase's single source for this) so a
+  // pathological summed cost clamps at UINT64_MAX rather than wrapping — per-node
+  // weights are already saturated flops-style quantities.
+  auto sat_add = [](uint64_t a, uint64_t b) -> uint64_t { return safe_add(a, b); };
+
+  // best[v] = max summed per-node weight of a path ENDING at v (v included).
+  // parent[v] = the argmax predecessor (smallest index on ties), kNone for a
+  // source. Seeded to the no-predecessor value w[v].
+  constexpr uint32_t kNone = UINT32_MAX;
+  std::vector<uint64_t> best(n);
+  std::vector<uint32_t> parent(n, kNone);
+  std::vector<uint32_t> indeg(n, 0);
+  for (uint32_t v = 0; v < n; ++v) best[v] = w_at(v);
+
+  // Indegree from the forward (succ) edges — dedup already collapsed parallels.
+  for (uint32_t u = 0; u < n; ++u)
+    for (uint32_t j = succ_off_[u]; j < succ_off_[u + 1]; ++j)
+      ++indeg[succ_val_[j]];
+
+  // Kahn queue, seeded with sources in ascending index order (determinism).
+  std::queue<uint32_t> q;
+  for (uint32_t v = 0; v < n; ++v)
+    if (indeg[v] == 0) q.push(v);
+
+  // DP over the Kahn order. Relax only edges out of popped (finalized) nodes, so
+  // a residual cycle (indegree never reaching 0) simply never propagates and the
+  // pass still terminates — its unvisited nodes keep best = w[v].
+  while (!q.empty()) {
+    uint32_t u = q.front();
+    q.pop();
+    for (uint32_t j = succ_off_[u]; j < succ_off_[u + 1]; ++j) {
+      uint32_t v = succ_val_[j];
+      uint64_t cand = sat_add(best[u], w_at(v));
+      // Strictly better cost wins; equal cost keeps the smallest-index pred.
+      if (cand > best[v] ||
+          (cand == best[v] && (parent[v] == kNone || u < parent[v]))) {
+        best[v] = cand;
+        parent[v] = u;
+      }
+      if (indeg[v] > 0 && --indeg[v] == 0) q.push(v);
+    }
+  }
+
+  // Sink = global argmax best[v] (smallest index on ties via strict >).
+  uint32_t sink = 0;
+  for (uint32_t v = 1; v < n; ++v)
+    if (best[v] > best[sink]) sink = v;
+
+  // Walk parent[] back to a source; the seen-guard bounds it to n steps even on
+  // hostile input (parent only ever points at an earlier-finalized node).
+  std::vector<bool> seen(n, false);
+  for (uint32_t cur = sink; cur != kNone && !seen[cur]; cur = parent[cur]) {
+    seen[cur] = true;
+    result.push_back(cur);
+  }
+  std::reverse(result.begin(), result.end());  // source -> sink (ascending topo)
+  return result;
 }
 
 }  // namespace netvis

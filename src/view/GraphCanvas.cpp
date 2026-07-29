@@ -21,6 +21,8 @@
 #include "imgui.h"
 #include "imgui_internal.h"  // ImBezierCubicClosestPoint (#18 edge hit-test)
 
+#include "engine/CostModel.h"    // #14: CostReport per-node flops (path weights)
+#include "engine/GraphAdjacency.h"  // #14: longest_cost_path
 #include "engine/OpCategory.h"
 #include "engine/plugin/Registry.h"
 #include "view/DiffPanel.h"
@@ -150,6 +152,74 @@ const LayerBandCache& layer_band_cache(const LayoutResult& layout) {
     }
     cache.lo[L] = std::min(cache.lo[L], b.pos.y);
     cache.hi[L] = std::max(cache.hi[L], b.pos.y + b.size.y);
+  }
+  return cache;
+}
+
+// #14 critical-path cache: the set of DISPLAY nodes on the heaviest cumulative-
+// FLOP chain source→sink. Computed from the cost report's per-node FLOPs as edge
+// weights over the graph adjacency (longest_cost_path), then mapped IR→display.
+// Rebuilt only when the session key or the report identity changes — not per
+// frame. `on[display_id] != 0` => draw a glow.
+struct CriticalPathCache {
+  uint64_t key_generation = UINT64_MAX;
+  uint32_t key_graph = UINT32_MAX;
+  uint64_t key_collapse = UINT64_MAX;
+  const void* key_report = nullptr;   // CostReport pointer identity
+  bool valid = false;
+  std::vector<uint8_t> on;            // indexed by display id
+};
+
+const CriticalPathCache& critical_path_cache(App& app, const CostReport* report,
+                                             const GraphAdjacency* adj) {
+  static CriticalPathCache cache;
+  ModelSession& s = app.session();
+  const uint64_t gen = s.generation();
+  const uint32_t gi = s.current_graph();
+  const uint64_t ch = s.collapse().collapse_hash();
+  if (cache.valid && cache.key_generation == gen && cache.key_graph == gi &&
+      cache.key_collapse == ch && cache.key_report == report)
+    return cache;
+  cache.key_generation = gen;
+  cache.key_graph = gi;
+  cache.key_collapse = ch;
+  cache.key_report = report;
+  cache.valid = true;
+
+  const auto& disp = s.collapse().display_nodes();
+  cache.on.assign(disp.size(), 0);
+  if (report == nullptr || adj == nullptr || report->per_node.empty()) return cache;
+
+  // Per-node FLOP weights (0 where unknown). longest_cost_path returns the IR-node
+  // chain maximizing summed weight; map each to its display node.
+  std::vector<uint64_t> weight(report->per_node.size());
+  for (size_t i = 0; i < report->per_node.size(); ++i)
+    weight[i] = report->per_node[i].flops_known ? report->per_node[i].flops : 0;
+  std::vector<uint32_t> chain = adj->longest_cost_path(weight);
+
+  // Build a reverse index (IR node -> display id) in ONE O(display) pass rather
+  // than a per-chain-node linear scan (which would be O(chain × display) — a
+  // multi-second freeze on a deep 100k-node graph). A leaf display node maps its
+  // ir_node directly; a collapsed group maps every member to the group's display
+  // id (so a chain node hidden in a group lights the group, matching the old
+  // display_index_for_node fallback).
+  const auto& groups = s.collapse().groups();
+  std::vector<int32_t> rev(report->per_node.size(), -1);
+  for (size_t i = 0; i < disp.size(); ++i) {
+    const DisplayNode& dn = disp[i];
+    if (!dn.is_group) {
+      if (dn.ir_node < rev.size()) rev[dn.ir_node] = static_cast<int32_t>(i);
+    } else if (dn.group_index < groups.size()) {
+      for (uint32_t member : groups[dn.group_index].member_nodes)
+        if (member < rev.size() && rev[member] < 0)
+          rev[member] = static_cast<int32_t>(i);
+    }
+  }
+  for (uint32_t ir_node : chain) {
+    if (ir_node >= rev.size()) continue;
+    int32_t d = rev[ir_node];
+    if (d >= 0 && static_cast<size_t>(d) < cache.on.size())
+      cache.on[static_cast<size_t>(d)] = 1;
   }
   return cache;
 }
@@ -376,6 +446,17 @@ void draw_graph_canvas(App& app) {
 
   const Fonts& fonts = app.fonts();
 
+  // --- #14 critical path: display nodes on the heaviest FLOP chain -----------
+  // Computed (cached) from the cost report + graph adjacency when the toggle is on.
+  const CriticalPathCache* crit = nullptr;
+  if (vs.show_critical_path) {
+    const GraphAdjacency* adj = vs.nav ? vs.nav->adj.get() : nullptr;
+    crit = &critical_path_cache(app, vs.cost.get(), adj);
+  }
+  auto on_critical = [&](uint32_t did) -> bool {
+    return crit != nullptr && did < crit->on.size() && crit->on[did] != 0;
+  };
+
   // --- #20 Depth ruler: faint per-layer bands --------------------------------
   // Reads NodeBox::layer (already produced by the Sugiyama layout). We derive each
   // layer's world-space vertical extent [top,bottom] in one O(boxes) pass, then
@@ -483,9 +564,27 @@ void draw_graph_canvas(App& app) {
     ImU32 ec = touches_hover ? col_edge_hi : col_edge;
     float th = touches_hover ? edge_thick + 1.0f : edge_thick;
     if (edge_dim && !touches_hover) ec = with_alpha_mul(ec, kDimAlpha);
-    dl->AddBezierCubic(p0, p1, p2, p3, ec, th);
+    // #22: route the edge per the chosen style. Bezier uses the layout control
+    // points; Orthogonal is a 3-segment Manhattan path (down / across / down);
+    // Straight is a direct line. All share the same p0->p3 endpoints.
+    switch (vs.edge_routing) {
+      case 1: {  // orthogonal (Manhattan)
+        float midy = (p0.y + p3.y) * 0.5f;
+        dl->AddLine(p0, ImVec2(p0.x, midy), ec, th);
+        dl->AddLine(ImVec2(p0.x, midy), ImVec2(p3.x, midy), ec, th);
+        dl->AddLine(ImVec2(p3.x, midy), p3, ec, th);
+        break;
+      }
+      case 2:  // straight
+        dl->AddLine(p0, p3, ec, th);
+        break;
+      default:  // bezier
+        dl->AddBezierCubic(p0, p1, p2, p3, ec, th);
+        break;
+    }
 
-    // #18: track the nearest edge under the cursor (screen space).
+    // #18: track the nearest edge under the cursor (screen space). Hit-test uses
+    // the bezier approximation regardless of routing (close enough for picking).
     if (want_edge_hover) {
       float d2 = dist_sq_point_bezier(mouse, p0, p1, p2, p3, 12);
       if (d2 < hover_edge_d2) {
@@ -612,6 +711,14 @@ void draw_graph_canvas(App& app) {
                         col_text, lab.primary.c_str());
         }
         dl->PopClipRect();
+      }
+
+      // #14: critical-path glow — a warm outline on nodes of the heaviest FLOP
+      // chain (drawn under the selection outline so selection still reads on top).
+      if (on_critical(b.display_id)) {
+        const ImU32 glow = IM_COL32(255, 170, 60, 235);
+        dl->AddRect(ImVec2(smin.x - 3, smin.y - 3), ImVec2(smax.x + 3, smax.y + 3),
+                    glow, 7.0f, 0, 3.0f);
       }
 
       // Selection / search-hit outlines.

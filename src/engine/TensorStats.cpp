@@ -10,6 +10,7 @@
 // (safe to read concurrently), external files are mapped locally for the call.
 #include "engine/TensorStats.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -417,6 +418,113 @@ Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
   }
 
   return stats;
+}
+
+Result<TensorThumbnail> compute_tensor_thumbnail(const ir::TensorRef& t,
+                                                 const MappedFile& base,
+                                                 const std::string& model_dir,
+                                                 const ir::Model* model) {
+  auto pr = resolve_payload(t, base, model_dir, model);
+  if (!pr) return pr.error();
+  Payload p = std::move(*pr);
+
+  // PAYLOAD READ: single accounted access for this decode (like the others).
+  ByteReader::mark_payload_read();
+
+  TensorThumbnail thumb;  // available=false, width=height=0 by default.
+
+  // Unavailable (NOT an error): quantized/unknown dtype, rank<2, or a dynamic
+  // (-1) / empty dim in the image plane (the last two axes).
+  if (is_quantized(t.dtype)) return thumb;
+  const uint32_t es = ir::dtype_size(t.dtype);
+  if (es == 0) return thumb;                    // unknown dtype
+  if (t.shape.size() < 2) return thumb;         // rank < 2
+  const int64_t rows_i = t.shape[t.shape.size() - 2];
+  const int64_t cols_i = t.shape[t.shape.size() - 1];
+  if (rows_i <= 0 || cols_i <= 0) return thumb; // dynamic (-1) / empty plane
+
+  const uint64_t rows = static_cast<uint64_t>(rows_i);
+  const uint64_t cols = static_cast<uint64_t>(cols_i);
+
+  // Output dimensions capped per side; block-average when the plane is larger.
+  const uint64_t height = std::min<uint64_t>(rows, kThumbMax);
+  const uint64_t width = std::min<uint64_t>(cols, kThumbMax);
+  const uint64_t block_r = (rows + height - 1) / height;  // ceil(rows/height)
+  const uint64_t block_c = (cols + width - 1) / width;    // ceil(cols/width)
+
+  // Downsampled accumulators (bounded by kThumbMax^2 — never rows*cols).
+  const size_t cells = static_cast<size_t>(width * height);
+  std::vector<double> sum(cells, 0.0);
+  std::vector<uint64_t> cnt(cells, 0);
+
+  // Elements we may read: the first 2D slice [0, rows*cols), clamped to what the
+  // payload actually holds. elem_count_from_bytes divides (never multiplies) so a
+  // hostile shape can't drive an OOB streaming read; higher dims are fixed at 0.
+  const uint64_t n = elem_count_from_bytes(t, p);
+
+  // --- Single streaming pass over the slice: accumulate block sums -----------
+  // The flat slice index `i` equals r*cols + c (row-major). Track the output
+  // (row,col) incrementally so there is no 64-bit divide per element.
+  uint64_t i = 0;
+  for (uint64_t r = 0; r < rows && i < n; ++r) {
+    uint64_t out_row = r / block_r;
+    if (out_row >= height) out_row = height - 1;  // defensive clamp
+    const size_t row_base = static_cast<size_t>(out_row * width);
+    uint64_t oc = 0, cc = 0;  // output col + element count within the block
+    for (uint64_t c = 0; c < cols && i < n; ++c, ++i) {
+      const double v = read_elem(p.ptr, t.dtype, i);
+      if (!std::isnan(v) && !std::isinf(v)) {
+        const size_t idx = row_base + static_cast<size_t>(oc);
+        sum[idx] += v;
+        ++cnt[idx];
+      }
+      if (++cc == block_c) { cc = 0; if (oc + 1 < width) ++oc; }
+    }
+  }
+
+  // --- Min/max over the DOWNSAMPLED grid's finite cells (display contrast) ----
+  double gmin = std::numeric_limits<double>::infinity();
+  double gmax = -std::numeric_limits<double>::infinity();
+  for (size_t k = 0; k < cells; ++k) {
+    if (cnt[k] == 0) continue;
+    const double avg = sum[k] / static_cast<double>(cnt[k]);
+    if (avg < gmin) gmin = avg;
+    if (avg > gmax) gmax = avg;
+  }
+  if (gmin > gmax) { gmin = 0.0; gmax = 0.0; }  // no finite cell anywhere
+  thumb.slice_min = gmin;
+  thumb.slice_max = gmax;
+  const double range = gmax - gmin;
+
+  // --- Normalize + pack RGBA8 via a simple blue->red ramp --------------------
+  auto to_u8 = [](double x) -> uint8_t {
+    long q = std::lround(x * 255.0);
+    if (q < 0) q = 0;
+    if (q > 255) q = 255;
+    return static_cast<uint8_t>(q);
+  };
+  thumb.rgba.assign(cells * 4, static_cast<uint8_t>(0));
+  for (size_t k = 0; k < cells; ++k) {
+    uint8_t r8, g8, b8;
+    if (cnt[k] == 0) {
+      r8 = g8 = b8 = 128;  // block with no finite values -> mid-gray
+    } else {
+      const double avg = sum[k] / static_cast<double>(cnt[k]);
+      const double t01 = (range > 0.0) ? (avg - gmin) / range : 0.5;  // guard
+      r8 = to_u8(t01);                                // R rises 0->1
+      g8 = to_u8(1.0 - std::fabs(2.0 * t01 - 1.0));   // G peaks at mid
+      b8 = to_u8(1.0 - t01);                          // B falls 1->0
+    }
+    thumb.rgba[k * 4 + 0] = r8;
+    thumb.rgba[k * 4 + 1] = g8;
+    thumb.rgba[k * 4 + 2] = b8;
+    thumb.rgba[k * 4 + 3] = 255;
+  }
+
+  thumb.width = static_cast<uint32_t>(width);
+  thumb.height = static_cast<uint32_t>(height);
+  thumb.available = true;
+  return thumb;
 }
 
 Result<bool> export_npy(const ir::TensorRef& t, const MappedFile& base,

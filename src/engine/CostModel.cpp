@@ -1173,6 +1173,109 @@ CostReport compute_cost(const ir::Model& model, uint32_t graph_index) {
   return report;
 }
 
+// Public API (#32): per-node receptive field over a conv/pool stack. Propagates
+// (rf, jump) along producer->consumer value edges in topological (node index)
+// order — see the NodeReceptiveField doc block in CostModel.h. Pure, O(V+E),
+// saturating, never throws, zero payload reads.
+std::vector<NodeReceptiveField> compute_receptive_fields(const ir::Model& model,
+                                                         uint32_t graph_index) {
+  std::vector<NodeReceptiveField> out;
+  // Graph-mode only; empty in table mode or for an out-of-range graph.
+  if (!model.has_graph || graph_index >= model.graphs.size()) return out;
+  const ir::Graph& g = model.graphs[graph_index];
+  out.resize(g.nodes.size());
+
+  // Per-VALUE receptive field / cumulative stride. `known` distinguishes a value
+  // whose RF has been derived (a graph input, or the output of a resolvable node)
+  // from one that has not — an unresolved input contributes nothing to the MAX.
+  std::vector<uint64_t> val_rf(g.values.size(), 0);
+  std::vector<uint64_t> val_jump(g.values.size(), 0);
+  std::vector<uint8_t> val_known(g.values.size(), 0);
+
+  // Seed graph inputs with rf=1, jump=1 (one input pixel sees itself).
+  for (uint32_t vidx : g.graph_inputs) {
+    if (vidx >= g.values.size()) continue;
+    val_rf[vidx] = 1;
+    val_jump[vidx] = 1;
+    val_known[vidx] = 1;
+  }
+
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    const ir::Node& node = g.nodes[i];
+    OpCategory cat = categorize_op(model.str(node.op_type));
+
+    // Gather incoming rf/jump: MAX rf across resolved input values, with jump
+    // taken from that same input; fall back to a fresh seed (1,1) if no input
+    // resolved (mirrors the graph-input seed for a source-like node).
+    uint64_t in_rf = 1, in_jump = 1;
+    bool have_input = false;
+    for (uint32_t slot = 0; slot < node.inputs.count; ++slot) {
+      uint32_t er = node.inputs.begin + slot;
+      if (er >= g.edge_refs.size()) continue;
+      uint32_t vidx = g.edge_refs[er];
+      if (vidx >= g.values.size()) continue;
+      if (!val_known[vidx]) continue;  // unresolved -> not part of the MAX
+      if (!have_input || val_rf[vidx] > in_rf) {
+        in_rf = val_rf[vidx];
+        in_jump = val_jump[vidx];
+        have_input = true;
+      }
+    }
+
+    uint64_t out_rf = 0, out_jump = 0;
+    bool derived = false;
+
+    if (cat == OpCategory::Conv || cat == OpCategory::Pool) {
+      // Conv/ConvTranspose/Pool: ke = d*(k-1)+1; out_rf = in_rf + (ke-1)*in_jump;
+      // out_jump = in_jump * s. Needs kernel_shape[0]; strides/dilations default 1.
+      std::vector<int64_t> kernel = get_ints_attr(model, g, node, "kernel_shape");
+      if (!kernel.empty() && kernel[0] >= 1) {
+        int64_t k = kernel[0];
+        std::vector<int64_t> strides = get_ints_attr(model, g, node, "strides");
+        std::vector<int64_t> dilations =
+            get_ints_attr(model, g, node, "dilations");
+        int64_t s = (!strides.empty()) ? strides[0] : 1;
+        int64_t d = (!dilations.empty()) ? dilations[0] : 1;
+        if (s >= 1 && d >= 1) {
+          uint64_t ke = safe_add(
+              safe_mul(static_cast<uint64_t>(d), static_cast<uint64_t>(k - 1)), 1);
+          out_rf = safe_add(in_rf, safe_mul(ke - 1, in_jump));
+          out_jump = safe_mul(in_jump, static_cast<uint64_t>(s));
+          derived = true;
+        }
+      }
+      // else: missing/invalid kernel_shape -> honest unknown ({0,false}).
+    } else if (cat == OpCategory::Activation || cat == OpCategory::Norm ||
+               cat == OpCategory::Elementwise) {
+      // Spatial-preserving pointwise op: RF/jump pass through unchanged.
+      out_rf = in_rf;
+      out_jump = in_jump;
+      derived = true;
+    }
+    // Everything else (MatMul/Shape/Reduce/Tensor/ControlFlow/Attention/... and
+    // unknown ops) is unknown-structural for RF purposes -> {0,false}.
+
+    if (derived) {
+      out[i].rf = out_rf;
+      out[i].known = true;
+      // Publish onto this node's output values so consumers can look them up.
+      for (uint32_t slot = 0; slot < node.outputs.count; ++slot) {
+        uint32_t er = node.outputs.begin + slot;
+        if (er >= g.edge_refs.size()) continue;
+        uint32_t vidx = g.edge_refs[er];
+        if (vidx >= g.values.size()) continue;
+        val_rf[vidx] = out_rf;
+        val_jump[vidx] = out_jump;
+        val_known[vidx] = 1;
+      }
+    }
+    // Unknown node: leave out[i] = {0,false} and its outputs unresolved (so a
+    // downstream consumer does not fabricate an RF from a broken chain).
+  }
+
+  return out;
+}
+
 // Public API: the full activation-liveness curve for graphs[graph_index].
 std::vector<uint64_t> activation_liveness_curve(const ir::Model& model,
                                                 uint32_t graph_index) {

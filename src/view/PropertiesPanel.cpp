@@ -17,12 +17,14 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "imgui.h"
 
 // LayoutEngine.h defines SizeFn, which the frozen ModelSession.h (pulled in by
 // App.h) references without including it; include it first so App.h compiles.
 #include "engine/LayoutEngine.h"
+#include "engine/CostModel.h"   // #32: compute_receptive_fields / NodeReceptiveField
 #include "engine/OpCategory.h"
 #include "engine/plugin/Registry.h"
 #include "ir/IR.h"
@@ -334,6 +336,39 @@ void draw_properties_panel(App& app) {
   ImGui::Text("op:       %s", op.empty() ? "?" : std::string(op).c_str());
   ImGui::Text("name:     %s", name.empty() ? "(unnamed)" : std::string(name).c_str());
   ImGui::Text("category: %s", category_name(cat));
+
+  // #32: per-node receptive field (conv/pool stacks). Cached per (generation,
+  // graph, enrich) since it's a pure O(V+E) pass over shapes — recompute only when
+  // the model/graph/shape-epoch changes, not per selection or per frame.
+  {
+    // Key includes the MODEL POINTER: per-tab JobSystems make (generation, graph,
+    // enrich) collide across tabs (each starts at gen 0), so without the model
+    // identity a second tab's node would be looked up in the first tab's RF table
+    // (the #62 multi-tab collision that #14's cache avoids via its report ptr).
+    static std::vector<NodeReceptiveField> rf_cache;
+    static const ir::Model* rf_model = nullptr;
+    static uint64_t rf_gen = UINT64_MAX;
+    static uint32_t rf_graph = UINT32_MAX;
+    static uint64_t rf_enrich = UINT64_MAX;
+    const uint64_t gen = session.generation();
+    const uint64_t enrich = session.enrich_generation();
+    if (rf_model != model || rf_gen != gen || rf_graph != gi || rf_enrich != enrich) {
+      rf_cache = compute_receptive_fields(*model, gi);
+      rf_model = model;
+      rf_gen = gen;
+      rf_graph = gi;
+      rf_enrich = enrich;
+    }
+    if (dn.ir_node < rf_cache.size() && rf_cache[dn.ir_node].known) {
+      ImGui::Text("recept. field: %llu",
+                  static_cast<unsigned long long>(rf_cache[dn.ir_node].rf));
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Receptive field along the first spatial axis: input pixels that "
+            "influence one output pixel (conv/pool stack, shape-derived).");
+    }
+  }
+
   // #57: copy the whole node (op/attrs/input-output shapes) as JSON.
   if (ImGui::SmallButton("Copy as JSON")) {
     std::string js = panel_detail::node_to_json(*model, g, node);

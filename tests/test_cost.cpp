@@ -1709,3 +1709,161 @@ TEST_CASE("Cost: estimate_model_latency_s unknown when no FLOPs known") {
   double t_m = 1000000.0 / bandwidth_bytes_per_s(RooflinePreset::GpuFp32);
   CHECK(lat == doctest::Approx(std::max(t_c, t_m)));
 }
+
+// =============================================================================
+//  #32 — per-node receptive field (compute_receptive_fields).
+//  ke = d*(k-1)+1; out_rf = in_rf + (ke-1)*in_jump; out_jump = in_jump*s.
+//  Graph inputs seed rf=1, jump=1. Elementwise/Norm/Activation pass through.
+// =============================================================================
+
+namespace {
+// Add a Conv node consuming `in_val`, producing a fresh output value, with the
+// given kernel/stride/dilation along the first spatial axis. Returns the output
+// value index (so the next node can chain off it).
+uint32_t add_conv(ir::Model& m, ir::Graph& g, uint32_t in_val,
+                  const std::string& out_name, int64_t k, int64_t s, int64_t d) {
+  uint32_t out = add_value(m, g, out_name, ir::DType::F32, {1, 1, 8, 8});
+  add_node(m, g, "Conv", {in_val}, {out});
+  add_attr_ints(m, g, "kernel_shape", {k, k});
+  if (s != 1) add_attr_ints(m, g, "strides", {s, s});
+  if (d != 1) add_attr_ints(m, g, "dilations", {d, d});
+  return out;
+}
+}  // namespace
+
+TEST_CASE("RF: single Conv k=3,s=1,d=1 over a seeded input -> rf=3") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in = add_value(m, g, "in", ir::DType::F32, {1, 1, 8, 8});
+  g.graph_inputs.push_back(in);  // seed rf=1, jump=1
+  add_conv(m, g, in, "c0", /*k=*/3, /*s=*/1, /*d=*/1);
+
+  ByteReader::payload_read_counter() = 0;
+  std::vector<NodeReceptiveField> rf = compute_receptive_fields(m, 0);
+  REQUIRE(rf.size() == 1);
+  CHECK(rf[0].known);
+  CHECK(rf[0].rf == 3);  // 1 + (3-1)*1
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("RF: two stacked Conv k=3,s=1 -> rf grows 3 then 5") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in = add_value(m, g, "in", ir::DType::F32, {1, 1, 8, 8});
+  g.graph_inputs.push_back(in);
+  uint32_t c0 = add_conv(m, g, in, "c0", 3, 1, 1);
+  add_conv(m, g, c0, "c1", 3, 1, 1);
+
+  std::vector<NodeReceptiveField> rf = compute_receptive_fields(m, 0);
+  REQUIRE(rf.size() == 2);
+  CHECK(rf[0].rf == 3);          // 1 + 2*1
+  CHECK(rf[1].known);
+  CHECK(rf[1].rf == 5);          // 3 + (3-1)*1
+}
+
+TEST_CASE("RF: stride-2 Conv then k=3 Conv -> jump multiplication (rf 3 then 7)") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in = add_value(m, g, "in", ir::DType::F32, {1, 1, 8, 8});
+  g.graph_inputs.push_back(in);
+  uint32_t c0 = add_conv(m, g, in, "c0", /*k=*/3, /*s=*/2, /*d=*/1);  // jump -> 2
+  add_conv(m, g, c0, "c1", /*k=*/3, /*s=*/1, /*d=*/1);
+
+  std::vector<NodeReceptiveField> rf = compute_receptive_fields(m, 0);
+  REQUIRE(rf.size() == 2);
+  CHECK(rf[0].rf == 3);   // 1 + (3-1)*1, out_jump = 2
+  CHECK(rf[1].known);
+  // The next k=3 adds (3-1)*jump = (3-1)*2 = 4 -> rf = 3 + 4 = 7.
+  CHECK(rf[1].rf == 7);
+}
+
+TEST_CASE("RF: dilation d=2,k=3 -> effective kernel 5 -> rf=5") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in = add_value(m, g, "in", ir::DType::F32, {1, 1, 8, 8});
+  g.graph_inputs.push_back(in);
+  add_conv(m, g, in, "c0", /*k=*/3, /*s=*/1, /*d=*/2);  // ke = 2*(3-1)+1 = 5
+
+  std::vector<NodeReceptiveField> rf = compute_receptive_fields(m, 0);
+  REQUIRE(rf.size() == 1);
+  CHECK(rf[0].known);
+  CHECK(rf[0].rf == 5);  // 1 + (5-1)*1
+}
+
+TEST_CASE("RF: elementwise op passes the receptive field through unchanged") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in = add_value(m, g, "in", ir::DType::F32, {1, 1, 8, 8});
+  g.graph_inputs.push_back(in);
+  uint32_t c0 = add_conv(m, g, in, "c0", 3, 1, 1);  // rf=3
+  uint32_t r0 = add_value(m, g, "r0", ir::DType::F32, {1, 1, 8, 8});
+  add_node(m, g, "Relu", {c0}, {r0});               // pass-through
+  uint32_t a1 = add_value(m, g, "a1", ir::DType::F32, {1, 1, 8, 8});
+  add_node(m, g, "Add", {r0, r0}, {a1});            // pass-through
+
+  std::vector<NodeReceptiveField> rf = compute_receptive_fields(m, 0);
+  REQUIRE(rf.size() == 3);
+  CHECK(rf[0].rf == 3);       // Conv
+  CHECK(rf[1].known);
+  CHECK(rf[1].rf == 3);       // Relu unchanged
+  CHECK(rf[2].known);
+  CHECK(rf[2].rf == 3);       // Add unchanged
+}
+
+TEST_CASE("RF: unknown/missing-attr node is honest {0,false}") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  uint32_t in = add_value(m, g, "in", ir::DType::F32, {1, 1, 8, 8});
+  g.graph_inputs.push_back(in);
+  // Conv with NO kernel_shape attribute -> a needed attr is missing -> unknown.
+  uint32_t c0 = add_value(m, g, "c0", ir::DType::F32, {1, 1, 8, 8});
+  add_node(m, g, "Conv", {in}, {c0});  // no kernel_shape
+  // A structural op (MatMul) is unknown-for-RF regardless of attrs.
+  uint32_t mo = add_value(m, g, "mo", ir::DType::F32, {1, 1, 8, 8});
+  add_node(m, g, "MatMul", {in}, {mo});
+
+  std::vector<NodeReceptiveField> rf = compute_receptive_fields(m, 0);
+  REQUIRE(rf.size() == 2);
+  CHECK_FALSE(rf[0].known);   // Conv missing kernel_shape
+  CHECK(rf[0].rf == 0);
+  CHECK_FALSE(rf[1].known);   // MatMul structural-unknown
+  CHECK(rf[1].rf == 0);
+}
+
+TEST_CASE("RF: empty in table mode / out-of-range graph_index") {
+  {  // table mode
+    ir::Model m;
+    m.format_name = m.intern("GGUF");
+    m.has_graph = false;
+    CHECK(compute_receptive_fields(m, 0).empty());
+  }
+  {  // out-of-range graph_index
+    ir::Model m;
+    m.format_name = m.intern("ONNX");
+    m.has_graph = true;
+    m.graphs.emplace_back();
+    ir::Graph& g = m.graphs[0];
+    uint32_t in = add_value(m, g, "in", ir::DType::F32, {1, 1, 8, 8});
+    g.graph_inputs.push_back(in);
+    add_conv(m, g, in, "c0", 3, 1, 1);
+    CHECK(compute_receptive_fields(m, 999).empty());
+  }
+}
