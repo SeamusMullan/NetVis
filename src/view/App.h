@@ -175,6 +175,16 @@ struct ViewState {
   // transient Ctrl+F overlay). Its query is shared with the overlay via
   // search_query, so typing in either updates both. Toggled from the View menu.
   bool show_search_results = false;
+
+  // --- v0.8.3 additions (append-only) ----------------------------------------
+  // #4/#30: roofline machine-balance. When custom_ridge > 0 the analyzer uses it
+  // as the ridge FLOP/byte instead of the selected built-in preset; 0 => use the
+  // preset. machine_profiles are user-named (name, ridge) HW profiles, persisted
+  // to view_prefs.json, that populate the machine-balance selector. Global (not
+  // per-tab) conceptually, but ViewState is per-tab so the active tab's copy is
+  // what save_prefs persists — acceptable (a single-user preference).
+  double custom_ridge = 0.0;
+  std::vector<std::pair<std::string, double>> machine_profiles;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather

@@ -31,6 +31,7 @@
 #include "engine/LayoutEngine.h"
 #include "engine/CollapseTree.h"
 #include "engine/CostModel.h"
+#include "core/SafeMath.h"   // safe_mul (canonical saturating multiply, #29)
 #include "ir/IR.h"
 #include "view/App.h"
 #include "view/GraphNav.h"
@@ -175,12 +176,14 @@ void ensure_cost(App& app) {
   // when this advances or FLOPs/peak stay at their pre-inference (empty) values.
   const uint64_t enrich = s.enrich_generation();
 
-  // Check if the cache key matches (same discipline as ensure_nav).
-  const bool key_match =
-      vs.cost && vs.cost_key_generation == generation &&
-      vs.cost_key_graph == graph && vs.cost_key_collapse == collapse_hash &&
-      vs.cost_key_enrich == enrich;
-  if (!key_match) {
+  // Check staleness via the pure engine predicate (#5: unit-tested headless, so
+  // the rebuild decision the view runs IS the tested one). The individual
+  // cost_key_* fields on ViewState are the frozen storage; assemble them into a
+  // CostCacheKey to compare.
+  const CostCacheKey cached{vs.cost_key_generation, vs.cost_key_graph,
+                            vs.cost_key_collapse, vs.cost_key_enrich};
+  const CostCacheKey now{generation, graph, collapse_hash, enrich};
+  if (cached.stale(now, vs.cost != nullptr)) {
     // Record the key we are rebuilding for.
     vs.cost_key_generation = generation;
     vs.cost_key_graph = graph;
@@ -436,6 +439,112 @@ void draw_cost_section(App& app) {
     }
   }
 
+  // --- #29 what-if batch-size slider ------------------------------------------
+  // Rescales the FLOP/activation totals by a hypothetical batch N. ONNX exports
+  // are typically batch-1; FLOPs and activation memory scale ~linearly with batch
+  // while weights are batch-invariant. This is an ESTIMATE (assumes the batch dim
+  // scales all compute linearly — true for dense/conv/attention, not for
+  // batch-independent ops), shown as a separate what-if line, never overwriting
+  // the measured totals above. Local static (a transient what-if control).
+  if (report->from_graph && report->nodes_flops_known > 0) {
+    static int batch = 1;
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SliderInt("batch (what-if)", &batch, 1, 256);
+    if (batch > 1) {
+      const uint64_t bf = static_cast<uint64_t>(batch);
+      kv_u64("  FLOPs @ N", safe_mul(report->total_flops, bf));
+      kv_bytes("  peak act @ N", safe_mul(report->peak_activation_bytes, bf));
+      ImGui::TextDisabled("  approximate: assumes linear batch scaling");
+    }
+  }
+
+  // --- #25 top-N cost hotspots -------------------------------------------------
+  // The heaviest ops by FLOPs, with jump-to-node. Reads report->per_node (already
+  // computed); builds a small top-N via partial_sort on an index vector, so it is
+  // O(V) build + O(V log N) select — cheap, recomputed per frame only when the
+  // section is open (CollapsingHeader gates the work).
+  if (report->from_graph && !report->per_node.empty() &&
+      ImGui::CollapsingHeader("Cost hotspots (top 10)")) {
+    uint32_t gi = s.current_graph();
+    if (gi < model->graphs.size()) {
+      const ir::Graph& g = model->graphs[gi];
+      std::vector<uint32_t> idx;
+      idx.reserve(report->per_node.size());
+      for (uint32_t i = 0;
+           i < report->per_node.size() && i < g.nodes.size(); ++i)
+        if (report->per_node[i].flops_known && report->per_node[i].flops > 0)
+          idx.push_back(i);
+      const size_t topN = std::min<size_t>(10, idx.size());
+      std::partial_sort(
+          idx.begin(), idx.begin() + static_cast<long>(topN), idx.end(),
+          [&](uint32_t a, uint32_t b) {
+            if (report->per_node[a].flops != report->per_node[b].flops)
+              return report->per_node[a].flops > report->per_node[b].flops;
+            return a < b;  // deterministic tie-break
+          });
+      if (topN == 0) {
+        ImGui::TextDisabled("  (no nodes with known FLOPs)");
+      } else if (ImGui::BeginTable("hotspots", 3,
+                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("op", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableSetupColumn("FLOPs");
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+        ImGui::TableHeadersRow();
+        for (size_t r = 0; r < topN; ++r) {
+          uint32_t ni = idx[r];
+          const ir::Node& node = g.nodes[ni];
+          std::string_view nm = model->str(node.name);
+          std::string_view opn = model->str(node.op_type);
+          ImGui::TableNextRow();
+          ImGui::PushID(static_cast<int>(ni));
+          ImGui::TableSetColumnIndex(0);
+          ImGui::TextUnformatted(nm.empty() ? std::string(opn).c_str()
+                                            : std::string(nm).c_str());
+          ImGui::TableSetColumnIndex(1);
+          ImGui::TextUnformatted(
+              grouped_count(static_cast<int64_t>(report->per_node[ni].flops)).c_str());
+          ImGui::TableSetColumnIndex(2);
+          if (ImGui::SmallButton("jump")) nav_jump_to_ir_node(app, ni);
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+    }
+  }
+
+  // --- #27 cumulative-cost sparkline (along topological node order) -----------
+  // ONNX node order is topological (spec), so per_node index order IS execution
+  // order. Plot the running FLOP fraction as a sparkline — a quick read of WHERE
+  // in the network the compute concentrates. Downsampled to the plot width.
+  if (report->from_graph && !report->per_node.empty() &&
+      ImGui::CollapsingHeader("Cumulative FLOPs (exec order)")) {
+    // Build the cumulative fraction curve (double, 0..1). Cheap O(V). The
+    // denominator is the report's precomputed flops-known sum (no extra pass).
+    const size_t V = report->per_node.size();
+    const double total = static_cast<double>(report->total_flops);
+    if (total > 0.0) {
+      constexpr int kMaxPlot = 256;  // cap the plotted array
+      const int pts = static_cast<int>(std::min<size_t>(V, kMaxPlot));
+      std::vector<float> curve(static_cast<size_t>(pts), 0.0f);
+      double acc = 0.0;
+      for (size_t i = 0; i < V; ++i) {
+        if (report->per_node[i].flops_known)
+          acc += static_cast<double>(report->per_node[i].flops);
+        // Map node i to a plot bucket; keep the running max in that bucket.
+        // V>=1 and pts>=1 here, so the division is always well-defined.
+        int b = static_cast<int>((i * static_cast<size_t>(pts)) / V);
+        if (b >= pts) b = pts - 1;
+        curve[static_cast<size_t>(b)] =
+            static_cast<float>(acc / total);
+      }
+      ImGui::PlotLines("##cumflops", curve.data(), pts, 0, "cumulative FLOP %",
+                       0.0f, 1.0f, ImVec2(0, 60));
+      ImGui::TextDisabled("left = input, right = output; steep = compute-heavy region");
+    } else {
+      ImGui::TextDisabled("  (no known FLOPs to plot)");
+    }
+  }
+
   // --- Activation memory timeline (#28) ---------------------------------------
   // The full liveness curve behind peak_activation_bytes: resident activation
   // bytes at each node's high-water point in exec (topological) order. Graph-mode
@@ -526,7 +635,7 @@ void draw_cost_section(App& app) {
 
     // Roofline verdict at a user-selectable machine-balance preset. Recomputed at
     // draw time (cheap O(V)); the stored CostReport::roofline is the default-ridge
-    // snapshot. The preset need not persist — a local static is enough.
+    // snapshot. The preset selection need not persist — a local static is enough.
     static RooflinePreset roof_preset = RooflinePreset::Generic;
     ImGui::SetNextItemWidth(180.0f);
     if (ImGui::BeginCombo("Machine balance",
@@ -534,13 +643,69 @@ void draw_cost_section(App& app) {
       for (int i = 0; i < kRooflinePresetCount; ++i) {
         auto p = static_cast<RooflinePreset>(i);
         bool is_sel = (roof_preset == p);
-        if (ImGui::Selectable(roofline_preset_name(p), is_sel)) roof_preset = p;
+        if (ImGui::Selectable(roofline_preset_name(p), is_sel)) {
+          roof_preset = p;
+          vs.custom_ridge = 0.0;  // picking a preset clears any custom override
+        }
         if (is_sel) ImGui::SetItemDefaultFocus();
       }
       ImGui::EndCombo();
     }
-    RooflineSummary roof =
-        compute_roofline(*report, ridge_flop_per_byte(roof_preset));
+
+    // #4 user-tunable ridge + #30 named HW profiles. custom_ridge>0 overrides the
+    // preset; profiles are persisted named (name, ridge) pairs. eff_ridge is the
+    // one derived value used by the input seed, the save handler, and the roofline.
+    const double eff_ridge =
+        vs.custom_ridge > 0.0 ? vs.custom_ridge : ridge_flop_per_byte(roof_preset);
+    float ridge_edit = static_cast<float>(eff_ridge);
+    ImGui::SetNextItemWidth(120.0f);
+    if (ImGui::InputFloat("ridge FLOP/byte", &ridge_edit, 0.0f, 0.0f, "%.1f",
+                          ImGuiInputTextFlags_EnterReturnsTrue)) {
+      vs.custom_ridge = ridge_edit > 0.0f ? static_cast<double>(ridge_edit) : 0.0;
+      app.save_prefs();
+    }
+    if (vs.custom_ridge > 0.0) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("(custom)");
+    }
+    // Saved machine profiles: a combo to load + a save-current control.
+    if (!vs.machine_profiles.empty()) {
+      ImGui::SetNextItemWidth(180.0f);
+      if (ImGui::BeginCombo("Saved profiles", "load...")) {
+        int to_delete = -1;
+        for (size_t i = 0; i < vs.machine_profiles.size(); ++i) {
+          ImGui::PushID(static_cast<int>(i));
+          char lbl[96];
+          std::snprintf(lbl, sizeof(lbl), "%s (%.1f)",
+                        vs.machine_profiles[i].first.c_str(),
+                        vs.machine_profiles[i].second);
+          if (ImGui::Selectable(lbl)) {
+            vs.custom_ridge = vs.machine_profiles[i].second;
+            app.save_prefs();
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("x")) to_delete = static_cast<int>(i);
+          ImGui::PopID();
+        }
+        ImGui::EndCombo();
+        if (to_delete >= 0) {
+          vs.machine_profiles.erase(vs.machine_profiles.begin() + to_delete);
+          app.save_prefs();
+        }
+      }
+    }
+    static char prof_name[48] = {0};
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputTextWithHint("##prof_name", "profile name", prof_name,
+                             sizeof(prof_name));
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Save profile") && prof_name[0]) {
+      vs.machine_profiles.emplace_back(prof_name, eff_ridge);
+      prof_name[0] = '\0';
+      app.save_prefs();
+    }
+
+    RooflineSummary roof = compute_roofline(*report, eff_ridge);
     double cbf = roof.compute_bound_fraction() * 100.0;
     ImGui::Text("Roofline: %.0f%% compute-bound (%u nodes), %.0f%% memory-bound "
                 "(%u nodes)",

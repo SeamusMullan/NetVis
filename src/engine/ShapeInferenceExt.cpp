@@ -501,6 +501,24 @@ uint32_t infer_shapes_ext(Model& model, uint32_t graph_index,
       continue;
     }
 
+    // --- MatMulNBits (com.microsoft, #1): A=[..., K], packed n-bit weight of
+    // logical shape [N, K]. Output replaces A's last dim with N (the "N" attr).
+    // The ONNX parser stores op_type BARE (domain stripped), so it arrives as
+    // "MatMulNBits"; match the last dot-segment defensively in case a future
+    // format/plugin path delivers a domain-prefixed name. Honest carry-dtype when
+    // A rank<1 or the N attr is missing.
+    if (op.substr(op.rfind('.') + 1) == "MatMulNBits") {
+      int64_t N = attr_int(model, g, n, "N", 0);
+      if (!s0.empty() && N > 0) {
+        Shape s = s0;
+        s[s.size() - 1] = N;
+        if (set_shape(outv, s, dt0)) ++resolved;
+      } else {
+        carry_dtype(outv, dt0);
+      }
+      continue;
+    }
+
     // --- Conv / ConvTranspose (NCHW) ----------------------------------------
     if (op == "Conv" || op == "ConvTranspose") {
       auto out = conv_output_shape(model, g, n, s0, s1, op == "ConvTranspose");

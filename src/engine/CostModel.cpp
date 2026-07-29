@@ -317,8 +317,20 @@ void compute_flops(const ir::Model& model, const ir::Graph& g,
       if (H < 1 || d < 1) return;
       hidden_q = static_cast<int64_t>(safe_mul(static_cast<uint64_t>(H),
                                                static_cast<uint64_t>(d)));
+    } else if (q->shape.size() == 5) {
+      // #6 packed-QKV: query [B, S, N, 3, H] — the rank-5 layout packs Q,K,V into
+      // one tensor (the "3"). hidden_q is per-Q, so multiply the head count N by
+      // the head size H and ignore the pack dim (which must be exactly 3). The
+      // core-attention MAC formula below is unchanged (head dim cancels).
+      B = q->shape[0];
+      S_q = q->shape[1];
+      int64_t N = q->shape[2], pack = q->shape[3], H = q->shape[4];
+      if (N < 1 || H < 1) return;
+      if (pack != 3) return;  // not a QKV pack => honest-unknown
+      hidden_q = static_cast<int64_t>(safe_mul(static_cast<uint64_t>(N),
+                                               static_cast<uint64_t>(H)));
     } else {
-      return;  // query rank not in {3,4}
+      return;  // query rank not in {3,4,5}
     }
     if (B < 1 || S_q < 1 || hidden_q < 1) return;
     int64_t S_kv = S_q;  // self-attention fallback
@@ -472,6 +484,50 @@ void compute_flops(const ir::Model& model, const ir::Graph& g,
     uint64_t e = elem_count_from_shape(out->shape);
     if (e == 0) return;
     nc.flops = e;
+    nc.flops_known = true;
+    return;
+  }
+
+  // MatMulNBits (com.microsoft): the dominant weight-quantized MatMul in modern
+  // LLM ONNX exports (#1). A = in[0] = [..., K]; weight B is packed n-bit and its
+  // logical shape [N, K] comes from the K/N attrs, not a resolvable value shape.
+  // The compute is a plain matmul in dequantized space: macs = |O| * K, where |O|
+  // is the output element count and K is the contraction dim (the "K" attr, or A's
+  // last dim as a fallback). flops = 2*macs. Honest-unknown on any unresolved dim.
+  if (nop == "matmulnbits") {
+    const ir::ValueInfo* out = get_output_value(g, node, 0);
+    if (!out) return;
+    uint64_t out_elems = elem_count_from_shape(out->shape);
+    if (out_elems == 0) return;
+    int64_t K = get_int_attr(model, g, node, "K", 0);
+    if (K < 1) {
+      // Fall back to A's last dim when the K attr is absent/zero.
+      const ir::ValueInfo* A = get_input_value(g, node, 0);
+      if (!A || A->shape.empty()) return;
+      K = A->shape.back();
+    }
+    if (K < 1) return;
+    uint64_t macs = safe_mul(out_elems, static_cast<uint64_t>(K));
+    nc.flops = safe_mul(macs, 2);
+    nc.flops_known = true;
+    return;
+  }
+
+  // Variadic Sum / Mean (#3): N-input elementwise. Counting them as |O| (one
+  // op/elem) understates the true cost of the fan-in reduction: Sum of N inputs is
+  // (N-1) adds per output element, Mean is N (N-1 adds + 1 divide). Route them
+  // explicitly off node.inputs.count rather than the generic Elementwise |O|.
+  if (nop == "sum" || nop == "mean") {
+    const ir::ValueInfo* out = get_output_value(g, node, 0);
+    if (!out) return;
+    uint64_t elems = elem_count_from_shape(out->shape);
+    if (elems == 0) return;
+    uint32_t nin = node.inputs.count;
+    if (nin < 1) return;
+    // Sum: (N-1)*|O| adds. Mean: N*|O| (the extra term is the divide-by-N).
+    uint64_t factor = (nop == "mean") ? nin : (nin - 1);
+    if (factor == 0) factor = 1;  // single-input Sum degenerates to a copy (~|O|).
+    nc.flops = safe_mul(elems, factor);
     nc.flops_known = true;
     return;
   }
@@ -902,6 +958,15 @@ double RooflineSummary::compute_bound_fraction() const {
 }
 
 double ridge_flop_per_byte(RooflinePreset p) {
+  // #4: ridge = peak compute (FLOP/s) / peak bandwidth (byte/s), MAC=2 convention.
+  // Order-of-magnitude datasheet ESTIMATES, NOT measurements (the UI labels the
+  // whole roofline "approximate"); a user who needs an exact target enters a
+  // custom ridge in the analyzer panel. Sources per preset:
+  //   Generic   40 : ~10 TFLOP/s ÷ ~250 GB/s  — a representative mixed-precision accelerator.
+  //   CpuServer  8 : ~1  TFLOP/s ÷ ~128 GB/s  — a many-core server CPU, fp32 (e.g. dual-socket Xeon-class).
+  //   GpuFp32   13 : ~13 TFLOP/s ÷ ~1  TB/s   — a desktop GPU on fp32 lanes (e.g. RTX-class).
+  //   GpuTensor 200: ~300 TFLOP/s ÷ ~1.5 TB/s — a datacenter GPU tensor/low-precision path (e.g. A100-class HBM).
+  //   MobileNpu 30 : ~5  TFLOP/s ÷ ~68 GB/s   — a mobile NPU + LPDDR (low precision).
   switch (p) {
     case RooflinePreset::Generic:   return 40.0;
     case RooflinePreset::CpuServer: return 8.0;

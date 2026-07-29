@@ -95,6 +95,29 @@ void draw_histogram(const TensorStats& s) {
   ImGui::Text("max %g", s.hist_max);
 }
 
+// #51: unflatten a row-major flat index to a multi-dim coordinate string like
+// "[12, 0, 3]" via the tensor shape: coord[k] = (idx / prod(shape[k+1:])) %
+// shape[k]. Returns "[]" for a scalar/empty shape. A dynamic (-1) OR zero dim
+// can't be unflattened meaningfully (and a 0 dim would make the `% shape[k]`
+// divide-by-zero on an inconsistent/hostile model whose payload has bytes but a
+// 0-valued declared dim), so we fall back to the raw flat index.
+std::string coord_string(const ir::TensorRef& t, uint64_t flat) {
+  if (t.shape.empty()) return "[]";
+  for (int64_t d : t.shape)
+    if (d <= 0) return "flat #" + std::to_string(flat);
+  std::string out = "[";
+  for (size_t k = 0; k < t.shape.size(); ++k) {
+    uint64_t inner = 1;  // prod(shape[k+1:])
+    for (size_t j = k + 1; j < t.shape.size(); ++j)
+      inner *= static_cast<uint64_t>(t.shape[j]);
+    uint64_t c = inner ? (flat / inner) % static_cast<uint64_t>(t.shape[k]) : 0;
+    if (k) out += ", ";
+    out += std::to_string(c);
+  }
+  out += "]";
+  return out;
+}
+
 // Run a save dialog + export, toasting the result. `raw` selects raw bin vs npy.
 void do_export(App& app, const ir::TensorRef& t, bool raw) {
   const char* pat_npy[] = {"*.npy"};
@@ -214,6 +237,83 @@ void draw_weight_inspector(App& app) {
 
   ImGui::SeparatorText("Histogram");
   draw_histogram(s);
+
+  // #51: argmin/argmax with their multi-dim coordinates ("jump to"). Skip an
+  // extreme whose index is UINT64_MAX (no finite element was scanned).
+  if (s.min_index != UINT64_MAX || s.max_index != UINT64_MAX) {
+    ImGui::SeparatorText("Extremes");
+    if (s.min_index != UINT64_MAX)
+      ImGui::Text("min %g at %s", s.min, coord_string(t, s.min_index).c_str());
+    if (s.max_index != UINT64_MAX)
+      ImGui::Text("max %g at %s", s.max, coord_string(t, s.max_index).c_str());
+  }
+
+  // #48: whole-tensor + per-channel outlier warnings (red for the alarming ones).
+  const ImVec4 warn(0.95f, 0.4f, 0.4f, 1.0f);
+  if (s.has_nan_inf())
+    ImGui::TextColored(warn, "%llu NaN/Inf values",
+                       static_cast<unsigned long long>(s.nan_inf_count));
+  if (s.all_zero()) ImGui::TextColored(warn, "tensor is all zero");
+  if (!s.per_channel.empty()) {
+    uint64_t dead = 0, nan_ch = 0;
+    for (const ChannelStat& c : s.per_channel) {
+      if (c.all_zero()) ++dead;
+      if (c.has_nan_inf()) ++nan_ch;
+    }
+    if (dead || nan_ch)
+      ImGui::TextColored(warn, "%llu dead channels, %llu channels with NaN/Inf",
+                         static_cast<unsigned long long>(dead),
+                         static_cast<unsigned long long>(nan_ch));
+  }
+
+  // #46: per-output-channel stats. Collapsible + virtualized (up to kMaxChannels
+  // rows). Capped tensors show a note instead of an unbounded table.
+  if (s.per_channel_capped) {
+    ImGui::SeparatorText("Per-channel");
+    ImGui::TextDisabled("too many channels (>%u) — per-channel stats omitted",
+                        kMaxChannels);
+  } else if (!s.per_channel.empty()) {
+    char hdr[48];
+    std::snprintf(hdr, sizeof(hdr), "Per-channel (%zu)", s.per_channel.size());
+    if (ImGui::CollapsingHeader(hdr)) {
+      const ImGuiTableFlags cflags = ImGuiTableFlags_Borders |
+                                     ImGuiTableFlags_RowBg |
+                                     ImGuiTableFlags_ScrollY;
+      ImVec2 tsize(0.0f, 220.0f);
+      if (ImGui::BeginTable("per_channel", 5, cflags, tsize)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("ch");
+        ImGui::TableSetupColumn("min");
+        ImGui::TableSetupColumn("max");
+        ImGui::TableSetupColumn("mean");
+        ImGui::TableSetupColumn("flag");
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(s.per_channel.size()));
+        while (clipper.Step()) {
+          for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+            const ChannelStat& c = s.per_channel[static_cast<size_t>(r)];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%d", r);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%g", c.min);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%g", c.max);
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%g", c.mean);
+            ImGui::TableSetColumnIndex(4);
+            if (c.has_nan_inf())
+              ImGui::TextColored(warn, "nan");
+            else if (c.all_zero())
+              ImGui::TextColored(warn, "dead");
+          }
+        }
+        ImGui::EndTable();
+      }
+    }
+  }
 
   ImGui::SeparatorText("Export");
   if (ImGui::Button("Export .npy")) do_export(app, t, /*raw=*/false);

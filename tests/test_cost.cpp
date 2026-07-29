@@ -1097,9 +1097,11 @@ TEST_CASE("Cost: gap-fill ReduceL2 gets |input0|") {
   CHECK(r.per_node[0].flops == 4 * 8);  // 32
 }
 
-TEST_CASE("Cost: unhandled quant op with no formula stays flops_known=false") {
-  // MatMulNBits is out-of-scope for v0.4.0 (no explicit handler, not in a generic
-  // category) -> honest unknown, never fabricated.
+TEST_CASE("Cost: MatMulNBits FLOPs (#1) = 2 * |O| * K") {
+  // v0.8.3 (#1): MatMulNBits (com.microsoft) now has an explicit handler — the
+  // dominant weight-quantized MatMul in modern LLM exports. macs = |O| * K (K from
+  // the "K" attr, or input[0]'s last dim as a fallback); flops = 2*macs. Here no K
+  // attr is set, so K falls back to A.back() = 16; |O| = 8*32 = 256.
   ir::Model m;
   m.format_name = m.intern("ONNX");
   m.graphs.emplace_back();
@@ -1112,8 +1114,102 @@ TEST_CASE("Cost: unhandled quant op with no formula stays flops_known=false") {
 
   CostReport r = compute_cost(m, 0);
   REQUIRE(r.per_node.size() == 1);
-  CHECK_FALSE(r.per_node[0].flops_known);
-  CHECK(r.per_node[0].flops == 0);
+  CHECK(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 2ull * 256 * 16);  // 8192
+}
+
+TEST_CASE("Cost: MatMulNBits honors the K attr over input fallback (#1)") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+  uint32_t a = add_value(m, g, "a", ir::DType::F32, {4, 64});
+  uint32_t b = add_value(m, g, "b", ir::DType::U8, {8, 0});  // packed, opaque
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {4, 8});
+  add_node(m, g, "com.microsoft.MatMulNBits", {a, b}, {out});
+  add_attr_int(m, g, "K", 64);
+  add_attr_int(m, g, "N", 8);
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 2ull * (4 * 8) * 64);  // |O|=32, K=64
+}
+
+TEST_CASE("Cost: variadic Sum/Mean fan-in factor (#3)") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+  uint32_t x0 = add_value(m, g, "x0", ir::DType::F32, {2, 5});
+  uint32_t x1 = add_value(m, g, "x1", ir::DType::F32, {2, 5});
+  uint32_t x2 = add_value(m, g, "x2", ir::DType::F32, {2, 5});
+  uint32_t sout = add_value(m, g, "sout", ir::DType::F32, {2, 5});
+  add_node(m, g, "Sum", {x0, x1, x2}, {sout});  // 3 inputs -> (3-1)*|O|
+  uint32_t mout = add_value(m, g, "mout", ir::DType::F32, {2, 5});
+  add_node(m, g, "Mean", {x0, x1, x2}, {mout});  // 3 inputs -> 3*|O|
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 2);
+  CHECK(r.per_node[0].flops_known);
+  CHECK(r.per_node[0].flops == 2ull * 10);   // Sum: (3-1)*10 = 20
+  CHECK(r.per_node[1].flops_known);
+  CHECK(r.per_node[1].flops == 3ull * 10);   // Mean: 3*10 = 30
+}
+
+TEST_CASE("Cost: MultiHeadAttention packed-QKV rank-5 query (#6)") {
+  // query [B,S,N,3,H] -> hidden_q = N*H, pack dim must be 3. macs =
+  // 2*B*S_q*S_kv*hidden_q (S_kv=S_q self-attn); flops = 2*macs.
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+  // B=1, S=8, N=4 heads, pack=3, H=16 -> hidden_q = 64.
+  uint32_t q = add_value(m, g, "q", ir::DType::F32, {1, 8, 4, 3, 16});
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {1, 8, 64});
+  add_node(m, g, "com.microsoft.MultiHeadAttention", {q}, {out});
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK(r.per_node[0].flops_known);
+  // macs = 2 * 1 * 8 * 8 * 64 = 8192; flops = 2*macs = 16384.
+  CHECK(r.per_node[0].flops == 2ull * (2ull * 1 * 8 * 8 * 64));
+}
+
+TEST_CASE("Cost: MultiHeadAttention rank-5 with pack!=3 stays unknown (#6)") {
+  ir::Model m;
+  m.format_name = m.intern("ONNX");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+  uint32_t q = add_value(m, g, "q", ir::DType::F32, {1, 8, 4, 2, 16});  // pack=2
+  uint32_t out = add_value(m, g, "out", ir::DType::F32, {1, 8, 64});
+  add_node(m, g, "com.microsoft.MultiHeadAttention", {q}, {out});
+
+  CostReport r = compute_cost(m, 0);
+  REQUIRE(r.per_node.size() == 1);
+  CHECK_FALSE(r.per_node[0].flops_known);  // not a coherent QKV pack
+}
+
+// --- #5 cost-cache-key staleness (headless; the ensure_cost rebuild decision) --
+TEST_CASE("Cost: CostCacheKey::stale detects every rebuild trigger (#5)") {
+  const CostCacheKey k{/*gen*/ 1, /*graph*/ 0, /*collapse*/ 100, /*enrich*/ 5};
+
+  // No cached report -> always stale, regardless of key equality.
+  CHECK(k.stale(k, /*has_report=*/false));
+  // Identical key with a cached report -> NOT stale (no needless rebuild).
+  CHECK_FALSE(k.stale(k, /*has_report=*/true));
+
+  // Each individual field change forces a rebuild:
+  CHECK(k.stale({2, 0, 100, 5}, true));   // new generation (reopen)
+  CHECK(k.stale({1, 1, 100, 5}, true));   // graph switch (subgraph dive)
+  CHECK(k.stale({1, 0, 200, 5}, true));   // collapse-hash change (expand/collapse)
+  // enrich bump is the v0.3.0 stale-report blocker: shapes mutate in place after
+  // publish WITHOUT a generation bump, so this MUST be stale.
+  CHECK(k.stale({1, 0, 100, 6}, true));
+
+  // Equality operator symmetry.
+  CHECK(k == CostCacheKey{1, 0, 100, 5});
+  CHECK_FALSE(k == CostCacheKey{1, 0, 100, 6});
 }
 
 // --- efficiency: arithmetic intensity / roofline / metric_value ---------------

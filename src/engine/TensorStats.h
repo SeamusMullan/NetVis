@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "core/MappedFile.h"
 #include "core/Result.h"
@@ -17,6 +18,24 @@
 namespace netvis {
 
 constexpr int kHistogramBuckets = 64;
+
+// #46: per-output-channel accumulation is capped so a weight with a huge dim-0
+// (e.g. a vocab-sized embedding) never allocates an unbounded per-channel vector
+// or blows the decode budget. Beyond this, per_channel is left empty and
+// per_channel_capped is set (the inspector shows whole-tensor stats only).
+constexpr uint32_t kMaxChannels = 4096;
+
+// #46: per-output-channel summary. Channel = index along dim 0 (weights are
+// [Cout, ...] by convention). Streaming min/max/mean + a dead/NaN flag per
+// channel for quant debugging.
+struct ChannelStat {
+  double min = 0, max = 0, mean = 0;
+  uint64_t zero_count = 0;      // zeros in this channel
+  uint64_t nan_inf_count = 0;   // NaN/Inf in this channel
+  uint64_t count = 0;           // elements in this channel (== elems_per_channel)
+  bool all_zero() const { return count > 0 && zero_count == count; }  // #48 dead
+  bool has_nan_inf() const { return nan_inf_count > 0; }              // #48
+};
 
 // One-pass summary of a tensor's values (spec §7.5).
 struct TensorStats {
@@ -27,6 +46,25 @@ struct TensorStats {
   std::array<uint64_t, kHistogramBuckets> histogram{};
   double hist_min = 0, hist_max = 0;        // histogram range
   bool quantized_unsupported = false;       // GGUF Q* -> metadata only (spec §7.5)
+
+  // --- v0.8.3 additions (append-only) ---------------------------------------
+  // #51: flat index of the first minimum / maximum element (argmin/argmax over
+  // finite values), recorded during the streaming pass. UINT64_MAX if no finite
+  // element was scanned (empty / all-NaN). The inspector maps a flat index back
+  // to a multi-dim coordinate via the tensor shape for "jump to".
+  uint64_t min_index = UINT64_MAX;
+  uint64_t max_index = UINT64_MAX;
+
+  // #48 whole-tensor outlier flags (derived from the counts above; convenience so
+  // the inspector doesn't re-derive them). all_zero: every element is 0. has_*: at
+  // least one such element.
+  bool all_zero() const { return count > 0 && zero_count == count; }
+  bool has_nan_inf() const { return nan_inf_count > 0; }
+
+  // #46: per-output-channel stats (dim-0 slices), or EMPTY when the tensor is
+  // rank<1, has one channel, or exceeds kMaxChannels (see per_channel_capped).
+  std::vector<ChannelStat> per_channel;
+  bool per_channel_capped = false;  // true => too many channels; per_channel empty
 };
 
 // Decode a tensor's payload and compute stats. `base` is the model's mmap;

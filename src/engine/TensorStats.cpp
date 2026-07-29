@@ -280,7 +280,42 @@ Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
   stats.count = n;
   if (n == 0) return stats;
 
+  // #46: per-output-channel accumulation setup. Channel = index along dim 0
+  // (weights are [Cout, ...]). GUARD (spec §7.5 + kMaxChannels): only accumulate
+  // when there are >=2 channels that divide the scanned count cleanly AND the
+  // channel count stays within kMaxChannels — so a vocab-sized embedding
+  // ([50257, 768]) never allocates an unbounded per-channel vector or blows the
+  // decode budget. `elems_per_channel` uses the ACTUAL scanned element count `n`
+  // (already clamped to the payload by elem_count_from_bytes), never the declared
+  // shape product, so a hostile shape can't drive `i / elems_per_channel` OOB.
+  //   - channels > kMaxChannels          -> per_channel_capped = true, empty
+  //   - channels < 2 or n % channels != 0 -> skip cleanly (empty, NOT capped)
+  const int64_t channels_i = t.shape.empty() ? 0 : t.shape[0];
+  uint64_t channels = 0, elems_per_channel = 0;
+  bool per_channel_on = false;
+  if (channels_i > static_cast<int64_t>(kMaxChannels)) {
+    stats.per_channel_capped = true;  // too many channels; per_channel stays empty
+  } else if (channels_i >= 2 &&
+             n % static_cast<uint64_t>(channels_i) == 0) {
+    channels = static_cast<uint64_t>(channels_i);
+    elems_per_channel = n / channels;
+    stats.per_channel.assign(channels, ChannelStat{});
+    per_channel_on = true;
+  }
+  // Scratch sums parallel to per_channel; ChannelStat has no sum field. min/max
+  // start at +/-inf so the first finite value wins (default 0 would be wrong).
+  std::vector<double> ch_sum;
+  if (per_channel_on) {
+    ch_sum.assign(channels, 0.0);
+    for (auto& c : stats.per_channel) {
+      c.min = std::numeric_limits<double>::infinity();
+      c.max = -std::numeric_limits<double>::infinity();
+    }
+  }
+
   // --- Pass 1: min/max/mean/std/counts, streaming in chunks ----------------
+  // Also records argmin/argmax flat indices (#51) and per-channel stats (#46) in
+  // this SAME pass — no extra full re-read of the payload.
   constexpr uint64_t kChunk = 65536;  // ~64K elems per chunk (no full copy)
   double vmin = std::numeric_limits<double>::infinity();
   double vmax = -std::numeric_limits<double>::infinity();
@@ -288,17 +323,43 @@ Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
   uint64_t zero_count = 0, naninf = 0;
   uint64_t finite_count = 0;
 
+  // #46: the channel index is MONOTONIC in i (row-major: dim0 is the outermost
+  // axis), so advance it incrementally at each channel boundary rather than doing
+  // a 64-bit divide per element on the streaming path (a real DIV since
+  // elems_per_channel is a runtime value; ~131M of them on a 500 MB weight).
+  uint64_t ci = 0;
+  uint64_t ch_boundary = per_channel_on ? elems_per_channel : n;  // next channel start
   for (uint64_t start = 0; start < n; start += kChunk) {
     uint64_t end = std::min(start + kChunk, n);
     for (uint64_t i = start; i < end; ++i) {
       double v = read_elem(p.ptr, t.dtype, i);
-      if (v == 0.0) ++zero_count;
-      if (std::isnan(v) || std::isinf(v)) { ++naninf; continue; }
-      if (v < vmin) vmin = v;
-      if (v > vmax) vmax = v;
+      const bool is_zero = (v == 0.0);
+      const bool bad = std::isnan(v) || std::isinf(v);
+      if (is_zero) ++zero_count;
+
+      ChannelStat* c = nullptr;
+      if (per_channel_on) {
+        if (i >= ch_boundary) { ++ci; ch_boundary += elems_per_channel; }
+        c = &stats.per_channel[ci];
+        if (is_zero) ++c->zero_count;
+      }
+
+      if (bad) {
+        ++naninf;
+        if (c) ++c->nan_inf_count;
+        continue;
+      }
+      // #51: track the flat index of the running min/max over finite values.
+      if (v < vmin) { vmin = v; stats.min_index = i; }
+      if (v > vmax) { vmax = v; stats.max_index = i; }
       sum += v;
       sumsq += v * v;
       ++finite_count;
+      if (c) {
+        if (v < c->min) c->min = v;
+        if (v > c->max) c->max = v;
+        ch_sum[ci] += v;
+      }
     }
   }
 
@@ -312,6 +373,24 @@ Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
     stats.std = std::sqrt(var);
     stats.min = vmin;
     stats.max = vmax;
+  }
+
+  // #46: finalize per-channel stats. count is the same constant for every channel
+  // (guaranteed by the n % channels == 0 gate), so set it once here instead of
+  // per-element in the hot loop. Then compute the mean over finite elements and
+  // reset the min/max sentinels for any all-NaN/Inf channel back to 0.
+  if (per_channel_on) {
+    for (uint64_t k = 0; k < channels; ++k) {
+      ChannelStat& c = stats.per_channel[k];
+      c.count = elems_per_channel;
+      const uint64_t finite = c.count - c.nan_inf_count;  // zeros are finite
+      if (finite > 0) {
+        c.mean = ch_sum[k] / static_cast<double>(finite);
+      } else {
+        c.min = 0;
+        c.max = 0;
+      }
+    }
   }
 
   // --- Pass 2: 64-bucket histogram (re-read from mmap, no full copy) --------
