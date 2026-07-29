@@ -282,6 +282,33 @@ std::vector<CategoryCost> rollup_by_category(const ir::Model& model,
                                              uint32_t graph_index,
                                              const CostReport& report);
 
+// --- v0.8.3 (#5): cost-report cache key -----------------------------------
+// The exact (generation, graph, collapse_hash, enrich_generation) tuple the view
+// keys its cached CostReport on. Extracted here as a pure, headless-testable value
+// so the rebuild decision — the path where the v0.3.0 stale-report and v0.3.1
+// group-scale bugs lived — is unit-tested against the SAME predicate the view runs
+// (ensure_cost uses stale(), not a parallel copy). ImGui-coupled downstream bits
+// (heatmap range / per-node tint) stay covered by the xvfb screenshot smoke run.
+struct CostCacheKey {
+  uint64_t generation = UINT64_MAX;
+  uint32_t graph = UINT32_MAX;
+  uint64_t collapse_hash = UINT64_MAX;
+  uint64_t enrich_generation = UINT64_MAX;
+
+  bool operator==(const CostCacheKey& o) const {
+    return generation == o.generation && graph == o.graph &&
+           collapse_hash == o.collapse_hash &&
+           enrich_generation == o.enrich_generation;
+  }
+  // True if a report cached under *this must be recomputed for `now`. `has_report`
+  // is false when no report is cached yet (always stale). Any differing field is
+  // stale — notably enrich_generation, since ONNX shape inference mutates shapes
+  // in place after publish WITHOUT bumping generation (the v0.3.0 blocker).
+  bool stale(const CostCacheKey& now, bool has_report) const {
+    return !has_report || !(*this == now);
+  }
+};
+
 // Build the cost report for graphs[graph_index]. Out-of-range graph_index, or a
 // model with has_graph == false, yields a table-mode report (from_graph == false,
 // per_node empty) built from model.flat_tensors. Deterministic; never reads a

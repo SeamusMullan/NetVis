@@ -39,6 +39,7 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"convtranspose", OpCategory::Conv},
       // MatMul
       {"matmul", OpCategory::MatMul},
+      {"matmulnbits", OpCategory::MatMul},  // #1 com.microsoft weight-quant MatMul
       {"gemm", OpCategory::MatMul},
       {"linear", OpCategory::MatMul},
       {"einsum", OpCategory::MatMul},

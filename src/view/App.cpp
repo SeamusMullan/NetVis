@@ -1006,6 +1006,14 @@ void App::save_prefs() {
   j["gradient_high"] = rgba_to_json(g.high);
   // #11: per-plugin enable overrides (empty object if the user changed nothing).
   j["plugins"] = plugin_enabled_.to_json();
+  // #4/#30 (v0.8.3): custom roofline ridge + named machine profiles.
+  if (view().custom_ridge > 0.0) j["custom_ridge"] = view().custom_ridge;
+  if (!view().machine_profiles.empty()) {
+    nlohmann::json profs = nlohmann::json::array();
+    for (const auto& [name, ridge] : view().machine_profiles)
+      profs.push_back({{"name", name}, {"ridge", ridge}});
+    j["machine_profiles"] = profs;
+  }
   std::ofstream f(layout_cache_dir() + "/view_prefs.json");
   if (f) f << j.dump(2);
 }
@@ -1056,6 +1064,18 @@ void App::load_prefs() {
     // #11: per-plugin enable overrides (guarded; never prunes, ignores non-bool).
     if (j.contains("plugins") && j["plugins"].is_object())
       plugin_enabled_.load_json(j["plugins"]);
+    // #4/#30: custom ridge + named machine profiles.
+    if (j.contains("custom_ridge") && j["custom_ridge"].is_number())
+      view().custom_ridge = j["custom_ridge"].get<double>();
+    if (j.contains("machine_profiles") && j["machine_profiles"].is_array()) {
+      view().machine_profiles.clear();
+      for (const auto& e : j["machine_profiles"]) {
+        if (e.is_object() && e.contains("name") && e["name"].is_string() &&
+            e.contains("ridge") && e["ridge"].is_number())
+          view().machine_profiles.emplace_back(e["name"].get<std::string>(),
+                                               e["ridge"].get<double>());
+      }
+    }
   } catch (...) {
     // Corrupt prefs -> keep defaults.
   }
