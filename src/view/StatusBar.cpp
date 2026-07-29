@@ -21,6 +21,7 @@
 #include "engine/LayoutEngine.h"
 #include "engine/ModelSession.h"
 #include "ir/IR.h"
+#include "parsers/Parser.h"  // #45: detect_format(...,reason) + detect_reason_name
 #include "view/App.h"
 
 namespace netvis {
@@ -29,6 +30,57 @@ namespace {
 
 // Height reserved for the status bar (also used to offset the toast stack).
 float status_bar_height() { return ImGui::GetFrameHeight(); }
+
+// Lowercased extension (no dot) of a mapped path, matching ModelSession's own
+// detection tiebreaker input. Local copy so the status bar can recompute the
+// detected format + reason WITHOUT touching the frozen ModelSession header.
+std::string ext_of(const std::string& path) {
+  auto slash = path.find_last_of("/\\");
+  auto dot = path.find_last_of('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+    return {};
+  }
+  std::string e = path.substr(dot + 1);
+  for (char& c : e) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return e;
+}
+
+// #45: the detected format + WHY, surfaced in the status bar so an
+// extension-only / content-default tiebreak is visible (vs. a trustworthy magic
+// hit). Recomputed here (not stored on the frozen ModelSession) but cached per
+// (session, generation) so detect_format runs once per load, not every frame.
+struct DetectTag {
+  const ModelSession* session = nullptr;
+  uint64_t generation = UINT64_MAX;
+  std::string path;  // guards pointer-ABA: a freed session reallocated at the same
+                     // address with the same per-tab generation still re-detects.
+  bool valid = false;
+  Format format = Format::Unknown;
+  DetectReason reason = DetectReason::None;
+};
+
+const DetectTag& detected_tag(ModelSession& session) {
+  static DetectTag cache;
+  const uint64_t gen = session.generation();
+  if (cache.session == &session && cache.generation == gen &&
+      cache.path == session.path() && cache.valid) {
+    return cache;
+  }
+  cache = DetectTag{};
+  cache.session = &session;
+  cache.generation = gen;
+  cache.path = session.path();
+  // Recompute over the exact inputs the parse pipeline used: the mapped inner
+  // file and its extension (map_path_ == file().path()).
+  const MappedFile& f = session.file();
+  if (f.valid()) {
+    DetectReason r = DetectReason::None;
+    cache.format = detect_format(f, ext_of(f.path()), r);
+    cache.reason = r;
+    cache.valid = true;
+  }
+  return cache;
+}
 
 // Append "label Xms . " for a stage that actually ran (>0), spec §8.7 omits 0.
 void append_timing(std::string& out, const char* label, double ms) {
@@ -114,10 +166,19 @@ void draw_status_bar(App& app) {
     }
   }
 
-  // Right: model path + counts. Compute a right-aligned string.
+  // Right: format tag + model path + counts. Compute a right-aligned string.
   const ir::Model* model = session.model();
   std::string right;
   if (model) {
+    // #45: format name + a short reason tag, e.g. "ONNX (structure)" or
+    // "PyTorch (content default)". Only shown once a model is loaded.
+    const DetectTag& tag = detected_tag(session);
+    if (tag.valid && tag.format != Format::Unknown) {
+      right += format_name(tag.format);
+      right += " (";
+      right += detect_reason_name(tag.reason);
+      right += ")  |  ";
+    }
     uint64_t nodes = 0;
     uint64_t tensors = model->flat_tensors.size();
     for (const ir::Graph& g : model->graphs) {
@@ -128,7 +189,7 @@ void draw_status_bar(App& app) {
     std::snprintf(buf, sizeof(buf), "%llu nodes  .  %llu tensors  |  ",
                   static_cast<unsigned long long>(nodes),
                   static_cast<unsigned long long>(tensors));
-    right = buf;
+    right += buf;
   }
   right += session.path().empty() ? "(no file)" : session.path();
 

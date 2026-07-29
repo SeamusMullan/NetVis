@@ -25,6 +25,14 @@ enum class DiffStatus : uint8_t {
   Changed,  // matched by name/position but fingerprint differs
 };
 
+// #35 node-matching strategy. NameThenTopology (default) is the v0.2.0 behavior:
+// match content-unique node NAMES first, then fall back to structural fingerprint
+// aligned by topological position. TopologyOnly skips the name pass entirely and
+// matches purely by fingerprint+topo-rank — useful when the two models were
+// exported with different naming (e.g. a re-quantized model that renamed nodes)
+// so a name match would spuriously fail. Same classification rules otherwise.
+enum class DiffMatch : uint8_t { NameThenTopology, TopologyOnly };
+
 // Per-node diff. a_status is parallel to graph A's node list; b_status to B's.
 // a_to_b[i] = the matched B node index for A node i, or -1. b_to_a symmetric.
 struct ModelDiffResult {
@@ -37,8 +45,11 @@ struct ModelDiffResult {
 };
 
 // Diff graph_a of model_a (primary) against graph_b of model_b (comparison).
-// Deterministic. See header notes for what is (not) read.
+// Deterministic. See header notes for what is (not) read. `match` (#35) selects
+// the node-matching strategy; defaults to the v0.2.0 name-then-topology behavior
+// so existing callers are unchanged.
 ModelDiffResult diff_models(const ir::Model& model_a, uint32_t graph_a,
-                            const ir::Model& model_b, uint32_t graph_b);
+                            const ir::Model& model_b, uint32_t graph_b,
+                            DiffMatch match = DiffMatch::NameThenTopology);
 
 }  // namespace netvis

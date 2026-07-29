@@ -28,6 +28,7 @@
 #include "engine/OpCategory.h"
 #include "engine/plugin/Registry.h"
 #include "ir/IR.h"
+#include "parsers/gguf/GgufMetadata.h"  // #44: well-known GGUF KV grouping
 #include "view/App.h"
 #include "view/CostPanel.h"
 #include "view/PanelHelpers.h"
@@ -227,6 +228,55 @@ void draw_model_root(App& app, const ir::Model& model) {
   kv("format", model.str(model.format_name));
   kv("producer", model.str(model.producer));
   kv("version", model.str(model.version_info));
+
+  // #44: GGUF metadata summary. GGUF is table-mode (has_graph==false), so this
+  // model-root view is what a GGUF user sees in Properties (the tensor table
+  // never selects a node). The parser already dropped every KV into
+  // model.metadata; here we pull the well-known keys (arch / quant / rope /
+  // attention / context length / block count …) into labelled groups ABOVE the
+  // raw KV table so the model's shape reads at a glance. Empty when not GGUF or
+  // when none of the recognised keys are present, so it self-hides.
+  {
+    // Cache the grouped summary per (model ptr, generation) — it's a pure function
+    // of the immutable metadata, so rebuilding its ~28×N key scans + string allocs
+    // every frame (this is the view a GGUF user sits on) is pure waste. Same
+    // (pointer, generation) cache pattern as the cost/detect caches.
+    static const ir::Model* gg_model = nullptr;
+    static uint64_t gg_gen = UINT64_MAX;
+    static std::vector<gguf::GgufSummaryGroup> gg_groups;
+    const uint64_t gen = app.session().generation();
+    if (gg_model != &model || gg_gen != gen) {
+      gg_model = &model;
+      gg_gen = gen;
+      gg_groups = gguf::summarize_gguf_metadata(model);
+    }
+    const std::vector<gguf::GgufSummaryGroup>& groups = gg_groups;
+    if (!groups.empty()) {
+      ImGui::SeparatorText("GGUF");
+      const ImGuiTableFlags gflags =
+          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;
+      for (const gguf::GgufSummaryGroup& grp : groups) {
+        // Groups open by default so the summary is visible without a click.
+        if (!ImGui::CollapsingHeader(grp.title.c_str(),
+                                     ImGuiTreeNodeFlags_DefaultOpen))
+          continue;
+        ImGui::PushID(grp.title.c_str());
+        if (ImGui::BeginTable("ggufgrp", 2, gflags)) {
+          ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+          ImGui::TableSetupColumn("value");
+          for (const gguf::GgufSummaryItem& it : grp.items) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(it.label.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextWrapped("%s", it.value.c_str());
+          }
+          ImGui::EndTable();
+        }
+        ImGui::PopID();
+      }
+    }
+  }
 
   // Metadata table (opset / ir version etc. live here per parser convention).
   if (!model.metadata.empty()) {

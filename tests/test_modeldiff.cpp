@@ -137,6 +137,105 @@ TEST_CASE("diff: unnamed nodes match by fingerprint + topological position") {
   CHECK(d2.changed == 0);
 }
 
+TEST_CASE("diff #35: same structure, different names — both modes match Same") {
+  // Identical structure (Relu->Conv->Gemm) but every node RENAMED, so the name
+  // pass finds no common name. NameThenTopology must fall to the fingerprint
+  // fallback and still classify all Same; TopologyOnly skips names and matches
+  // the same way. Chain shapes chosen so per-node fingerprints are equal.
+  ir::Model a = make_chain({{"Relu", "a0"}, {"Conv", "a1"}, {"Gemm", "a2"}});
+  ir::Model b = make_chain({{"Relu", "b0"}, {"Conv", "b1"}, {"Gemm", "b2"}});
+
+  ModelDiffResult dn = diff_models(a, 0, b, 0, DiffMatch::NameThenTopology);
+  REQUIRE(dn.valid);
+  CHECK(dn.same == 3);
+  CHECK(dn.added == 0);
+  CHECK(dn.removed == 0);
+  CHECK(dn.changed == 0);
+
+  ModelDiffResult dt = diff_models(a, 0, b, 0, DiffMatch::TopologyOnly);
+  REQUIRE(dt.valid);
+  CHECK(dt.same == 3);
+  CHECK(dt.added == 0);
+  CHECK(dt.removed == 0);
+  CHECK(dt.changed == 0);
+  // No common names anywhere, so both strategies produce the same positional
+  // pairing.
+  CHECK(dn.a_to_b == dt.a_to_b);
+}
+
+TEST_CASE("diff #35: name vs topology matching DIVERGE on swapped names") {
+  // Two interior "Add" nodes share a fingerprint (op_type + arity, name-free)
+  // but have their names SWAPPED between A and B. NameThenTopology pairs by
+  // name (crossed), TopologyOnly pairs by topological position (straight), so
+  // the a_to_b mapping differs — the whole point of the toggle. Every pair is
+  // structurally identical, so all counts are Same in BOTH modes.
+  ir::Model a = make_chain(
+      {{"Relu", "head"}, {"Add", "x"}, {"Add", "y"}, {"Softmax", "tail"}});
+  ir::Model b = make_chain(
+      {{"Relu", "head"}, {"Add", "y"}, {"Add", "x"}, {"Softmax", "tail"}});
+
+  ModelDiffResult dn = diff_models(a, 0, b, 0, DiffMatch::NameThenTopology);
+  ModelDiffResult dt = diff_models(a, 0, b, 0, DiffMatch::TopologyOnly);
+  REQUIRE(dn.valid);
+  REQUIRE(dt.valid);
+
+  // Name pass crosses the two "Add" nodes: A "x"(1)->B "x"(2), A "y"(2)->B "y"(1).
+  CHECK(dn.a_to_b == std::vector<int32_t>{0, 2, 1, 3});
+  // Topology-only pairs the fingerprint bucket positionally: A1->B1, A2->B2.
+  CHECK(dt.a_to_b == std::vector<int32_t>{0, 1, 2, 3});
+  // The mappings genuinely diverge.
+  CHECK(dn.a_to_b != dt.a_to_b);
+
+  // Both are valid matchings with identical Same/Changed/Removed counts.
+  CHECK(dn.same == 4);
+  CHECK(dt.same == 4);
+  CHECK(dn.same + dn.changed + dn.removed == 4);
+  CHECK(dt.same + dt.changed + dt.removed == 4);
+
+  // TopologyOnly must NEVER consult names: renaming B's nodes leaves its result
+  // byte-identical to the un-renamed run.
+  ir::Model b_renamed = make_chain(
+      {{"Relu", "q0"}, {"Add", "q1"}, {"Add", "q2"}, {"Softmax", "q3"}});
+  ModelDiffResult dt_renamed =
+      diff_models(a, 0, b_renamed, 0, DiffMatch::TopologyOnly);
+  REQUIRE(dt_renamed.valid);
+  CHECK(dt_renamed.a_to_b == dt.a_to_b);
+  CHECK(dt_renamed.b_to_a == dt.b_to_a);
+  CHECK(dt_renamed.a_status == dt.a_status);
+  CHECK(dt_renamed.b_status == dt.b_status);
+}
+
+TEST_CASE("diff #35: NameThenTopology default == pre-change fixture counts") {
+  // Regression: the #35 param defaults to NameThenTopology, so the original
+  // add/remove/change fixture yields exactly the pre-change classification, and
+  // the explicit-arg call matches the default-arg call byte-for-byte.
+  ir::Model a = make_chain({{"Relu", "relu"},
+                            {"Conv", "conv"},
+                            {"Gemm", "gemm"},
+                            {"Softmax", "softmax"}});
+  ir::Model b = make_chain({{"Relu", "relu"},
+                            {"Gemm", "gemm"},
+                            {"LogSoftmax", "softmax"},
+                            {"Sigmoid", "sigmoid"}});
+
+  ModelDiffResult d_default = diff_models(a, 0, b, 0);
+  ModelDiffResult d_explicit =
+      diff_models(a, 0, b, 0, DiffMatch::NameThenTopology);
+  REQUIRE(d_default.valid);
+
+  // Pre-change counts (see first fixture in this file).
+  CHECK(d_default.same == 2);
+  CHECK(d_default.removed == 1);
+  CHECK(d_default.changed == 1);
+  CHECK(d_default.added == 1);
+
+  // Default arg is exactly NameThenTopology.
+  CHECK(d_default.a_status == d_explicit.a_status);
+  CHECK(d_default.b_status == d_explicit.b_status);
+  CHECK(d_default.a_to_b == d_explicit.a_to_b);
+  CHECK(d_default.b_to_a == d_explicit.b_to_a);
+}
+
 TEST_CASE("diff: deterministic and OOB-safe") {
   ir::Model a = make_chain({{"Relu", "r"}, {"Conv", "c"}});
   ir::Model b = make_chain({{"Relu", "r"}, {"Gemm", "g"}});

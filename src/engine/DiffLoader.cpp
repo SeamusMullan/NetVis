@@ -113,7 +113,7 @@ void DiffLoader::load_comparison(const ModelSession& primary,
       // reads only immutable structure/topology of model A — never shapes.
       const ir::Model* pa = primary_ptr->model();
       if (pa && primary_ptr->current_graph() == primary_graph_) {
-        ModelDiffResult d = diff_models(*pa, primary_graph_, *model_, 0);
+        ModelDiffResult d = diff_models(*pa, primary_graph_, *model_, 0, match_);
         const bool ok = d.valid;
         diff_ = std::make_unique<ModelDiffResult>(std::move(d));
         if (ok) {
@@ -159,6 +159,26 @@ void DiffLoader::clear() {
   primary_graph_ = 0;
   primary_generation_ = UINT64_MAX;
   primary_session_ = nullptr;
+}
+
+void DiffLoader::set_match(DiffMatch m) {
+  // MAIN THREAD. Re-diff the already-loaded pair under the new match strategy
+  // (bounded structural work, same as the post-load diff — reads only immutable
+  // topology of both models, never shapes). No-op unless a diff is loaded, the
+  // mode actually changed, and the primary still matches the snapshot the current
+  // diff was computed against (identity + graph + generation — the same guards the
+  // view uses before tinting).
+  if (m == match_) return;
+  match_ = m;
+  if (state_ != DiffLoadState::Ready || !model_ || primary_session_ == nullptr)
+    return;
+  const ModelSession* ps = primary_session_;
+  const ir::Model* pa = ps->model();
+  if (pa == nullptr || ps->current_graph() != primary_graph_ ||
+      ps->generation() != primary_generation_)
+    return;  // primary moved on; leave the existing diff until a reload
+  ModelDiffResult d = diff_models(*pa, primary_graph_, *model_, 0, match_);
+  if (d.valid) diff_ = std::make_unique<ModelDiffResult>(std::move(d));
 }
 
 }  // namespace netvis

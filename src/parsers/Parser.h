@@ -40,6 +40,24 @@ const char* format_name(Format f);
 // nothing matches.
 Format detect_format(const MappedFile& file, const std::string& ext_hint);
 
+// #45: how a format was decided, surfaced in the status bar so a user can see
+// WHY NetVis picked a parser (a magic-byte match is trustworthy; an
+// extension-only tiebreak on ambiguous content is worth flagging).
+enum class DetectReason : uint8_t {
+  None,          // Unknown / nothing matched
+  Magic,         // a magic-byte / file-identifier match (high confidence)
+  Structure,     // a bounded structural sniff matched (e.g. protobuf/XML shape)
+  Extension,     // content ambiguous; the file extension broke the tie
+  ContentDefault // content matched a family (e.g. a zip) but the specific format
+                 // fell back to a default (lower confidence)
+};
+const char* detect_reason_name(DetectReason r);
+
+// Same detection, additionally reporting WHY (#45). `reason` is set to the signal
+// that decided the returned Format. The plain overload above delegates to this.
+Format detect_format(const MappedFile& file, const std::string& ext_hint,
+                     DetectReason& reason);
+
 // Parse dispatch: detect then route to the right parser. Runs on a worker
 // thread (never the UI thread). `progress` receives stage updates.
 Result<ir::Model> parse_model(const MappedFile& file, const std::string& ext_hint,

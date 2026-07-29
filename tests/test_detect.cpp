@@ -43,6 +43,20 @@ Format detect_bytes(const std::string& stem, const std::vector<uint8_t>& bytes,
   return f;
 }
 
+// #45: same, but also captures WHY detection decided. Verifies the 3-arg
+// overload and that the 2-arg wrapper stays consistent with it.
+Format detect_bytes_reason(const std::string& stem,
+                           const std::vector<uint8_t>& bytes,
+                           const std::string& ext_hint, DetectReason& reason) {
+  std::string path = write_temp(stem, bytes);
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);  // mapping a freshly-written file must succeed
+  Format f = detect_format(*mf, ext_hint, reason);
+  CHECK(detect_format(*mf, ext_hint) == f);  // wrapper delegates identically
+  std::filesystem::remove(path);
+  return f;
+}
+
 }  // namespace
 
 TEST_CASE("detect GGUF by magic bytes") {
@@ -122,6 +136,71 @@ TEST_CASE("detect Keras HDF5 by superblock signature") {
   std::vector<uint8_t> b = {0x89, 'H', 'D', 'F', '\r', '\n', 0x1a, '\n'};
   b.resize(64, 0);
   CHECK(detect_bytes("h5", b, "h5") == Format::Keras);
+}
+
+// --- #45: format-detection reason (confidence signal) -------------------------
+// The 3-arg detect_format reports WHICH signal decided the format, surfaced in
+// the status bar. Magic > structure > extension > content-default confidence.
+
+TEST_CASE("detect reason: GGUF magic -> Magic") {
+  std::vector<uint8_t> b = {'G', 'G', 'U', 'F', 3, 0, 0, 0};
+  b.resize(32, 0);
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("r_gguf", b, "gguf", r) == Format::GGUF);
+  CHECK(r == DetectReason::Magic);
+}
+
+TEST_CASE("detect reason: ONNX-shaped protobuf -> Structure") {
+  // field 1 (ir_version, varint) + field 7 (graph, length-delimited). No .onnx
+  // extension, so only the structural sniff can decide it.
+  std::vector<uint8_t> b = {0x08, 0x07, 0x3a, 0x02, 0x00, 0x00};
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("r_onnx", b, "", r) == Format::ONNX);
+  CHECK(r == DetectReason::Structure);
+}
+
+TEST_CASE("detect reason: ambiguous zip + ext_hint pt -> Extension") {
+  // A bare zip (PK local-file-header, no central directory the scan recognizes)
+  // carries no specific content signal; the "pt" extension breaks the tie.
+  std::vector<uint8_t> b = {'P', 'K', 0x03, 0x04};
+  b.resize(64, 0);
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("r_zip_pt", b, "pt", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Extension);
+}
+
+TEST_CASE("detect reason: ambiguous zip + no ext -> ContentDefault") {
+  // Same zip with no extension hint: the family matched but the specific format
+  // falls back to the PyTorch-zip default (lower confidence).
+  std::vector<uint8_t> b = {'P', 'K', 0x03, 0x04};
+  b.resize(64, 0);
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("r_zip_none", b, "", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::ContentDefault);
+}
+
+TEST_CASE("detect reason: random bytes -> None (Unknown)") {
+  std::vector<uint8_t> b = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
+  b.resize(32, 0);
+  DetectReason r = DetectReason::Magic;  // seed non-None to prove it is cleared
+  CHECK(detect_bytes_reason("r_junk", b, "", r) == Format::Unknown);
+  CHECK(r == DetectReason::None);
+}
+
+TEST_CASE("detect reason: CoreML .mlmodel tiebreak -> Extension") {
+  std::vector<uint8_t> b = {0x08, 0x04, 0xa2, 0x1f, 0x00};
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("r_coreml", b, "mlmodel", r) == Format::CoreML);
+  CHECK(r == DetectReason::Extension);
+}
+
+TEST_CASE("detect_reason_name: non-empty label per reason") {
+  CHECK(std::string(detect_reason_name(DetectReason::None)) == "none");
+  CHECK(std::string(detect_reason_name(DetectReason::Magic)) == "magic");
+  CHECK(std::string(detect_reason_name(DetectReason::Structure)) == "structure");
+  CHECK(std::string(detect_reason_name(DetectReason::Extension)) == "extension");
+  CHECK(std::string(detect_reason_name(DetectReason::ContentDefault)) ==
+        "content default");
 }
 
 // --- v0.4.0: OpCategory coverage (color routing) ------------------------------

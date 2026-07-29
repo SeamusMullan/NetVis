@@ -8,6 +8,7 @@
 #include "view/DiffPanel.h"
 
 #include <cstdint>
+#include <fstream>
 #include <string>
 
 #include "imgui.h"
@@ -28,6 +29,11 @@ char* tinyfd_openFileDialog(const char* aTitle, const char* aDefaultPathAndFile,
                             const char* const* aFilterPatterns,
                             const char* aSingleFilterDescription,
                             int aAllowMultipleSelects);
+char const* tinyfd_saveFileDialog(char const* aTitle,
+                                  char const* aDefaultPathAndFile,
+                                  int aNumOfFilterPatterns,
+                                  char const* const* aFilterPatterns,
+                                  char const* aSingleFilterDescription);
 }
 
 namespace netvis {
@@ -38,6 +44,54 @@ namespace {
 constexpr ImU32 kColAdded = IM_COL32(76, 201, 120, 255);    // green
 constexpr ImU32 kColRemoved = IM_COL32(224, 92, 92, 255);   // red
 constexpr ImU32 kColChanged = IM_COL32(232, 168, 56, 255);  // amber
+
+// #37: serialize the diff to a change report. `tsv` selects TSV vs markdown.
+// Lists each changed/added/removed node (status, op, name) + the summary counts.
+// Pure over the two models + the diff result; no payload reads. `a_gi` is the
+// primary graph the diff was computed for; B is always comparison graph 0.
+std::string build_change_report(const ir::Model& a, uint32_t a_gi,
+                                const ir::Model& b, const ModelDiffResult& diff,
+                                bool tsv) {
+  std::string out;
+  const char* sep = tsv ? "\t" : " | ";
+  auto row = [&](const char* status, std::string_view op, std::string_view nm) {
+    if (!tsv) out += "| ";
+    out += status;
+    out += sep;
+    out += op.empty() ? "?" : std::string(op);
+    out += sep;
+    out += std::string(nm);
+    if (!tsv) out += " |";
+    out += "\n";
+  };
+  if (tsv) {
+    out += "status\top\tname\n";
+  } else {
+    out += "# NetVis model diff\n\n";
+    out += "**Summary:** " + std::to_string(diff.same) + " same, " +
+           std::to_string(diff.added) + " added, " +
+           std::to_string(diff.removed) + " removed, " +
+           std::to_string(diff.changed) + " changed\n\n";
+    out += "| status | op | name |\n|---|---|---|\n";
+  }
+  if (a_gi < a.graphs.size()) {
+    const auto& nodes = a.graphs[a_gi].nodes;
+    for (uint32_t i = 0; i < diff.a_status.size() && i < nodes.size(); ++i) {
+      const char* st = diff.a_status[i] == DiffStatus::Removed  ? "removed"
+                       : diff.a_status[i] == DiffStatus::Changed ? "changed"
+                                                                 : nullptr;
+      if (st) row(st, a.str(nodes[i].op_type), a.str(nodes[i].name));
+    }
+  }
+  if (b.graphs.size() > 0) {
+    const auto& nodes = b.graphs[0].nodes;
+    for (uint32_t i = 0; i < diff.b_status.size() && i < nodes.size(); ++i) {
+      if (diff.b_status[i] == DiffStatus::Added)
+        row("added", b.str(nodes[i].op_type), b.str(nodes[i].name));
+    }
+  }
+  return out;
+}
 
 }  // namespace
 
@@ -122,6 +176,19 @@ void draw_diff_panel(App& app) {
     if (ImGui::Button("Clear")) dl.clear();
   }
 
+  // #35: node-matching strategy toggle. Changing it re-diffs the loaded pair in
+  // place (DiffLoader::set_match; no reload).
+  {
+    int mode = dl.match() == DiffMatch::TopologyOnly ? 1 : 0;
+    ImGui::TextDisabled("Match:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("name+topology", &mode, 0))
+      dl.set_match(DiffMatch::NameThenTopology);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("topology only", &mode, 1))
+      dl.set_match(DiffMatch::TopologyOnly);
+  }
+
   ImGui::Separator();
 
   switch (dl.state()) {
@@ -150,12 +217,17 @@ void draw_diff_panel(App& app) {
     return;
   }
 
-  if (dl.primary_graph() != s.current_graph()) {
-    ImGui::TextDisabled(
-        "Diff was computed for graph %u; showing summary only "
-        "(re-load to diff the current graph).",
-        dl.primary_graph());
-  }
+  // The diff was computed against a SPECIFIC primary session/generation/graph. The
+  // summary counts are model-agnostic and always safe to show, but the A-side node
+  // lists, cost delta, and #37 export index the ACTIVE tab's model — which is only
+  // the diff's A-side when the active session IS the one the diff was pinned to
+  // (same identity + generation + graph). On a second/reloaded tab those differ,
+  // so pairing the active model with this diff's per-node status would render + (in
+  // #37) EXPORT a wrong artifact. Gate the A-side on the same predicate the canvas
+  // tint uses (diff_tint_for_display).
+  const bool primary_matches = dl.primary_session() == &s &&
+                               dl.primary_generation() == s.generation() &&
+                               dl.primary_graph() == s.current_graph();
 
   ImGui::SeparatorText("Summary");
   ImGui::Text("same:    %u", diff->same);
@@ -165,6 +237,16 @@ void draw_diff_panel(App& app) {
                      diff->removed);
   ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChanged), "changed: %u",
                      diff->changed);
+
+  // A-side (node lists + cost delta + #37 export) is only valid when the active
+  // session is the one this diff was pinned to. Otherwise stop after the summary.
+  if (!primary_matches) {
+    ImGui::TextDisabled(
+        "Diff was computed for a different model/tab — switch to that tab or "
+        "re-load the comparison here to diff this model.");
+    ImGui::End();
+    return;
+  }
 
   const ir::Model* a_model = s.model();
   const ir::Model* b_model = dl.model();
@@ -287,6 +369,31 @@ void draw_diff_panel(App& app) {
     }
     ImGui::EndChild();
   };
+
+  // #37: export the change report (markdown / TSV).
+  if (a_model != nullptr && b_model != nullptr) {
+    ImGui::SeparatorText("Export");
+    auto do_export = [&](bool tsv) {
+      const char* pat_md[] = {"*.md"};
+      const char* pat_tsv[] = {"*.tsv"};
+      const char* out = tinyfd_saveFileDialog(
+          "Export change report", tsv ? "diff.tsv" : "diff.md", 1,
+          tsv ? pat_tsv : pat_md, tsv ? "TSV" : "Markdown");
+      if (out == nullptr) return;
+      std::string report =
+          build_change_report(*a_model, a_gi, *b_model, *diff, tsv);
+      std::ofstream f(out);
+      if (f) {
+        f << report;
+        app.add_toast(std::string("Exported ") + out, false);
+      } else {
+        app.add_toast("Could not write report", true);
+      }
+    };
+    if (ImGui::Button("Export .md")) do_export(false);
+    ImGui::SameLine();
+    if (ImGui::Button("Export .tsv")) do_export(true);
+  }
 
   ImGui::SeparatorText("Details");
   list_a("Removed (primary only)", DiffStatus::Removed, kColRemoved);

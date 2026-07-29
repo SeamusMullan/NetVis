@@ -53,6 +53,13 @@ class DiffLoader {
   // Clear the comparison (exit diff mode).
   void clear();
 
+  // #35: node-matching strategy for the diff. set_match re-runs the diff INLINE
+  // against the already-loaded pair (bounded main-thread work, same as the
+  // post-load diff) when the mode changes and a diff is loaded — no reload. No-op
+  // if not Ready or the mode is unchanged.
+  DiffMatch match() const { return match_; }
+  void set_match(DiffMatch m);
+
   DiffLoadState state() const { return state_; }
   const std::string& error() const { return error_; }
   const std::string& path() const { return path_; }
@@ -98,6 +105,7 @@ class DiffLoader {
   uint32_t primary_graph_ = 0;
   uint64_t primary_generation_ = UINT64_MAX;  // primary gen at diff-compute time
   const ModelSession* primary_session_ = nullptr;  // #62: which session (identity)
+  DiffMatch match_ = DiffMatch::NameThenTopology;   // #35 node-matching strategy
   uint64_t token_ = 0;  // newest load wins
 };
 
