@@ -12,6 +12,7 @@
 
 #include "imgui.h"
 
+#include "engine/CostModel.h"   // #31: compute_cost for the two-model cost delta
 #include "engine/DiffLoader.h"
 #include "engine/LayoutEngine.h"
 #include "engine/ModelDiff.h"
@@ -168,6 +169,63 @@ void draw_diff_panel(App& app) {
   const ir::Model* a_model = s.model();
   const ir::Model* b_model = dl.model();
   const uint32_t a_gi = dl.primary_graph();
+
+  // #31 two-model cost diff: ΔFLOPs / Δparams / Δweight-bytes (B − A). Model-wide
+  // deltas come from each model's whole-graph CostReport (comparison always graph
+  // 0). Cheap headless compute; cached across frames keyed on the two model
+  // pointers so we don't recompute both reports every frame the panel is open.
+  if (a_model != nullptr && b_model != nullptr &&
+      a_gi < a_model->graphs.size()) {
+    ImGui::SeparatorText("Cost delta (B - A)");
+    // Cache the two reports keyed on the model pointers AND the primary session
+    // generation (so a reopen that reuses a freed ir::Model address — pointer ABA
+    // — still invalidates; the pointer alone could compare equal to the old one).
+    static const ir::Model* ck_a = nullptr;
+    static const ir::Model* ck_b = nullptr;
+    static uint64_t ck_gen = UINT64_MAX;
+    static uint64_t a_flops = 0, b_flops = 0, a_params = 0, b_params = 0;
+    static uint64_t a_wbytes = 0, b_wbytes = 0;
+    const uint64_t gen = s.generation();
+    if (ck_a != a_model || ck_b != b_model || ck_gen != gen) {
+      ck_a = a_model;
+      ck_b = b_model;
+      ck_gen = gen;
+      CostReport ra = compute_cost(*a_model, a_gi);
+      CostReport rb = compute_cost(*b_model, 0);
+      a_flops = ra.total_flops; b_flops = rb.total_flops;
+      a_params = ra.total_params; b_params = rb.total_params;
+      a_wbytes = ra.total_weight_bytes; b_wbytes = rb.total_weight_bytes;
+    }
+    // Compute the delta in the UNSIGNED domain (totals are saturating uint64 that
+    // can exceed INT64_MAX — casting to int64 and negating would be signed-overflow
+    // UB). Carry a sign flag + magnitude instead.
+    auto signed_row = [](const char* label, uint64_t a, uint64_t b, bool bytes) {
+      const bool neg = b < a;
+      const uint64_t mag = neg ? a - b : b - a;
+      const ImU32 col = mag == 0 ? IM_COL32(160, 160, 160, 255)
+                                 : (neg ? kColRemoved : kColAdded);
+      // grouped_count takes int64; clamp a saturated magnitude so the cast is safe.
+      const int64_t mag_i = mag > static_cast<uint64_t>(INT64_MAX)
+                                ? INT64_MAX
+                                : static_cast<int64_t>(mag);
+      std::string dv = (neg ? "-" : "+") +
+                       (bytes ? panel_detail::human_bytes(mag)
+                              : panel_detail::grouped_count(mag_i));
+      ImGui::Text("%s", label);
+      ImGui::SameLine(150.0f);
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s", dv.c_str());
+    };
+    signed_row("Δ FLOPs", a_flops, b_flops, false);
+    signed_row("Δ params", a_params, b_params, false);
+    signed_row("Δ weights", a_wbytes, b_wbytes, true);
+    // Percent size change (weights) — the headline "how much smaller after quant".
+    if (a_wbytes > 0) {
+      double pct = 100.0 * (static_cast<double>(b_wbytes) -
+                            static_cast<double>(a_wbytes)) /
+                   static_cast<double>(a_wbytes);
+      ImGui::TextDisabled("weights %+.1f%% vs primary", pct);
+    }
+  }
 
   // Helper to render a scrollable list of A-side nodes matching a status.
   auto list_a = [&](const char* title, DiffStatus want, ImU32 col) {

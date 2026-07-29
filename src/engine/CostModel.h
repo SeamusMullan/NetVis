@@ -409,6 +409,30 @@ void builtin_compute_flops(const ir::Model& model, const ir::Graph& g,
                            const ir::Node& node, NodeCost& nc);
 }  // namespace detail
 
+// --- v0.9.0 (#32): per-node receptive-field size (conv/pool stacks) ---------
+// The receptive field (RF) of a node is how many input-image pixels (per spatial
+// axis) influence one of its output pixels — a shape/attr-only quantity, zero
+// payload. Computed over the graph in topological (node-index) order: RF and the
+// cumulative stride (jump) propagate along edges. For a Conv/Pool node with kernel
+// k, stride s, dilation d (per axis): effective kernel ke = d*(k-1)+1; the node's
+// output RF = input RF + (ke-1)*input_jump; output jump = input_jump * s. Nodes
+// that don't change the RF (elementwise/norm/activation) pass it through; a node
+// with multiple inputs takes the MAX incoming RF (the widest dependency). A node
+// whose RF can't be derived (dynamic dims, unknown op) is reported unknown.
+struct NodeReceptiveField {
+  // RF along the first spatial axis (a single representative number — most conv
+  // stacks are square). 0 when unknown. `known` distinguishes an honest 0.
+  uint64_t rf = 0;
+  bool known = false;
+};
+
+// Compute per-node receptive field for graphs[graph_index], indexed 1:1 by node.
+// Graph-mode only; empty in table mode or for an out-of-range graph. Reads only
+// shapes/attrs (kernel_shape/strides/dilations) — never a payload. Best-effort:
+// a node the pass can't resolve is {0,false}, never faked. PURE; O(V+E); no throw.
+std::vector<NodeReceptiveField> compute_receptive_fields(const ir::Model& model,
+                                                         uint32_t graph_index);
+
 // Live activation bytes at each node in execution (node index == topological)
 // order — the FULL curve behind the single peak_activation_bytes scalar.
 // liveness_curve[i] = the memory HIGH-WATER MARK during node i: live activation

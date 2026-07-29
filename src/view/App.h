@@ -176,6 +176,18 @@ struct ViewState {
   // search_query, so typing in either updates both. Toggled from the View menu.
   bool show_search_results = false;
 
+  // --- v0.9.0 additions (append-only) ----------------------------------------
+  // #22: edge routing style. Bezier (default) uses the layout's control points;
+  // Orthogonal draws right-angle (Manhattan) segments; Straight is a direct line.
+  // Pure view choice over the same EdgeCurve endpoints — no re-layout. Persisted.
+  // 0=Bezier, 1=Orthogonal, 2=Straight (plain int for the frozen-header/prefs).
+  int edge_routing = 0;
+
+  // #14: highlight the critical path (heaviest cumulative-FLOP chain source→sink).
+  // View toggle; the path is computed from the cost report + graph adjacency and
+  // cached (see GraphCanvas). Not persisted (a transient analysis overlay).
+  bool show_critical_path = false;
+
   // --- v0.8.3 additions (append-only) ----------------------------------------
   // #4/#30: roofline machine-balance. When custom_ridge > 0 the analyzer uses it
   // as the ridge FLOP/byte instead of the selected built-in preset; 0 => use the
@@ -284,6 +296,12 @@ class App {
   void export_view_png(const std::string& path);
   // Prompt for a path then export (used by the File menu + command palette).
   void export_view_dialog();
+
+  // #55 (v0.9.0): export the current graph as vector SVG (world-space, the whole
+  // layout — not just the visible viewport). Reuses the layout boxes/edges +
+  // category colors. Best-effort; no-op with no layout. *_dialog prompts a path.
+  void export_view_svg(const std::string& path);
+  void export_view_svg_dialog();
 
   // #56 (v0.8.2): a shareable view-state file (.netvis-view JSON) capturing the
   // camera pose, nav filters/overlays, and selection so a view can be reproduced.

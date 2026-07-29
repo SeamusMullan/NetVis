@@ -78,6 +78,31 @@ Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
                                          const std::string& model_dir,
                                          const ir::Model* model = nullptr);
 
+// #47: a 2D heatmap thumbnail of a tensor slice, produced by streaming decode.
+// The last two dims are taken as the [rows, cols] image plane; higher dims are
+// fixed at index 0 (the first 2D slice). Values are normalized to [0,1] over the
+// slice's own [min,max] and packed as RGBA8 via a simple blue->red ramp so the
+// view can upload it straight to a texture without a second pass. Dimensions are
+// capped (kThumbMax per side) — a larger slice is BLOCK-averaged down so a huge
+// weight never allocates a huge texture. Never materializes the whole tensor.
+constexpr uint32_t kThumbMax = 128;
+
+struct TensorThumbnail {
+  uint32_t width = 0, height = 0;      // <= kThumbMax each; 0 => unavailable
+  std::vector<uint8_t> rgba;           // width*height*4, row-major, or empty
+  double slice_min = 0, slice_max = 0; // the normalization range used
+  bool available = false;              // false => quant/unknown/rank<2/dynamic
+};
+
+// Compute a 2D heatmap thumbnail for `t`. `base`/`model_dir`/`model` resolve the
+// payload exactly like compute_tensor_stats. Returns available=false (not an
+// error) for quantized/unknown dtypes, rank<2, or dynamic/oversized-unresolvable
+// dims. Calls ByteReader::mark_payload_read() once. Streams; no full copy.
+Result<TensorThumbnail> compute_tensor_thumbnail(const ir::TensorRef& t,
+                                                 const MappedFile& base,
+                                                 const std::string& model_dir,
+                                                 const ir::Model* model = nullptr);
+
 // Export a tensor to NumPy .npy (v1.0 header, spec §7.5) or raw .bin.
 // Reads the payload from the mmap/external file; writes to `out_path`.
 // Pass `model` to resolve StringId in external_path (nullptr if not needed).
