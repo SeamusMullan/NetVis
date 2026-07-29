@@ -99,7 +99,8 @@ std::unordered_map<std::string_view, uint32_t> unique_name_index(
 }  // namespace
 
 ModelDiffResult diff_models(const ir::Model& model_a, uint32_t graph_a,
-                            const ir::Model& model_b, uint32_t graph_b) {
+                            const ir::Model& model_b, uint32_t graph_b,
+                            DiffMatch match) {
   ModelDiffResult r;
   if (graph_a >= model_a.graphs.size() || graph_b >= model_b.graphs.size()) {
     r.valid = false;
@@ -125,15 +126,19 @@ ModelDiffResult diff_models(const ir::Model& model_a, uint32_t graph_a,
   r.b_status.assign(nb, DiffStatus::Added);
 
   // (a) Name matching over content-unique names present in both graphs.
-  auto name_a = unique_name_index(model_a, ga);
-  auto name_b = unique_name_index(model_b, gb);
-  for (auto& [nm, ai] : name_a) {
-    if (ai == UINT32_MAX) continue;
-    auto it = name_b.find(nm);
-    if (it == name_b.end() || it->second == UINT32_MAX) continue;
-    uint32_t bi = it->second;
-    r.a_to_b[ai] = static_cast<int32_t>(bi);
-    r.b_to_a[bi] = static_cast<int32_t>(ai);
+  // #35: TopologyOnly skips this pass entirely so every node falls through to
+  // the structural fingerprint+topo-rank fallback (b) below.
+  if (match == DiffMatch::NameThenTopology) {
+    auto name_a = unique_name_index(model_a, ga);
+    auto name_b = unique_name_index(model_b, gb);
+    for (auto& [nm, ai] : name_a) {
+      if (ai == UINT32_MAX) continue;
+      auto it = name_b.find(nm);
+      if (it == name_b.end() || it->second == UINT32_MAX) continue;
+      uint32_t bi = it->second;
+      r.a_to_b[ai] = static_cast<int32_t>(bi);
+      r.b_to_a[bi] = static_cast<int32_t>(ai);
+    }
   }
 
   // (b) Fingerprint fallback for still-unmatched nodes, aligned by topological

@@ -33,6 +33,19 @@ const char* format_name(Format f) {
   return "Unknown";
 }
 
+// #45: short human labels for the status bar's reason tag. Kept lowercase so the
+// bar reads "ONNX (structure)" / "PyTorch (content default)".
+const char* detect_reason_name(DetectReason r) {
+  switch (r) {
+    case DetectReason::None:           return "none";
+    case DetectReason::Magic:          return "magic";
+    case DetectReason::Structure:      return "structure";
+    case DetectReason::Extension:      return "extension";
+    case DetectReason::ContentDefault: return "content default";
+  }
+  return "none";
+}
+
 namespace {
 
 // Little-endian load helpers over a bounds-checked span. All detection reads go
@@ -220,16 +233,26 @@ bool looks_like_openvino_xml(const uint8_t* d, uint64_t size) {
 
 }  // namespace
 
-Format detect_format(const MappedFile& file, const std::string& ext_hint) {
+Format detect_format(const MappedFile& file, const std::string& ext_hint,
+                     DetectReason& reason) {
   const uint8_t* d = file.data();
   const uint64_t size = file.size();
-  if (d == nullptr || size == 0) return Format::Unknown;
+  if (d == nullptr || size == 0) {
+    reason = DetectReason::None;
+    return Format::Unknown;
+  }
 
   // GGUF: magic "GGUF" at byte 0.
-  if (size >= 4 && std::memcmp(d, "GGUF", 4) == 0) return Format::GGUF;
+  if (size >= 4 && std::memcmp(d, "GGUF", 4) == 0) {
+    reason = DetectReason::Magic;
+    return Format::GGUF;
+  }
 
   // TFLite: flatbuffer file identifier "TFL3" at bytes [4..8).
-  if (size >= 8 && std::memcmp(d + 4, "TFL3", 4) == 0) return Format::TFLite;
+  if (size >= 8 && std::memcmp(d + 4, "TFL3", 4) == 0) {
+    reason = DetectReason::Magic;
+    return Format::TFLite;
+  }
 
   // SafeTensors: u64 LE header length N at 0, then 8+N <= filesize and the JSON
   // header (after optional whitespace) begins with '{'.
@@ -241,7 +264,10 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint) {
                            d[p] == '\r' || d[p] == '\n')) {
         ++p;
       }
-      if (p < 8 + n && d[p] == '{') return Format::SafeTensors;
+      if (p < 8 + n && d[p] == '{') {
+        reason = DetectReason::Magic;
+        return Format::SafeTensors;
+      }
     }
   }
 
@@ -250,28 +276,54 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint) {
   // the central-directory filenames (bounded, bounds-checked).
   if (size >= 4 && std::memcmp(d, "PK\x03\x04", 4) == 0) {
     ZipFlags fl = scan_zip_names(d, size);
+    // A specific in-archive content signal is as trustworthy as a magic match.
     // PyTorch is the most specific signal (a data.pkl object graph); prefer it.
-    if (fl.pytorch_pkl) return Format::PyTorchZip;
-    if (fl.keras_config && fl.keras_weights) return Format::Keras;
-    if (fl.any_npy) return Format::Npz;
-    // Ambiguous zip: fall through to the extension tiebreaker below.
-    if (ext_hint == "npz") return Format::Npz;
-    if (ext_hint == "keras") return Format::Keras;
-    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin")
+    if (fl.pytorch_pkl) {
+      reason = DetectReason::Magic;
       return Format::PyTorchZip;
+    }
+    if (fl.keras_config && fl.keras_weights) {
+      reason = DetectReason::Magic;
+      return Format::Keras;
+    }
+    if (fl.any_npy) {
+      reason = DetectReason::Magic;
+      return Format::Npz;
+    }
+    // Ambiguous zip: the file extension breaks the tie.
+    if (ext_hint == "npz") {
+      reason = DetectReason::Extension;
+      return Format::Npz;
+    }
+    if (ext_hint == "keras") {
+      reason = DetectReason::Extension;
+      return Format::Keras;
+    }
+    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
+      reason = DetectReason::Extension;
+      return Format::PyTorchZip;
+    }
     // Unknown zip contents: default to PyTorch zip (its parser errors cleanly
     // if there is no data.pkl) rather than mis-claiming a tensor format.
+    reason = DetectReason::ContentDefault;
     return Format::PyTorchZip;
   }
 
   // Keras legacy / raw HDF5 (.h5): superblock magic at an aligned offset.
-  if (looks_like_hdf5(d, size)) return Format::Keras;
+  if (looks_like_hdf5(d, size)) {
+    reason = DetectReason::Magic;
+    return Format::Keras;
+  }
 
   // OpenVINO IR: XML text with a <net version="10|11"> root element.
-  if (looks_like_openvino_xml(d, size)) return Format::OpenVINO;
+  if (looks_like_openvino_xml(d, size)) {
+    reason = DetectReason::Structure;
+    return Format::OpenVINO;
+  }
 
   // Legacy pickle: opcode PROTO (0x80) followed by protocol byte 2..5.
   if (size >= 2 && d[0] == 0x80 && d[1] >= 0x02 && d[1] <= 0x05) {
+    reason = DetectReason::Magic;
     return Format::PyTorchLegacy;
   }
 
@@ -281,16 +333,23 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint) {
   // two are otherwise ambiguous, so the `.mlmodel` extension is the decisive
   // tiebreaker (spec §5): a file carrying it routes to CoreML before the ONNX
   // structural sniff below could claim it.
-  if (ext_hint == "mlmodel") return Format::CoreML;
+  if (ext_hint == "mlmodel") {
+    reason = DetectReason::Extension;
+    return Format::CoreML;
+  }
 
   // ONNX: plausible top-level protobuf ModelProto. Runs after the .mlmodel
   // guard because a bare CoreML protobuf would otherwise be misread as ONNX;
   // ONNX carries the ir_version/graph structural signal for extension-less
   // protobufs.
-  if (looks_like_onnx_proto(d, size)) return Format::ONNX;
+  if (looks_like_onnx_proto(d, size)) {
+    reason = DetectReason::Structure;
+    return Format::ONNX;
+  }
 
   // Extension tiebreaker for ambiguous content.
   if (!ext_hint.empty()) {
+    reason = DetectReason::Extension;
     if (ext_hint == "onnx") return Format::ONNX;
     if (ext_hint == "tflite") return Format::TFLite;
     if (ext_hint == "safetensors") return Format::SafeTensors;
@@ -306,7 +365,15 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint) {
     if (ext_hint == "pkl" || ext_hint == "pickle") return Format::PyTorchLegacy;
   }
 
+  reason = DetectReason::None;
   return Format::Unknown;
+}
+
+// Plain overload (frozen contract): delegate to the reason-reporting form and
+// discard the reason.
+Format detect_format(const MappedFile& file, const std::string& ext_hint) {
+  DetectReason r;
+  return detect_format(file, ext_hint, r);
 }
 
 Result<ir::Model> parse_model(const MappedFile& file, const std::string& ext_hint,
