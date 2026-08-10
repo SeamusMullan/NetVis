@@ -80,40 +80,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: seanmiddleditch/gha-setup-ninja@v5
-      # `netvis --bench` (src/main.cpp) is only compiled into the `netvis` GUI
-      # target -- it is NOT part of netvis_core or netvis_tests (see
-      # CMakeLists.txt: NETVIS_VIEW_SRC + main.cpp only exist inside the
-      # `if(NETVIS_BUILD_APP)` block). Getting a headless benchmark therefore
-      # still means LINKING the full GLFW/OpenGL/Dear ImGui/tinyfiledialogs
-      # chain, even though --bench exits before a window or GL context is ever
-      # created. Same package list package.yml's Linux job installs for the
-      # same reason (GLFW needs the X11/GL dev headers to build).
-      - name: Install Linux GUI deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev \
-            libxcursor-dev libxi-dev
-      # Release, not Debug and not sanitized: bench/baseline.json (once
-      # committed) is a Release measurement, and tools/bench_gate.py refuses to
-      # compare across build types on purpose (a Debug number is a different
-      # measurement, not a slower one). NETVIS_BUILD_TESTS=OFF skips compiling
-      # netvis_tests, which this job never runs, to keep the build fast.
+      # netvis_bench links netvis_core ONLY (CMakeLists.txt) -- no GLFW, no
+      # OpenGL, no ImGui, and therefore no X11/GL dev packages to install. The
+      # --bench flags also exist on the GUI binary for local convenience, but
+      # building the whole graphics stack on every push to run a benchmark that
+      # never opens a window would cost minutes per run for nothing.
+      #
+      # Release, not Debug and not sanitized: bench/baseline.json is a Release
+      # measurement and tools/bench_gate.py refuses to compare across build
+      # types on purpose (a Debug number is a different measurement, not a
+      # slower one). NETVIS_BUILD_TESTS=OFF skips netvis_tests, which the
+      # build-test job already covers.
       - name: Configure (Release)
         run: >
           cmake -B build/perf -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DNETVIS_BUILD_TESTS=OFF
-      - name: Build netvis
-        run: cmake --build build/perf --target netvis
-      # --bench-quick skips the 100k-node rung (BenchOptions::quick in
-      # engine/Bench.h). The full ladder's 100k rung at median-of-5 is the
-      # right thing to run before a release, but on every push/PR the fast
-      # 1k/10k signal is enough to catch a real regression without eating a
-      # shared runner's time budget -- this job should stay fast enough that
-      # nobody is tempted to skip waiting for it.
-      - name: Run benchmark (quick ladder)
-        run: ./build/perf/netvis --bench-quick > bench-current.json
+          -DNETVIS_BUILD_APP=OFF
+      - name: Build netvis_bench
+        run: cmake --build build/perf --target netvis_bench
+      # The FULL ladder, including the 100k rung. An earlier version ran
+      # --bench-quick to save runner time, which left the 100k rung ungated --
+      # and 100k is the whole point, since it is the only rung where a
+      # superlinear regression is visible at all (the O(initializers x values)
+      # loop #97 found cost 0.28 ms at 1k and 6.4 SECONDS at 100k). Measured at
+      # roughly two seconds on this runner, which is not worth trading the only
+      # rung that can catch that class of bug.
+      - name: Run benchmark (full ladder)
+        run: ./build/perf/netvis_bench --bench > bench-current.json
       - name: Upload bench result
         uses: actions/upload-artifact@v4
         with:
