@@ -309,6 +309,25 @@ if(NETVIS_BUILD_APP)
 endif()
 
 # =============================================================================
+#  netvis_bench — headless benchmark CLI (#97). Links only netvis_core.
+#
+#  The --bench flags also exist on the GUI binary, which is convenient for a
+#  developer who already has it built. CI is a different case: the perf gate
+#  needs a Release binary on every push and PR, and making it build the whole
+#  GLFW/OpenGL/ImGui/tinyfiledialogs chain — plus install the X11/GL dev packages
+#  — just to run a benchmark that never opens a window would be minutes of CI
+#  time for nothing. This target is the same code with none of that: it links
+#  netvis_core exactly as netvis_tests does, so it builds anywhere ctest builds.
+#
+#  Deliberately NOT gated on NETVIS_BUILD_APP: the whole point is that it works
+#  on a headless runner where the app is switched off.
+# =============================================================================
+add_executable(netvis_bench ${CMAKE_SOURCE_DIR}/src/bench_main.cpp)
+target_link_libraries(netvis_bench PRIVATE netvis_core)
+target_include_directories(netvis_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(netvis_bench PRIVATE netvis_warnings)
+
+# =============================================================================
 #  netvis_tests — links only netvis_core (spec §9, headless ctest).
 # =============================================================================
 if(NETVIS_BUILD_TESTS)

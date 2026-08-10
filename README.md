@@ -115,18 +115,40 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
 
 ## Performance
 
-Measured on this machine (16-core, `-O2 + LTO`), synthetic 10,000-node graph:
+Reproduce these numbers yourself — they come from the benchmark harness, not from
+a one-off measurement:
 
-| Stage | Time |
-|---|---|
-| `mmap` (any file size) | ~1 ms |
-| collapse-tree build (10k nodes) | ~1.2 ms |
-| default (collapsed) layout | ~0.1 ms |
-| search query over names | < 5 ms |
-| tensor payload reads during parse | **0** |
+```sh
+cmake --preset core-only && cmake --build --preset core-only
+./build/core/netvis_bench --bench          # 1k / 10k / 100k ladder, JSON to stdout
+```
+
+Median of 5, 16-core Linux, Release (`-O2 + LTO`), on the synthetic ladder. The
+graphs are generated deterministically from a seed, so a run is reproducible and
+any change in these numbers is a code change:
+
+| Stage | 1k nodes | 10k nodes | 100k nodes |
+|---|---|---|---|
+| collapse-tree build | 0.17 ms | 2.5 ms | 32 ms |
+| shape inference | 0.28 ms | 2.6 ms | 28 ms |
+| layout | 0.50 ms | 4.5 ms | 56 ms |
+| cost analysis | 0.27 ms | 2.7 ms | 28 ms |
+| per-frame visible scan | <0.01 ms | 0.07 ms | 0.58 ms |
+| peak RSS | 5.6 MB | 17.5 MB | 136 MB |
+| tensor payload reads during parse | **0** | **0** | **0** |
+
+`mmap` is ~1 ms for any file size — that is what makes cold-open independent of
+model size.
+
+Note the layout figure is for the **expanded** view (every node visible), which
+is what you get on open: repeated blocks are detected but not folded by default,
+because a default-collapsed view made large models look like they were missing
+nodes. Collapsing them is a keypress and is far faster still.
 
 The zero payload reads during parse is asserted by the test suite via a counting
 `ByteReader` — it is the property the whole design exists to guarantee.
+`tools/bench_gate.py` compares a run against `bench/baseline.json` in CI and
+fails the build on a regression beyond 30%.
 
 ## Building
 

@@ -7,12 +7,18 @@
 //   * Headless report (--report <path>, issue #58): parse + analyze + print JSON
 //     to stdout and exit — NO window, NO ImGui. Uses only netvis_core, so no GUI
 //     is ever spun up in this path.
+//   * Headless benchmark (--bench, issue #97): time the engine hot paths across a
+//     synthetic fixture ladder and print JSON to stdout — same headless contract
+//     as --report, so CI can gate on it without a display.
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // LayoutEngine.h defines SizeFn, referenced by the frozen ModelSession.h (via
 // App.h) but not included there; pre-include it so App.h compiles.
+#include "engine/Bench.h"
 #include "engine/LayoutEngine.h"
 #include "engine/ReportJson.h"
 #include "view/App.h"
@@ -58,6 +64,24 @@ int run_report(const std::string& path) {
   return 0;
 }
 
+// Headless benchmark path (#97). The flags and their parsing live in
+// engine/Bench.h so this binary and the dedicated headless netvis_bench target
+// cannot drift apart — CI gates on netvis_bench's numbers, and two flag parsers
+// would be two behaviours the gate could silently disagree about.
+//
+// Prints the harness JSON to stdout and exits. Never creates the App, so it
+// needs no display.
+int run_bench_cli(int argc, char** argv) {
+  const netvis::BenchOptions opt = netvis::parse_bench_args(argc, argv);
+  netvis::Result<std::vector<netvis::BenchCase>> cases = netvis::run_bench(opt);
+  if (!cases) {
+    std::fprintf(stderr, "netvis --bench: %s\n", cases.error().message.c_str());
+    return 1;
+  }
+  std::printf("%s\n", netvis::build_bench_json(*cases).c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -65,6 +89,9 @@ int main(int argc, char** argv) {
   bool report_mode = false;
   if (parse_report_arg(argc, argv, report_path, report_mode) && report_mode) {
     return run_report(report_path);  // headless: never creates the App
+  }
+  if (netvis::wants_bench(argc, argv)) {
+    return run_bench_cli(argc, argv);  // headless: never creates the App
   }
 
   // GUI path (unchanged): argv[1] is an optional initial file to open.

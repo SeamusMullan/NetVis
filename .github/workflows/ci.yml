@@ -70,6 +70,70 @@ jobs:
       - run: cmake --build --preset core-only
       - run: ctest --preset core-only
 
+  # --- Performance-regression gate (#97) ---------------------------------------
+  # Compares a fresh `netvis --bench` run against the committed bench/baseline.json
+  # via tools/bench_gate.py. Runs on every push/PR (not tag-only) so a regression
+  # is caught at review time, not discovered after a release ships.
+  perf-gate:
+    name: perf gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      # netvis_bench links netvis_core ONLY (CMakeLists.txt) -- no GLFW, no
+      # OpenGL, no ImGui, and therefore no X11/GL dev packages to install. The
+      # --bench flags also exist on the GUI binary for local convenience, but
+      # building the whole graphics stack on every push to run a benchmark that
+      # never opens a window would cost minutes per run for nothing.
+      #
+      # Release, not Debug and not sanitized: bench/baseline.json is a Release
+      # measurement and tools/bench_gate.py refuses to compare across build
+      # types on purpose (a Debug number is a different measurement, not a
+      # slower one). NETVIS_BUILD_TESTS=OFF skips netvis_tests, which the
+      # build-test job already covers.
+      - name: Configure (Release)
+        run: >
+          cmake -B build/perf -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNETVIS_BUILD_TESTS=OFF
+          -DNETVIS_BUILD_APP=OFF
+      - name: Build netvis_bench
+        run: cmake --build build/perf --target netvis_bench
+      # The FULL ladder, including the 100k rung. An earlier version ran
+      # --bench-quick to save runner time, which left the 100k rung ungated --
+      # and 100k is the whole point, since it is the only rung where a
+      # superlinear regression is visible at all (the O(initializers x values)
+      # loop #97 found cost 0.28 ms at 1k and 6.4 SECONDS at 100k). Measured at
+      # roughly two seconds on this runner, which is not worth trading the only
+      # rung that can catch that class of bug.
+      - name: Run benchmark (full ladder)
+        run: ./build/perf/netvis_bench --bench > bench-current.json
+      - name: Upload bench result
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-result
+          path: bench-current.json
+          if-no-files-found: error
+      # bench/baseline.json does not exist until a maintainer generates the
+      # first REAL baseline from this harness (see bench/README.md — a
+      # baseline committed before the harness could ever run would be
+      # fabricated data). Until then, treat "no baseline" as report-only: warn
+      # loudly so the gap is visible in every run's log, upload the JSON so
+      # the numbers are there when it is time to pick a baseline, but do NOT
+      # fail the build over a file nobody could have committed yet.
+      - name: Check for committed baseline
+        id: baseline
+        run: |
+          if [ -f bench/baseline.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::bench/baseline.json is not committed yet -- perf gate is running in report-only mode (see bench/README.md). It will start enforcing once a maintainer commits a real baseline."
+          fi
+      - name: Compare against baseline
+        if: steps.baseline.outputs.present == 'true'
+        run: python3 tools/bench_gate.py --baseline bench/baseline.json --current bench-current.json
+
   # --- Derive the version from the tag (only on a vX.Y.Z tag) -----------------
   version:
     name: resolve version

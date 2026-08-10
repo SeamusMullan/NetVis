@@ -5,6 +5,12 @@
 // graph would die under 100k Buttons; instead we cull to the visible world rect
 // and emit raw draw commands, so per-frame cost is O(visible), not O(nodes).
 // Hit-testing is likewise done against the culled boxes, not via ImGui items.
+//
+// #99 (v0.9.3): "cull to the visible rect" originally meant TESTING every box and
+// every edge against that rect each frame — the emit was O(visible) but the sweep
+// was O(total), so zooming into a corner of a 100k-node graph cost exactly what
+// showing all of it did. A SpatialIndex over the published layout now supplies the
+// candidates, and the per-frame label allocations are gone with it.
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "engine/LayoutEngine.h"
 #include "view/App.h"
@@ -16,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "imgui.h"
@@ -24,6 +31,7 @@
 #include "engine/CostModel.h"    // #14: CostReport per-node flops (path weights)
 #include "engine/GraphAdjacency.h"  // #14: longest_cost_path
 #include "engine/OpCategory.h"
+#include "engine/SpatialIndex.h"  // #99: O(visible) box/edge queries
 #include "engine/plugin/Registry.h"
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
@@ -274,18 +282,50 @@ ImU32 lerp_col(ImU32 a, ImU32 b, float t) {
   return ImGui::ColorConvertFloat4ToU32(r);
 }
 
+// An empty label whose data() is never null, so `%.*s` and ImGui's begin/end
+// AddText overload stay well-defined for a node with no resolvable text.
+constexpr std::string_view kEmptyLabel{""};
+
 // Resolve the two label lines + op category for one display node.
+//
+// #99: this used to be `NodeLabel label_for()` returning two std::strings BY
+// VALUE, called for every VISIBLE node at BOTH LOD tiers — two heap allocations
+// per visible node per frame, and by far the largest per-frame allocation source
+// in the canvas. Nothing here needs to OWN bytes:
+//   * a leaf's op_type/name already live in the model's StringArena, whose
+//     backing std::deque keeps element addresses stable across growth
+//     (core/StringArena.h), so a view into it is as good as a copy;
+//   * a collapsed group's label is a std::string owned by the CollapseTree, alive
+//     as long as the display list we just read it from;
+//   * the only line we SYNTHESIZE — "xN" for a group's instance count — is
+//     printed into `scratch`, a buffer inside the caller's own NodeLabel.
+//
+// LIFETIME: the views are valid until the next fill_label() on this NodeLabel,
+// and only while the model / collapse tree that produced them is alive. Every
+// call site below uses one stack NodeLabel reused across a draw loop and never
+// stores it, so a view cannot outlive its source. Copying is deleted rather than
+// merely discouraged: `secondary` may point into `scratch`, so a copy would
+// silently alias the ORIGINAL's buffer.
 struct NodeLabel {
-  std::string primary;
-  std::string secondary;
+  std::string_view primary = kEmptyLabel;
+  std::string_view secondary = kEmptyLabel;
   OpCategory cat = OpCategory::Other;
+  char scratch[16] = {};  // "x" + a uint32 decimal (10 digits) + NUL needs 12
+
+  NodeLabel() = default;
+  NodeLabel(const NodeLabel&) = delete;
+  NodeLabel& operator=(const NodeLabel&) = delete;
 };
 
-NodeLabel label_for(const App& app, uint32_t display_id) {
-  NodeLabel out;
+void fill_label(const App& app, uint32_t display_id, NodeLabel& out) {
+  out.primary = kEmptyLabel;
+  out.secondary = kEmptyLabel;
+  out.cat = OpCategory::Other;
   ModelSession& s = const_cast<App&>(app).session();
   const auto& disp = s.collapse().display_nodes();
-  if (display_id >= disp.size()) return out;
+  // An out-of-range id keeps the EMPTY primary rather than the "node" fallback
+  // below — matching label_for's early return, which skipped that fallback.
+  if (display_id >= disp.size()) return;
   const DisplayNode& dn = disp[display_id];
   const ir::Model* m = s.model();
   if (dn.is_group) {
@@ -293,7 +333,12 @@ NodeLabel label_for(const App& app, uint32_t display_id) {
     if (dn.group_index < groups.size()) {
       const CollapseGroup& g = groups[dn.group_index];
       out.primary = g.label;
-      out.secondary = "x" + std::to_string(g.instances);
+      int n = std::snprintf(out.scratch, sizeof(out.scratch), "x%u",
+                            static_cast<unsigned>(g.instances));
+      // snprintf returns the length it WANTED to write; a negative or truncated
+      // result must never become a view running off the end of the buffer.
+      if (n > 0 && static_cast<size_t>(n) < sizeof(out.scratch))
+        out.secondary = std::string_view(out.scratch, static_cast<size_t>(n));
       // Category from the group's first representative node op, if resolvable.
       if (m != nullptr && !g.representative_nodes.empty()) {
         uint32_t gi = s.current_graph();
@@ -311,14 +356,159 @@ NodeLabel label_for(const App& app, uint32_t display_id) {
       const auto& nodes = m->graphs[gi].nodes;
       if (dn.ir_node < nodes.size()) {
         const ir::Node& n = nodes[dn.ir_node];
-        out.primary = std::string(m->str(n.op_type));
-        out.secondary = std::string(m->str(n.name));
+        out.primary = m->str(n.op_type);
+        out.secondary = m->str(n.name);
         out.cat = plugin::resolve_category(*m, m->graphs[gi], n);
       }
     }
   }
   if (out.primary.empty()) out.primary = "node";
-  return out;
+}
+
+// #99: the canvas's viewport index, so the hit-test / edge draw / node draw are
+// O(visible) instead of O(total). The grid is a pure function of the published
+// LayoutResult, so it is rebuilt only when that layout changes — never per frame.
+//
+// KEYING. A LayoutResult is reachable only through ModelSession::layout(), and
+// this cache is a process-global static shared by every tab, so its key must
+// separate two DIFFERENT tabs' layouts as reliably as two successive layouts of
+// one tab. (structure_hash, collapse_hash) alone does NOT: open one file in two
+// tabs and both layouts hash identically, so a hash-only key would serve tab A's
+// grid for tab B's boxes — the same collision per-tab JobSystems already inflict
+// on generation counters. The layout POINTER alone does not either: layout_ is a
+// unique_ptr a re-layout replaces, and the allocator may hand the replacement the
+// address the old one just freed. The key is therefore pointer AND both hashes
+// AND both container sizes. Matching all five requires the previous layout to be
+// destroyed and the new one to describe the same graph at the same collapse state
+// with identical box/edge counts — and layout being deterministic in its inputs,
+// that is the same drawing, so the grid is correct for it either way.
+// indexed_boxes()/indexed_edges() are re-checked on every hit as a final backstop
+// against ever indexing an array the grid was not built for.
+struct CanvasIndexCache {
+  SpatialIndex index;
+  const LayoutResult* key_layout = nullptr;
+  uint64_t key_structure = UINT64_MAX;
+  uint64_t key_collapse = UINT64_MAX;
+  size_t key_boxes = 0;
+  size_t key_edges = 0;
+  bool valid = false;
+};
+
+const SpatialIndex& canvas_index(const LayoutResult& layout) {
+  static CanvasIndexCache c;
+  if (c.valid && c.key_layout == &layout &&
+      c.key_structure == layout.structure_hash &&
+      c.key_collapse == layout.collapse_hash &&
+      c.key_boxes == layout.boxes.size() &&
+      c.key_edges == layout.edges.size() &&
+      static_cast<size_t>(c.index.indexed_boxes()) == layout.boxes.size() &&
+      static_cast<size_t>(c.index.indexed_edges()) == layout.edges.size())
+    return c.index;
+  c.key_layout = &layout;
+  c.key_structure = layout.structure_hash;
+  c.key_collapse = layout.collapse_hash;
+  c.key_boxes = layout.boxes.size();
+  c.key_edges = layout.edges.size();
+  c.valid = true;
+  c.index.build(layout);
+  return c.index;
+}
+
+// Candidate list 0..n-1 — every item, which is exactly what the pre-#99 loops
+// walked. Used when the grid cannot help (see kIndexAreaFraction) or reports
+// !valid() on a degenerate zero-extent layout.
+//
+// The contents are a pure function of n, and n changes only when a new layout is
+// published, so a list that is ALREADY 0..n-1 is left alone: the steady state is
+// one size compare, not another 400 KB of stores per frame at the 100k rung. The
+// size + last-element test is conclusive because the vector only ever holds
+// ascending de-duplicated indices below n — n of those with max n-1 can only be
+// the full run.
+void fill_all_indices(std::vector<uint32_t>& out, size_t n) {
+  if (out.size() == n &&
+      (n == 0 || out.back() == static_cast<uint32_t>(n - 1)))
+    return;
+  out.resize(n);
+  for (size_t i = 0; i < n; ++i) out[i] = static_cast<uint32_t>(i);
+}
+
+// #99: the search-hit pulse used to LINEAR-SCAN every box every frame — building
+// a NodeLabel, i.e. allocating, per box — purely to locate ONE box, and to re-run
+// the whole fuzzy query over every search entry alongside it. Both are pure
+// functions of (query, active result, search index, layout), none of which
+// changes per frame, so the RESOLVED box is cached instead and the steady-state
+// cost drops to a key comparison.
+//
+// Keyed on the search index's entries pointer + count (a rebuild replaces that
+// vector) plus the same layout identity canvas_index() uses, for the same
+// anti-collision reason — AND on the LIVE collapse hash, because the resolution
+// walks the current display list, which toggle_group() rebuilds immediately
+// while the matching layout is still being computed on a worker. `box` is the
+// index into layout.boxes of the first match in ASCENDING order — the one the
+// old loop's `break` picked — or -1 for "this target has no box in this layout"
+// (it is inside a collapsed group, say), a result worth caching so a miss does
+// not re-scan every frame either.
+struct SearchPulseCache {
+  const void* key_entries = nullptr;
+  size_t key_entry_count = 0;
+  std::string key_query;
+  int key_active = -1;
+  const LayoutResult* key_layout = nullptr;
+  uint64_t key_structure = UINT64_MAX;
+  uint64_t key_collapse = UINT64_MAX;
+  uint64_t key_live_collapse = UINT64_MAX;
+  size_t key_boxes = 0;
+  bool valid = false;
+  int64_t box = -1;
+};
+
+int64_t search_pulse_box(ModelSession& session, const LayoutResult& layout,
+                         const std::string& query, int active_result) {
+  static SearchPulseCache c;
+  const SearchIndex& si = session.search();
+  const void* entries = static_cast<const void*>(si.entries().data());
+  const uint64_t live_collapse = session.collapse().collapse_hash();
+  if (c.valid && c.key_entries == entries &&
+      c.key_entry_count == si.entries().size() && c.key_query == query &&
+      c.key_active == active_result && c.key_layout == &layout &&
+      c.key_structure == layout.structure_hash &&
+      c.key_collapse == layout.collapse_hash &&
+      c.key_live_collapse == live_collapse &&
+      c.key_boxes == layout.boxes.size())
+    return c.box;
+  c.key_entries = entries;
+  c.key_entry_count = si.entries().size();
+  c.key_query = query;
+  c.key_active = active_result;
+  c.key_layout = &layout;
+  c.key_structure = layout.structure_hash;
+  c.key_collapse = layout.collapse_hash;
+  c.key_live_collapse = live_collapse;
+  c.key_boxes = layout.boxes.size();
+  c.valid = true;
+  c.box = -1;
+
+  std::vector<SearchHit> hits = si.query(query, 64);
+  if (hits.empty()) return c.box;
+  int idx = std::clamp(active_result, 0, static_cast<int>(hits.size()) - 1);
+  const uint32_t entry = hits[static_cast<size_t>(idx)].entry;
+  if (entry >= si.entries().size()) return c.box;
+  const SearchEntry& se = si.entries()[entry];
+  if (se.kind != SearchKind::Node) return c.box;
+
+  // Map the hit's IR node to its display box. Only leaf display nodes carry an
+  // ir_node, which is the old loop's `!dn.is_group` test unchanged.
+  const auto& disp = session.collapse().display_nodes();
+  for (size_t i = 0; i < layout.boxes.size(); ++i) {
+    const uint32_t did = layout.boxes[i].display_id;
+    if (did >= disp.size()) continue;
+    const DisplayNode& dn = disp[did];
+    if (!dn.is_group && dn.ir_node == se.ref) {
+      c.box = static_cast<int64_t>(i);
+      break;
+    }
+  }
+  return c.box;
 }
 
 }  // namespace
@@ -419,8 +609,10 @@ void draw_graph_canvas(App& app) {
   }
 
   // --- Compute the visible world rect (for culling) --------------------------
-  // PERF: transform the canvas corners back to world space once; every box/edge
-  // is tested against this AABB so the draw loop is O(visible), not O(total).
+  // PERF: transform the canvas corners back to world space once. This AABB is
+  // both the precise per-item cull test AND the rect handed to the #99 spatial
+  // index, which is what makes the loops below O(visible) rather than O(total) —
+  // testing every item against this rect was still a full sweep of the arrays.
   ImVec2 vw_min = screen_to_world(cam, origin, origin);
   ImVec2 vw_max = screen_to_world(cam, origin, canvas_max);
   if (vw_min.x > vw_max.x) std::swap(vw_min.x, vw_max.x);
@@ -508,13 +700,79 @@ void draw_graph_canvas(App& app) {
   };
   const float kDimAlpha = 0.18f;
 
+  // --- #99 Viewport query: the candidate boxes/edges for THIS frame -----------
+  // Everything below (hover hit-test, edge draw, node draw) used to walk the FULL
+  // boxes/edges arrays and AABB-test each — O(total), so zooming into a corner of
+  // a 100k-node graph cost exactly as much as showing all of it. The grid narrows
+  // that to the items overlapping the view rect; the precise AABB tests are kept
+  // verbatim below, because a grid returns CANDIDATES (an item overlapping the
+  // queried CELLS), never exact hits.
+  //
+  // The two candidate vectors are function-local statics so their heap buffers
+  // survive between frames — SpatialIndex::query_* clears and refills whatever it
+  // is handed, and a fresh vector per frame would reintroduce precisely the
+  // allocation this change removes. Main-thread only, like the whole canvas.
+  static std::vector<uint32_t> vis_boxes;
+  static std::vector<uint32_t> vis_edges;
+  {
+    // A viewport that already covers most of the layout has almost nothing to
+    // cull, and there the grid is pure overhead — it walks every bucket, visits
+    // each item once per cell it spans, and hands back nearly the whole array
+    // regardless. Measured on a 100k-box synthetic layout, the crossover is
+    // ~25% of the bounds AREA: below it the grid runs 1.1x-670x faster than the
+    // old full scan, above it up to 3x SLOWER. So past the threshold we
+    // enumerate everything, which is what the pre-#99 loops did anyway. Both
+    // paths feed the same ascending candidate list into the same precise tests,
+    // so which one runs is invisible in the picture.
+    constexpr double kIndexAreaFraction = 0.25;
+    const double lw = static_cast<double>(layout->bounds_max.x) -
+                      static_cast<double>(layout->bounds_min.x);
+    const double lh = static_cast<double>(layout->bounds_max.y) -
+                      static_cast<double>(layout->bounds_min.y);
+    const double ow = std::min(static_cast<double>(vw_max.x),
+                               static_cast<double>(layout->bounds_max.x)) -
+                      std::max(static_cast<double>(vw_min.x),
+                               static_cast<double>(layout->bounds_min.x));
+    const double oh = std::min(static_cast<double>(vw_max.y),
+                               static_cast<double>(layout->bounds_max.y)) -
+                      std::max(static_cast<double>(vw_min.y),
+                               static_cast<double>(layout->bounds_min.y));
+    // Zero-extent bounds count as fully covered (and would divide by zero).
+    const bool covers_most =
+        !(lw > 0.0) || !(lh > 0.0) ||
+        std::max(ow, 0.0) * std::max(oh, 0.0) >= kIndexAreaFraction * lw * lh;
+
+    // Building the grid is deferred to the first frame that actually queries it,
+    // so opening a model fit-to-screen never pays for an index it never reads.
+    bool queried = false;
+    if (!covers_most) {
+      const SpatialIndex& sindex = canvas_index(*layout);
+      if (sindex.valid()) {
+        const WorldRect view_rect{vw_min.x, vw_min.y, vw_max.x, vw_max.y};
+        sindex.query_boxes(view_rect, vis_boxes);
+        sindex.query_edges(view_rect, vis_edges);
+        queried = true;
+      }
+    }
+    if (!queried) {
+      fill_all_indices(vis_boxes, layout->boxes.size());
+      fill_all_indices(vis_edges, layout->edges.size());
+    }
+  }
+
   // --- Hover hit-test (against culled boxes) ---------------------------------
   const ImVec2 mouse = io.MousePos;
   int32_t hover_box = -1;
   if (canvas_hovered) {
-    // Iterate reverse so topmost (later) boxes win ties.
-    for (size_t i = layout->boxes.size(); i-- > 0;) {
-      const NodeBox& b = layout->boxes[i];
+    // Iterate reverse so topmost (later) boxes win ties. The index returns
+    // candidates in ASCENDING order, so this walks the candidate list BACKWARDS
+    // to reproduce the old `for (i = boxes.size(); i-- > 0;)` tie-break exactly.
+    // Walking it forwards would silently hand the hover to the BOTTOM box of any
+    // overlapping stack — a visible behaviour change, not a perf detail.
+    for (size_t k = vis_boxes.size(); k-- > 0;) {
+      const uint32_t bi = vis_boxes[k];
+      if (bi >= layout->boxes.size()) continue;  // never index a stale grid
+      const NodeBox& b = layout->boxes[bi];
       if (box_culled(b.display_id)) continue;  // can't hover a culled box.
       ImVec2 bmin(b.pos.x, b.pos.y);
       ImVec2 bmax(b.pos.x + b.size.x, b.pos.y + b.size.y);
@@ -540,9 +798,11 @@ void draw_graph_canvas(App& app) {
   int32_t hover_edge = -1;
   float hover_edge_d2 = FLT_MAX;
   const float kEdgePickPx = 6.0f;  // pointer must be within this many px of a curve
-  int32_t edge_idx = -1;
-  for (const EdgeCurve& e : layout->edges) {
-    ++edge_idx;
+  // #99: ascending candidate indices, so edges still emit in layout order — the
+  // grid de-duplicates an edge spanning several cells precisely so this holds.
+  for (const uint32_t edge_idx : vis_edges) {
+    if (edge_idx >= layout->edges.size()) continue;  // never index a stale grid
+    const EdgeCurve& e = layout->edges[edge_idx];
     // Feature 2: skip edges whose source is a hidden constant/initializer box.
     // Also cull edges touching a nav-hidden endpoint.
     if (is_const_source(e.from_display_id)) continue;
@@ -589,7 +849,7 @@ void draw_graph_canvas(App& app) {
       float d2 = dist_sq_point_bezier(mouse, p0, p1, p2, p3, 12);
       if (d2 < hover_edge_d2) {
         hover_edge_d2 = d2;
-        hover_edge = edge_idx;
+        hover_edge = static_cast<int32_t>(edge_idx);
       }
     }
   }
@@ -616,14 +876,19 @@ void draw_graph_canvas(App& app) {
   }
 
   // --- Draw nodes (LOD by zoom) ----------------------------------------------
+  // #99: both tiers walk the ascending candidate list (layout order preserved)
+  // and reuse ONE NodeLabel across the loop, so no node costs an allocation.
+  NodeLabel lab;
   if (zoom < kZoomFlat) {
     // Lowest LOD: one blob per collapse group / node, tinted by category.
-    for (const NodeBox& b : layout->boxes) {
+    for (const uint32_t bi : vis_boxes) {
+      if (bi >= layout->boxes.size()) continue;  // never index a stale grid
+      const NodeBox& b = layout->boxes[bi];
       if (box_culled(b.display_id)) continue;
       ImVec2 bmin(b.pos.x, b.pos.y);
       ImVec2 bmax(b.pos.x + b.size.x, b.pos.y + b.size.y);
       if (!aabb_overlap(bmin, bmax, vw_min, vw_max)) continue;
-      NodeLabel lab = label_for(app, b.display_id);
+      fill_label(app, b.display_id, lab);
       ImVec2 c = world_to_screen(
           cam, origin,
           ImVec2((bmin.x + bmax.x) * 0.5f, (bmin.y + bmax.y) * 0.5f));
@@ -642,7 +907,9 @@ void draw_graph_canvas(App& app) {
       dl->AddCircleFilled(c, r, blob, 8);
     }
   } else {
-    for (const NodeBox& b : layout->boxes) {
+    for (const uint32_t bi : vis_boxes) {
+      if (bi >= layout->boxes.size()) continue;  // never index a stale grid
+      const NodeBox& b = layout->boxes[bi];
       if (box_culled(b.display_id)) continue;
       ImVec2 bmin(b.pos.x, b.pos.y);
       ImVec2 bmax(b.pos.x + b.size.x, b.pos.y + b.size.y);
@@ -654,7 +921,7 @@ void draw_graph_canvas(App& app) {
           vs.selected_display == static_cast<int32_t>(b.display_id);
       const bool hovered = hover_box == static_cast<int32_t>(b.display_id);
       const bool dimmed = nav_dim(b.display_id);
-      NodeLabel lab = label_for(app, b.display_id);
+      fill_label(app, b.display_id, lab);
       ImU32 header = App::category_color(lab.cat, dark);
       // Diff overlay wins; else cost heatmap; else category color.
       DiffTint tint = diff_tint_for_display(app, static_cast<int32_t>(b.display_id));
@@ -694,21 +961,27 @@ void draw_graph_canvas(App& app) {
         auto text_px = [zoom](float base) {
           return std::clamp(base * zoom, base * 0.5f, base * 3.0f);
         };
+        // #99: the begin/end AddText overload takes the label views directly, so
+        // no NUL-terminated copy is materialized to draw a node. ImDrawList
+        // returns early when begin == end, so an empty line still draws nothing.
         dl->PushClipRect(smin, smax, true);
         if (zoom > kZoomFull) {
           if (fonts.bold != nullptr)
             dl->AddText(fonts.bold, text_px(16.0f),
                         ImVec2(smin.x + 6.0f * zoom, smin.y + 2.0f * zoom),
-                        col_text, lab.primary.c_str());
+                        col_text, lab.primary.data(),
+                        lab.primary.data() + lab.primary.size());
           if (fonts.small != nullptr && !lab.secondary.empty())
             dl->AddText(fonts.small, text_px(12.0f),
                         ImVec2(smin.x + 6.0f * zoom, smin.y + header_h + 2.0f),
-                        col_text_muted, lab.secondary.c_str());
+                        col_text_muted, lab.secondary.data(),
+                        lab.secondary.data() + lab.secondary.size());
         } else {
           if (fonts.body != nullptr)
             dl->AddText(fonts.body, text_px(14.0f),
                         ImVec2(smin.x + 6.0f * zoom, smin.y + 2.0f * zoom),
-                        col_text, lab.primary.c_str());
+                        col_text, lab.primary.data(),
+                        lab.primary.data() + lab.primary.size());
         }
         dl->PopClipRect();
       }
@@ -748,31 +1021,20 @@ void draw_graph_canvas(App& app) {
     }
 
     // Search-hit pulse: outline the current search target if it maps to a box.
+    // #99: the target box is resolved once and cached (see search_pulse_box);
+    // this used to re-run the fuzzy query AND scan every box, allocating a
+    // NodeLabel per box, every single frame the overlay was open.
     if (vs.search_open && !vs.search_query.empty()) {
-      const auto& hits =
-          session.search().query(vs.search_query, 64);
-      if (!hits.empty()) {
-        int idx = std::clamp(vs.search_active_result, 0,
-                             static_cast<int>(hits.size()) - 1);
-        const SearchEntry& se = session.search().entries()[hits[idx].entry];
-        // Map a node entry to its display box if visible.
-        for (const NodeBox& b : layout->boxes) {
-          NodeLabel lab = label_for(app, b.display_id);
-          (void)lab;
-          const auto& disp = session.collapse().display_nodes();
-          if (b.display_id >= disp.size()) continue;
-          const DisplayNode& dn = disp[b.display_id];
-          if (!dn.is_group && se.kind == SearchKind::Node &&
-              dn.ir_node == se.ref) {
-            ImVec2 smin = world_to_screen(cam, origin, ImVec2(b.pos.x, b.pos.y));
-            ImVec2 smax = world_to_screen(
-                cam, origin, ImVec2(b.pos.x + b.size.x, b.pos.y + b.size.y));
-            ImU32 pc = lerp_col(col_accent, IM_COL32(255, 220, 120, 255), pulse);
-            dl->AddRect(ImVec2(smin.x - 3, smin.y - 3),
-                        ImVec2(smax.x + 3, smax.y + 3), pc, 7.0f, 0, 3.0f);
-            break;
-          }
-        }
+      const int64_t target = search_pulse_box(session, *layout, vs.search_query,
+                                              vs.search_active_result);
+      if (target >= 0 && static_cast<size_t>(target) < layout->boxes.size()) {
+        const NodeBox& b = layout->boxes[static_cast<size_t>(target)];
+        ImVec2 smin = world_to_screen(cam, origin, ImVec2(b.pos.x, b.pos.y));
+        ImVec2 smax = world_to_screen(
+            cam, origin, ImVec2(b.pos.x + b.size.x, b.pos.y + b.size.y));
+        ImU32 pc = lerp_col(col_accent, IM_COL32(255, 220, 120, 255), pulse);
+        dl->AddRect(ImVec2(smin.x - 3, smin.y - 3),
+                    ImVec2(smax.x + 3, smax.y + 3), pc, 7.0f, 0, 3.0f);
       }
     }
   }
@@ -811,13 +1073,17 @@ void draw_graph_canvas(App& app) {
 
   if (ImGui::BeginPopup("canvas_ctx")) {
     if (vs.selected_display >= 0) {
-      NodeLabel lab = label_for(app, static_cast<uint32_t>(vs.selected_display));
-      ImGui::TextDisabled("%s", lab.primary.c_str());
+      NodeLabel ctx_lab;
+      fill_label(app, static_cast<uint32_t>(vs.selected_display), ctx_lab);
+      ImGui::TextDisabled("%.*s", static_cast<int>(ctx_lab.primary.size()),
+                          ctx_lab.primary.data());
       ImGui::Separator();
       if (ImGui::MenuItem("Copy name")) {
-        const std::string& nm =
-            lab.secondary.empty() ? lab.primary : lab.secondary;
-        ImGui::SetClipboardText(nm.c_str());
+        // The clipboard API needs a NUL-terminated buffer, so this ONE call site
+        // materializes a string — on a click, not per frame, so it is free.
+        std::string_view nm =
+            ctx_lab.secondary.empty() ? ctx_lab.primary : ctx_lab.secondary;
+        ImGui::SetClipboardText(std::string(nm).c_str());
       }
       // #57: copy the node's op/attrs/input-output shapes as JSON to the clipboard.
       const ir::Model* cm = session.model();
