@@ -59,6 +59,23 @@ struct TensorRef {
   // the real data; structural parsing still records offset+len only (zero reads).
   bool blob_indirect = false;
 
+  // v0.9.1b (#49), APPEND-ONLY. The EXACT source quantization type id, when the
+  // parser knows one that ir::DType cannot express. GGUF folds ~20 distinct ggml
+  // block layouts onto the two coarse buckets Q4/Q8 (spec §6.4) — enough to
+  // LABEL a tensor, but not enough to DECODE one: Q4_0 and Q4_K share the Q4
+  // bucket and share no layout whatsoever. The #49 single-block preview needs the
+  // exact id, so the parser records it verbatim here rather than growing the
+  // frozen 16-enumerator DType (see dtype_label above for the same reasoning
+  // applied to the display name).
+  //
+  // UINT32_MAX => the parser had no such id. Interpretation is PARSER-SPECIFIC —
+  // for GGUF this is the raw ggml type id (see parsers/gguf/GgufBlocks.h); a
+  // consumer must check Model::format_name before trusting it.
+  //
+  // Layout-inert: structure_hash covers CollapseTree node fingerprints + edges
+  // only, and this is never serialized to the layout cache — no kVersion bump.
+  uint32_t quant_type_id = UINT32_MAX;
+
   // Product of dims (>=0 dims only); 0 if any dim is dynamic/unset.
   int64_t elem_count() const {
     if (shape.empty()) return 0;

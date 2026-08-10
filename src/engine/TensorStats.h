@@ -103,6 +103,50 @@ Result<TensorThumbnail> compute_tensor_thumbnail(const ir::TensorRef& t,
                                                  const std::string& model_dir,
                                                  const ir::Model* model = nullptr);
 
+// --- #49: opt-in, view-only single-block dequant preview ---------------------
+//
+// SCOPE (frozen — see DECISIONS.md "v0.9.1b — dequantization scope"): this is the
+// ONLY dequantization entry point in NetVis, it decodes exactly ONE block, it
+// returns the values by value in a fixed-size buffer, and nothing may persist or
+// export what it returns. It exists so a user inspecting a quantized tensor can
+// see real numbers behind the metadata, not so anything downstream can consume a
+// dequantized tensor. It reads at most one block's bytes — strictly fewer than
+// the whole-tensor histogram pass the inspector already runs.
+//
+// Only the five legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) decode; K-quants
+// and the IQ* family report available=false with an honest reason rather than an
+// approximation. See parsers/gguf/GgufBlocks.h for why.
+constexpr uint32_t kQuantPreviewMaxElems = 32;
+
+struct QuantBlockPreview {
+  bool available = false;
+  std::string type_name;    // exact source quant type, e.g. "Q4_0"; "" if unknown
+  uint32_t block_index = 0; // which block was decoded
+  uint64_t total_blocks = 0;// blocks in the tensor (0 if the geometry is unknown)
+  uint32_t elem_count = 0;  // floats written to `values`
+  std::array<float, kQuantPreviewMaxElems> values{};
+  // The flat element index `values[0]` corresponds to, so the inspector can show
+  // where in the tensor the preview came from. block_index * elems_per_block.
+  uint64_t first_elem = 0;
+  // Non-empty whenever available == false: a fixed, honest explanation
+  // ("Q4_K uses 256-element super-blocks; preview not supported", ...). Never a
+  // guess and never a partially-decoded result.
+  std::string unavailable_reason;
+};
+
+// Decode one block of `t` for preview. `base`/`model_dir`/`model` resolve the
+// payload exactly like compute_tensor_stats (including ONNX external data and
+// the CoreML blob_indirect header). `block_index` is clamped-checked against the
+// tensor's block count; an out-of-range index yields available=false, not an
+// error. Calls ByteReader::mark_payload_read() once. Returns an error Result only
+// for an unreadable mapping — an unsupported LAYOUT is a successful call with
+// available=false, so the caller can render the reason.
+Result<QuantBlockPreview> preview_quant_block(const ir::TensorRef& t,
+                                              const MappedFile& base,
+                                              uint32_t block_index,
+                                              const std::string& model_dir,
+                                              const ir::Model* model = nullptr);
+
 // Export a tensor to NumPy .npy (v1.0 header, spec §7.5) or raw .bin.
 // Reads the payload from the mmap/external file; writes to `out_path`.
 // Pass `model` to resolve StringId in external_path (nullptr if not needed).

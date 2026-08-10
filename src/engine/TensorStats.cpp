@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "core/ByteReader.h"
+#include "core/Half.h"
 
 namespace netvis {
 
@@ -152,39 +153,8 @@ Result<Payload> resolve_payload(const ir::TensorRef& t, const MappedFile& base,
   return out;
 }
 
-// F16 (IEEE half) bit pattern -> float.
-float f16_to_f32(uint16_t h) {
-  uint32_t sign = (h & 0x8000u) << 16;
-  uint32_t exp = (h >> 10) & 0x1F;
-  uint32_t mant = h & 0x3FF;
-  uint32_t bits;
-  if (exp == 0) {
-    if (mant == 0) {
-      bits = sign;  // +/- zero
-    } else {
-      // subnormal: normalize
-      exp = 1;
-      while ((mant & 0x400) == 0) { mant <<= 1; --exp; }
-      mant &= 0x3FF;
-      bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    }
-  } else if (exp == 0x1F) {
-    bits = sign | 0x7F800000u | (mant << 13);  // inf/nan
-  } else {
-    bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-  }
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
-
-// BF16 (upper 16 bits of a float) -> float.
-float bf16_to_f32(uint16_t b) {
-  uint32_t bits = static_cast<uint32_t>(b) << 16;
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
+// f16_to_f32 / bf16_to_f32 moved to core/Half.h in v0.9.1b — GgufBlocks.cpp
+// (parsers layer, below engine) needs the same F16 decode for quant-block scales.
 
 // Number of elements from byte_len given dtype (0 for quantized/unknown).
 uint64_t elem_count_from_bytes(const ir::TensorRef& t, Payload& p) {
