@@ -94,6 +94,13 @@ struct BenchCase {
 // Stage names are FROZEN string constants: the gate matches baseline to current
 // by (case label, stage name), so a renamed stage silently drops out of the
 // comparison instead of failing. Adding a stage is safe; renaming one is not.
+// #100: MappedFile::open alone, for real model files only. This is the number
+// behind the product's central claim — that opening a 5 GB model costs the same
+// as opening a 5 MB one, because only the mapping is established up front.
+// NOT a cold-open figure: a process cannot drop the OS page cache for its own
+// files, so the pages stay warm across repeats and this measures the mapping
+// syscalls, not first-touch fault cost. Reported as what it is.
+inline constexpr const char* kStageMmap = "mmap";
 inline constexpr const char* kStageParse = "parse";
 inline constexpr const char* kStageCollapse = "collapse";
 inline constexpr const char* kStageShapes = "shape_infer";

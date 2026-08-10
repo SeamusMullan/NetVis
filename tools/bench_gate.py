@@ -295,6 +295,52 @@ def compare(baseline, current, threshold):
             }
         )
 
+    # --- #101: the memory ceiling -------------------------------------------
+    #
+    # Time is not the only thing that regresses. A change that trades memory for
+    # speed will sail through every stage comparison above while quietly pushing
+    # peak RSS up, and "opens a multi-GB model" is a memory claim as much as a
+    # latency one — the zero-payload thesis is precisely a statement about not
+    # holding the file in RAM. So peak RSS is gated on the same terms as a stage.
+    #
+    # Compared per case, because RSS is reported per case and the 100k rung is
+    # the one that matters. Reported as "unknown" rather than compared when
+    # either side is 0: core/Rss.h returns 0 for "the platform counter was
+    # unavailable", NOT for zero bytes, and treating an unavailable counter as a
+    # 100% improvement would silently disable this check on any platform where
+    # it does not work.
+    base_rss = {c["label"]: c.get("peak_rss_bytes", 0) for c in baseline["cases"]}
+    for case in current["cases"]:
+        label = case["label"]
+        cur = case.get("peak_rss_bytes", 0)
+        base = base_rss.get(label, 0)
+        if label not in base_rss:
+            continue  # a new case; its stages already reported as "added"
+        if not base or not cur:
+            rows.append({
+                "label": label, "stage": "peak_rss", "baseline_ms": None,
+                "current_ms": None, "delta": None,
+                "verdict": "unknown (RSS counter unavailable)", "failure": False,
+            })
+            continue
+        delta = (cur - base) / base
+        # The same generous threshold as timing. Allocator behaviour varies
+        # between runners far less than the scheduler does, but a tight bound
+        # here would fail on a glibc change rather than on a NetVis change.
+        failed = delta > threshold
+        rows.append({
+            "label": label,
+            "stage": "peak_rss",
+            "baseline_ms": base / (1024.0 * 1024.0),
+            "current_ms": cur / (1024.0 * 1024.0),
+            "delta": delta,
+            "verdict": ("REGRESSION (memory)" if failed
+                        else "IMPROVED (verify)" if delta < -0.10
+                        else "ok"),
+            "failure": failed,
+        })
+        any_failure = any_failure or failed
+
     return rows, any_failure
 
 

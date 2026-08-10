@@ -814,6 +814,27 @@ Result<std::vector<BenchCase>> run_bench(const BenchOptions& options) {
     const std::string ext = ext_of(resolved.map_path);
     ProgressSink progress;
 
+    // kStageMmap (#100). The product's central claim is that opening a 5 GB
+    // model is as fast as opening a 5 MB one, because only the mapping is
+    // established up front. That claim was published in the README for a year
+    // with nothing measuring it. This times MappedFile::open alone, so the
+    // number can be read against the file size and the claim checked.
+    //
+    // It is NOT a cold-open figure: the page cache stays warm across repeats,
+    // and a process cannot drop the OS page cache for its own files. So this
+    // measures the mapping syscalls, not first-touch fault cost. Reported as
+    // what it is rather than dressed up as a cold open.
+    std::vector<double> mmap_samples;
+    mmap_samples.reserve(repeats);
+    for (uint32_t r = 0; r < repeats; ++r) {
+      Clock::time_point t0 = Clock::now();
+      Result<MappedFile> probe = MappedFile::open(resolved.map_path);
+      const double dt = ms_since(t0);
+      if (!probe) break;
+      mmap_samples.push_back(dt);
+      // Released here, outside the timer: unmapping is teardown, not open cost.
+    }
+
     // kStageParse. Each repeat parses into a FRESH ir::Model, so every one
     // starts from the same state with no reset needed. The mapping is opened
     // once and stays warm across repeats: this measures parse throughput, not
@@ -840,9 +861,11 @@ Result<std::vector<BenchCase>> run_bench(const BenchOptions& options) {
 
     BenchCase c = measure_case(model, base_name(path), repeats, file.data(),
                                static_cast<size_t>(file.size()));
-    // Parse comes first in the stage list because it comes first in time; the
-    // gate matches on (label, stage name) so order is presentation only.
+    // mmap then parse, first in the stage list because they come first in time;
+    // the gate matches on (label, stage name) so order is presentation only.
     c.stages.insert(c.stages.begin(), make_stage(kStageParse, samples));
+    if (!mmap_samples.empty())
+      c.stages.insert(c.stages.begin(), make_stage(kStageMmap, mmap_samples));
     cases.push_back(std::move(c));
   }
 
