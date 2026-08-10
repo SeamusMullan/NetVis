@@ -63,6 +63,25 @@ class CollapseTree {
   bool collapse_all();
   bool expand_all();
 
+  // v0.9.4 (#103 session restore, #106 undo/redo): capture and restore the exact
+  // expand/collapse configuration.
+  //
+  // collapse_hash() is a FINGERPRINT, not state — it can say two configurations
+  // differ but cannot reconstruct either, so it is useless for restoring one.
+  // Replaying toggle_group() calls would need the caller to know the current
+  // state per group anyway, and would rebuild the display list once per toggle.
+  //
+  // The snapshot is only meaningful for the SAME build(): group indices are
+  // assigned during detection, so a snapshot taken against one model must not be
+  // applied to another. set_expanded() therefore rejects a size mismatch rather
+  // than silently applying a partial state — restoring a stale snapshot would
+  // collapse arbitrary unrelated groups.
+  const std::vector<bool>& expanded_state() const { return expanded_; }
+
+  // Returns false (and changes nothing) when `state` does not match groups()
+  // one-for-one. Rebuilds the display list once, not once per group.
+  bool set_expanded_state(const std::vector<bool>& state);
+
   // Hash of the current collapse state (which groups are expanded) — part of the
   // layout cache key (spec §7.2.7).
   uint64_t collapse_hash() const;

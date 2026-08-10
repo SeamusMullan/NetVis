@@ -23,6 +23,7 @@
 #include "engine/ModelSession.h"
 #include "engine/plugin/PluginPrefs.h"   // #11: PluginEnableSet, PluginKind
 #include "engine/OpCategory.h"
+#include "view/CategoryStyle.h"   // #104: accessible palette + non-colour cue
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
 
@@ -33,6 +34,7 @@ namespace netvis {
 // Navigation state lives in its own view header; ViewState holds it by pointer
 // so App.h stays light. Forward-declared here, defined in view/GraphNav.h.
 struct GraphNavState;
+class ViewHistory;  // view/ViewHistory.h (#106) — held by unique_ptr below
 
 // Static cost/analyzer report (v0.3.0). Forward-declared so App.h needn't include
 // engine/CostModel.h; ViewState holds it by unique_ptr, rebuilt by ensure_cost().
@@ -251,6 +253,40 @@ struct ViewState {
   // #49: the inspector's dequant-preview toggle. Off by default — the preview is
   // opt-in by contract, not merely by convention.
   bool inspector_quant_preview = false;
+
+  // --- v0.9.4 additions (APPEND-ONLY) ---------------------------------------
+  // #102: the unified Preferences window. Not persisted — a settings window that
+  // reopens itself on every launch is a nuisance, not a restored preference.
+  bool show_preferences = false;
+
+  // #105: the shortcut reference. Also not persisted, same reasoning.
+  bool show_shortcuts = false;
+
+  // #104 accessibility. Both PERSISTED (they are exactly the kind of setting a
+  // user sets once and expects to survive a restart — unlike the two above).
+  //
+  // accessible_palette swaps BOTH the category colours and the non-colour border
+  // cue together; they are one encoding, not two toggles (see CategoryStyle.h —
+  // fifteen categories cannot be separated by hue alone).
+  bool accessible_palette = false;
+  // UI scale for fonts and spacing. Clamped on load and on edit: a persisted 0 or
+  // a negative would render an unusable window with no way to reach the setting
+  // that caused it.
+  float ui_scale = 1.0f;
+
+  // #103: reopen last session's tabs + camera on launch. Opt-in and OFF by
+  // default — silently reopening several multi-GB models would turn a deliberate
+  // action into an unasked-for startup cost.
+  bool restore_session = false;
+
+  // #106: bounded undo/redo over view state. Held by pointer for the same reason
+  // `nav` and `cost` are — ViewState is copied around and a history is large.
+  // Per-tab, because a tab is the unit a user thinks of as "this view".
+  std::unique_ptr<ViewHistory> history;
+  // Set when a change is applied BY an undo/redo, so the frame that applies it
+  // does not immediately record the result as a new history entry (which would
+  // make redo unreachable after a single undo).
+  bool suppress_history = false;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather
@@ -318,6 +354,29 @@ class App {
   void preview_tensor_quant_block(uint32_t block_index);
 
   void add_toast(const std::string& text, bool is_error);
+
+  // --- v0.9.4 -------------------------------------------------------------
+  // #106: record the active tab's current view state, unless a restore is in
+  // flight. Called once per frame after input is handled, so a change made this
+  // frame becomes the next undo target. Cheap when nothing changed (the history
+  // drops a snapshot identical to the current one).
+  void record_view_history();
+  // Apply one step. No-op when there is nothing to step to, or when the snapshot
+  // does not match the live model/graph.
+  void undo_view();
+  void redo_view();
+
+  // #103: capture / restore the whole window's tabs. save_session() is a no-op
+  // when ViewState::restore_session is off, so disabling the pref also stops it
+  // being written. restore_session() opens what was remembered and returns how
+  // many entries were skipped because their path no longer resolves.
+  void save_session_now();
+  size_t restore_last_session();
+
+  // #104: the live category style, honouring ViewState::accessible_palette.
+  // Panels must call THIS rather than category_color() so the legend, the canvas
+  // and the minimap cannot disagree about what a category looks like.
+  CategoryStyle category_style_for(OpCategory c) const;
 
   // Accessors used by panel free functions — all redirect to the ACTIVE tab
   // (#62), so panels are agnostic to how many models are open.

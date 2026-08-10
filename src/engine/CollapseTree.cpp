@@ -451,6 +451,20 @@ bool CollapseTree::expand_all() {
   return true;
 }
 
+// #103/#106: restore an exact expand/collapse configuration captured by
+// expanded_state(). Rejects a snapshot whose size does not match the current
+// group count — that means it came from a different build() (group indices are
+// assigned during detection), and applying it would collapse arbitrary unrelated
+// groups rather than the ones the user had collapsed.
+bool CollapseTree::set_expanded_state(const std::vector<bool>& state) {
+  if (state.size() != expanded_.size()) return false;
+  if (state == expanded_) return false;  // no-op; caller need not re-layout
+  expanded_ = state;
+  if (model_ && graph_index_ < model_->graphs.size())
+    rebuild_display(model_->graphs[graph_index_]);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // collapse_hash
 // ---------------------------------------------------------------------------
