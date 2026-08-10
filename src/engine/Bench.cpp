@@ -43,6 +43,7 @@
 #include "engine/LayoutEngine.h"
 #include "engine/ModelPath.h"
 #include "engine/ShapeInferenceExt.h"
+#include "engine/SpatialIndex.h"
 #include "parsers/Parser.h"
 
 namespace netvis {
@@ -236,10 +237,20 @@ Vec2 bench_size(const DisplayNode& d) {
   return Vec2{40.0f + chars * 7.0f, 40.0f};
 }
 
-// Fraction of the world AREA the visible_scan proxy pretends the camera shows.
-// 5% is the interesting case: zoomed in far enough that almost everything is off
-// screen, which is precisely when an O(total) cull is pure waste.
-constexpr double kVisibleFraction = 0.05;
+// Fractions of the world AREA the visible_scan proxies pretend the camera shows.
+//
+// TWO of them, deliberately (#99). The spatial index that makes culling
+// O(visible) is only a win below roughly a quarter of the world: past that the
+// grid walk visits nearly every item anyway and costs more than a flat scan, so
+// both the index and the canvas fall back to direct enumeration there. Gating on
+// one fraction alone would therefore be misleading in whichever direction it was
+// chosen —
+//   * wide only  => the whole optimization reads as a regression;
+//   * zoomed only => a real regression at the zoom level a model FIRST OPENS at
+//                    (fit-to-screen, i.e. full coverage) would go unnoticed.
+// So the harness reports both and the gate compares both.
+constexpr double kVisibleFractionWide = 1.0;
+constexpr double kVisibleFractionZoomed = 0.01;
 
 // Lowercased extension without the leading dot ("" if none). Same derivation
 // ReportJson uses to route detection; duplicated rather than exported because it
@@ -422,16 +433,21 @@ BenchCase measure_case(ir::Model& model, std::string label, uint32_t repeats,
   // --- visible scan --------------------------------------------------------
   // A PROXY for per-frame render cost, never a frame time (Bench.h).
   {
-    BenchStage vs;
-    vs.name = kStageVisibleScan;
-    vs.repeats = repeats;
-    vs.ms = visible_scan_ms(layout, kVisibleFraction, repeats);
     // visible_scan_ms is frozen to return the median alone, so min/max echo it.
     // Echoing is honest here; inventing a spread the function never exposed
     // would put numbers in the baseline that no repeat produced.
-    vs.min_ms = vs.ms;
-    vs.max_ms = vs.ms;
-    c.stages.push_back(std::move(vs));
+    auto scan_stage = [&](const char* name, double fraction) {
+      BenchStage vs;
+      vs.name = name;
+      vs.repeats = repeats;
+      vs.ms = visible_scan_ms(layout, fraction, repeats);
+      vs.min_ms = vs.ms;
+      vs.max_ms = vs.ms;
+      return vs;
+    };
+    c.stages.push_back(scan_stage(kStageVisibleScan, kVisibleFractionWide));
+    c.stages.push_back(
+        scan_stage(kStageVisibleScanZoomed, kVisibleFractionZoomed));
   }
 
   g_bench_sink = sink;
@@ -676,24 +692,50 @@ double visible_scan_ms(const LayoutResult& layout, double visible_fraction,
   samples.reserve(n);
   uint64_t sink = 0;
 
+  // #99: the index is built ONCE here, outside the timing loop, because that is
+  // how the canvas uses it — a grid is rebuilt when the layout changes, not when
+  // a frame is drawn, and layout changes are already the expensive operation.
+  // Timing the build inside the per-frame number would report a per-layout cost
+  // as a per-frame one. (The build is ~5 ms at the 100k rung, against a layout
+  // stage of ~16 ms that must already have run for a grid to exist at all.)
+  SpatialIndex index;
+  index.build(layout);
+  std::vector<uint32_t> candidates;
+
+  const WorldRect rect{vw_min.x, vw_min.y, vw_max.x, vw_max.y};
+
   for (uint32_t r = 0; r < n; ++r) {
     Clock::time_point t0 = Clock::now();
     uint64_t hits = 0;
-    // Reverse iteration, as the canvas does so topmost boxes win ties.
-    for (size_t i = layout.boxes.size(); i-- > 0;) {
-      const NodeBox& b = layout.boxes[i];
+
+    // The index returns CANDIDATES by contract, so the exact AABB test still
+    // runs — exactly as at the call site. Dropping it here would measure a
+    // cheaper operation than the canvas actually performs.
+    index.query_boxes(rect, candidates);
+    // Reverse iteration, as the canvas does so topmost boxes win ties. The
+    // query returns ascending indices, so walking forward would silently invert
+    // the tie-break; this mirrors the fix the canvas needed for the same reason.
+    for (size_t k = candidates.size(); k-- > 0;) {
+      const uint32_t bi = candidates[k];
+      if (bi >= layout.boxes.size()) continue;
+      const NodeBox& b = layout.boxes[bi];
       const Vec2 bmin{b.pos.x, b.pos.y};
       const Vec2 bmax{b.pos.x + b.size.x, b.pos.y + b.size.y};
       if (aabb_overlap(bmin, bmax, vw_min, vw_max)) ++hits;
     }
+
     // Edge cull: the canvas bounds each bezier by its four control points.
-    for (const EdgeCurve& e : layout.edges) {
+    index.query_edges(rect, candidates);
+    for (uint32_t ei : candidates) {
+      if (ei >= layout.edges.size()) continue;
+      const EdgeCurve& e = layout.edges[ei];
       const Vec2 emin{min4(e.p0.x, e.p1.x, e.p2.x, e.p3.x),
                       min4(e.p0.y, e.p1.y, e.p2.y, e.p3.y)};
       const Vec2 emax{max4(e.p0.x, e.p1.x, e.p2.x, e.p3.x),
                       max4(e.p0.y, e.p1.y, e.p2.y, e.p3.y)};
       if (aabb_overlap(emin, emax, vw_min, vw_max)) ++hits;
     }
+
     samples.push_back(ms_since(t0));
     sink += hits;
   }

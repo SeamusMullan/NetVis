@@ -100,6 +100,14 @@ inline constexpr const char* kStageShapes = "shape_infer";
 inline constexpr const char* kStageLayout = "layout";
 inline constexpr const char* kStageCost = "cost";
 inline constexpr const char* kStageVisibleScan = "visible_scan";
+// #99: the same sweep at a ZOOMED-IN viewport. Two stages, not one, because the
+// spatial index that makes culling O(visible) is only a win below roughly a
+// quarter of the world — past that the grid walk visits nearly every item anyway
+// and costs more than a flat scan. Measuring only the wide view would therefore
+// report the whole optimization as a regression, and measuring only the zoomed
+// view would hide a real regression at the zoom level a model first opens at.
+// Both must be gated.
+inline constexpr const char* kStageVisibleScanZoomed = "visible_scan_zoomed";
 
 struct BenchOptions {
   // Median-of-N. 5 is the default: enough to reject a single outlier, cheap

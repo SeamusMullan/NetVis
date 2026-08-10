@@ -197,7 +197,17 @@ void ensure_cost(App& app) {
 
   // Refresh the cached heatmap range once per frame (cheap; O(display nodes)) so
   // the per-node tint and the legend read a scalar cache instead of re-scanning.
-  recompute_heatmap_range(app);
+  // #99: gated on the heatmap toggle -- when it is off (the default), NOTHING
+  // reads heatmap_range_* (cost_tint_for_display and draw_heatmap_legend both
+  // early-return on !vs.cost_heatmap before touching it), so scanning every
+  // display node to fill a range nobody looks at is pure waste. Safe to skip:
+  // App::frame() calls ensure_cost() BEFORE draw_graph_canvas() and BEFORE
+  // draw_properties_panel() (where the checkbox lives), so a frame that flips
+  // the toggle on always draws its canvas with the OLD (off) value first --
+  // this function only needs a fresh range by the FOLLOWING frame's canvas
+  // draw, and it gets exactly that (unconditional recompute resumes the instant
+  // cost_heatmap reads true). No stale-range flash is possible either way.
+  if (vs.cost_heatmap) recompute_heatmap_range(app);
 }
 
 // Normalize a metric value into [0,1] across [min,max] using the chosen scale.
@@ -548,13 +558,66 @@ void draw_cost_section(App& app) {
   // --- Activation memory timeline (#28) ---------------------------------------
   // The full liveness curve behind peak_activation_bytes: resident activation
   // bytes at each node's high-water point in exec (topological) order. Graph-mode
-  // only; skipped when the curve is empty (table mode / no nodes). Recomputed per
-  // frame — cheap O(V+E) for modest graphs; huge graphs are DOWNSAMPLED for the
-  // plotted array only (the true peak + peak-node index still come from the full
-  // curve). max(curve) == peak_activation_bytes by construction (engine invariant).
+  // only; skipped when the curve is empty (table mode / no nodes). Huge graphs
+  // are DOWNSAMPLED for the plotted array only (the true peak + peak-node index
+  // still come from the full curve). max(curve) == peak_activation_bytes by
+  // construction (engine invariant).
+  //
+  // CACHED (#99/#101): this section is drawn unconditionally whenever
+  // from_graph is true (no CollapsingHeader gate, unlike the hotspots/cumulative
+  // sections below), so activation_liveness_curve — a full O(V+E) re-walk of the
+  // graph PLUS a fresh heap-allocated std::vector<uint64_t> — used to run every
+  // single frame the analyzer panel was visible, for a curve whose inputs change
+  // only on model reload / subgraph dive / shape-inference resolution. Measured
+  // in isolation on the standard 100k-node synthetic rung (branch=2,
+  // block_size=8): ~6.1 ms median per call — a third of a 16.7 ms (60 fps)
+  // frame budget paid for a plot whose data had not changed since last frame.
+  //
+  // The cache is a function-local static (mirrors draw_cost_table's order/key_*
+  // pattern below) rather than a ViewState field, because ViewState lives in the
+  // frozen-by-scope App.h, which this change does not touch. Being a static
+  // means it is ONE instance shared by every tab's call into this function, so
+  // the key must rule out the two ways this codebase has already been bitten by
+  // stale-cache bugs on this exact panel:
+  //   - model pointer: REQUIRED, not optional. Each tab owns an independent
+  //     ModelSession with its own generation counter starting at 0, so two
+  //     different tabs' models can present an identical (generation, graph,
+  //     enrich) triple. Without the pointer, switching tabs could silently serve
+  //     tab A's curve while viewing tab B's model.
+  //   - generation: guards a reload IN THE SAME tab. Kept alongside the pointer,
+  //     not instead of it — ModelSession::load() frees the old ir::Model and
+  //     make_unique's a new one, and a freed-then-reallocated block CAN legally
+  //     receive the same address, so pointer-only equality is not airtight.
+  //   - graph: current_graph() selects which ir::Graph gets walked (subgraph
+  //     dive); a stale curve from the parent graph would silently mismatch.
+  //   - enrich_generation: the same hazard ensure_cost's CostCacheKey exists to
+  //     guard against (the v0.3.0 blocker) — ONNX shape inference mutates
+  //     ValueInfo shapes IN PLACE after publish without bumping `generation`,
+  //     and this curve reads those shapes to size every activation. Omitting
+  //     this would serve a mostly-empty pre-inference curve for the rest of the
+  //     session.
+  //   - collapse_hash is deliberately NOT in the key: activation_liveness_curve
+  //     walks the raw IR graph (model, graph_index only), never the display/
+  //     collapse tree, so expanding or collapsing a group cannot change it.
   if (report->from_graph) {
-    std::vector<uint64_t> curve =
-        activation_liveness_curve(*model, s.current_graph());
+    static std::vector<uint64_t> act_curve_cache;
+    static const ir::Model* act_curve_model = nullptr;
+    static uint64_t act_curve_gen = UINT64_MAX;
+    static uint32_t act_curve_graph = UINT32_MAX;
+    static uint64_t act_curve_enrich = UINT64_MAX;
+
+    const uint64_t cur_gen = s.generation();
+    const uint32_t cur_graph = s.current_graph();
+    const uint64_t cur_enrich = s.enrich_generation();
+    if (model != act_curve_model || cur_gen != act_curve_gen ||
+        cur_graph != act_curve_graph || cur_enrich != act_curve_enrich) {
+      act_curve_model = model;
+      act_curve_gen = cur_gen;
+      act_curve_graph = cur_graph;
+      act_curve_enrich = cur_enrich;
+      act_curve_cache = activation_liveness_curve(*model, cur_graph);
+    }
+    const std::vector<uint64_t>& curve = act_curve_cache;
     if (!curve.empty()) {
       ImGui::SeparatorText("Activation memory timeline");
 
@@ -755,9 +818,36 @@ void draw_cost_section(App& app) {
   // Roll up per-node cost by op category (Conv, MatMul, Attention, ...). The
   // compute lives in the engine (rollup_by_category, unit-tested); the view only
   // renders. Percentages are against report->total_flops (guard div-by-zero).
+  //
+  // CACHED (#99): same class of bug as the activation timeline above — this
+  // section has no CollapsingHeader gate, so the O(V) per_node scan (plus a
+  // string categorize_op() call per node, plus a fresh heap-allocated result
+  // vector) ran every frame the panel was open, for a rollup whose output only
+  // changes with the model/graph/shape-enrichment state. Same key shape and same
+  // rationale as the activation-curve cache: model pointer guards cross-tab
+  // static collision, generation covers a same-tab reload (defends against
+  // pointer-address reuse after the old ir::Model is freed), graph covers a
+  // subgraph dive, enrich_generation covers ONNX shape inference resolving
+  // FLOPs/bytes in place post-publish.
   if (report->from_graph) {
-    std::vector<CategoryCost> cats =
-        rollup_by_category(*model, s.current_graph(), *report);
+    static std::vector<CategoryCost> cat_cache;
+    static const ir::Model* cat_model = nullptr;
+    static uint64_t cat_gen = UINT64_MAX;
+    static uint32_t cat_graph = UINT32_MAX;
+    static uint64_t cat_enrich = UINT64_MAX;
+
+    const uint64_t cur_gen = s.generation();
+    const uint32_t cur_graph = s.current_graph();
+    const uint64_t cur_enrich = s.enrich_generation();
+    if (model != cat_model || cur_gen != cat_gen || cur_graph != cat_graph ||
+        cur_enrich != cat_enrich) {
+      cat_model = model;
+      cat_gen = cur_gen;
+      cat_graph = cur_graph;
+      cat_enrich = cur_enrich;
+      cat_cache = rollup_by_category(*model, cur_graph, *report);
+    }
+    const std::vector<CategoryCost>& cats = cat_cache;
     if (!cats.empty()) {
       ImGui::SeparatorText("Cost by op category");
       const ImGuiTableFlags cflags = ImGuiTableFlags_Borders |
@@ -997,12 +1087,23 @@ void draw_cost_table(App& app) {
     return;
   }
 
-  // Sorted index order over [0, row_count). Cached across frames (single-panel
-  // usage): re-sort only when the sort spec is dirty OR the underlying data
-  // changed. The data signature includes generation (model reload), graph index
-  // (subgraph dive), enrich_generation (shape inference resolves FLOPs and thus
-  // reorders), and row_count (guards a stale order against a shrunk model).
+  // Sorted index order over [0, row_count). Cached across frames: re-sort only
+  // when the sort spec is dirty OR the underlying data changed. The data
+  // signature includes generation (model reload), graph index (subgraph dive),
+  // enrich_generation (shape inference resolves FLOPs and thus reorders), and
+  // row_count (guards a stale order against a shrunk model).
+  //
+  // #99: also keyed on the model pointer. This is a function-local static, so
+  // it is ONE instance shared by every tab that calls draw_cost_table — each
+  // tab owns an independent ModelSession whose generation/enrich counters both
+  // start at 0, so two different tabs' models CAN present an identical
+  // (generation, graph, enrich, row_count) signature. Without the pointer, an
+  // unlucky tab switch would silently keep tab A's sort order applied to tab
+  // B's rows (see the identical fix on the activation-curve and category-rollup
+  // caches above, and ensure_cost's CostCacheKey, for the same lesson learned
+  // three times over on this panel).
   static std::vector<uint32_t> order;
+  static const ir::Model* key_model = nullptr;
   static uint64_t key_gen = UINT64_MAX;
   static uint64_t key_enrich = UINT64_MAX;
   static uint32_t key_graph = UINT32_MAX;
@@ -1011,8 +1112,9 @@ void draw_cost_table(App& app) {
   const uint64_t gen = s.generation();
   const uint64_t enrich = s.enrich_generation();
   bool need_sort = false;
-  if (gen != key_gen || enrich != key_enrich || gi != key_graph ||
-      row_count != key_count || order.size() != row_count) {
+  if (model != key_model || gen != key_gen || enrich != key_enrich ||
+      gi != key_graph || row_count != key_count || order.size() != row_count) {
+    key_model = model;
     key_gen = gen;
     key_enrich = enrich;
     key_graph = gi;

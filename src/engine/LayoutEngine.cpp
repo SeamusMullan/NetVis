@@ -1,10 +1,21 @@
 // engine/LayoutEngine.cpp — from-scratch layered (Sugiyama) layout.
 //
-// PERF (spec §7.2): the whole pipeline is O(V+E) plus O(sweeps*E) for ordering,
-// with no per-node heap churn in the hot loops. Target: 10k display nodes in
-// < 250 ms. Everything works on the CURRENT display-node list (already
-// collapsed by CollapseTree, so V is usually small), in world coordinates, with
-// no GUI dependency — node sizes come in through SizeFn so this runs headless.
+// PERF (spec §7.2): the whole pipeline is O(V+E) plus O(sweeps*E log E) for
+// ordering, and holds no per-node heap allocation in any pass. Target: 10k
+// display nodes in < 250 ms. Everything works on the CURRENT display-node list
+// (already collapsed by CollapseTree, so V is usually small), in world
+// coordinates, with no GUI dependency — node sizes come in through SizeFn so
+// this runs headless.
+//
+// The "no per-node allocation" half of that used to be aspiration rather than
+// fact. #98 profiled the 100k rung stage by stage and found the asymptotics were
+// fine but the constants were not: six vector-of-vectors adjacencies and two
+// scratch buffers rebuilt per layer added up to roughly a million small heap
+// allocations, which was two thirds of the stage. The structures below are
+// therefore flat (see Csr) and every scratch buffer is hoisted to the outermost
+// scope that can own it. Nothing about the OUTPUT changed — positions are
+// byte-identical, which is load-bearing because layouts are cached on disk by
+// structure hash (LayoutCache).
 //
 // Stages:
 //   1. Build DAG over display nodes (edge A->B if an IR node in A produces a
@@ -35,6 +46,78 @@ Vec2 default_size(const DisplayNode& d) {
   float chars = d.is_group ? 18.0f : 12.0f;
   float w = 40.0f + chars * 7.0f;
   return Vec2{w, 40.0f};
+}
+
+// --- Compressed adjacency ----------------------------------------------------
+//
+// #98: every adjacency in this file used to be a
+// std::vector<std::vector<uint32_t>>. Profiling the 100k rung showed why that is
+// the wrong shape here: the synthetic ladder lays out ~112k layout nodes across
+// ~100k layers, so each of the six adjacencies built below was ~100k separate
+// heap blocks holding roughly one element each. The traversal was never the
+// cost — the allocation traffic and the pointer chase were. CSR is two
+// allocations for the whole structure and keeps each owner's entries contiguous.
+//
+// A slice of a Csr, deliberately shaped like the std::vector<uint32_t> it
+// replaced (range-for, size, empty, indexing) so the ordering and coordinate
+// passes below read unchanged.
+struct CsrSpan {
+  const uint32_t* first = nullptr;
+  const uint32_t* last = nullptr;
+  const uint32_t* begin() const { return first; }
+  const uint32_t* end() const { return last; }
+  size_t size() const { return static_cast<size_t>(last - first); }
+  bool empty() const { return first == last; }
+  uint32_t operator[](size_t i) const { return first[i]; }
+};
+
+// The same slice, writable. Only two passes need it: the clone duplication sorts
+// a source's out-route list in place, and barycenter ordering permutes a layer.
+// Both stay strictly inside one owner's slice, so the offsets remain valid.
+struct CsrSpanMut {
+  uint32_t* first = nullptr;
+  uint32_t* last = nullptr;
+  uint32_t* begin() const { return first; }
+  uint32_t* end() const { return last; }
+  size_t size() const { return static_cast<size_t>(last - first); }
+  uint32_t& operator[](size_t i) const { return first[i]; }
+};
+
+struct Csr {
+  // n+1 offsets: items[start[v] .. start[v+1]) are owner v's entries.
+  std::vector<uint32_t> start;
+  std::vector<uint32_t> items;
+
+  CsrSpan operator[](size_t v) const {
+    return CsrSpan{items.data() + start[v], items.data() + start[v + 1]};
+  }
+  CsrSpanMut slice(size_t v) {
+    return CsrSpanMut{items.data() + start[v], items.data() + start[v + 1]};
+  }
+};
+
+// Two-pass counting build. `emit_all(sink)` must call sink(owner, item) once per
+// entry and produce the SAME sequence both times it is invoked — once to count,
+// once to place. Within an owner the items land in emission order, which is
+// byte-identical to the push_back order of the vector-of-vectors this replaces;
+// every ordering pass downstream is order-sensitive, so determinism (spec §2.7)
+// rests on that equivalence.
+//
+// Offsets are uint32_t because every entry stored here is an edge, route or
+// segment index, all of which this file already carries in a uint32_t — the
+// total therefore cannot exceed what those indices can address.
+template <typename Fn>
+Csr build_csr(uint32_t n, Fn&& emit_all) {
+  Csr c;
+  c.start.assign(static_cast<size_t>(n) + 1, 0);
+  emit_all([&](uint32_t owner, uint32_t) { ++c.start[owner + 1]; });
+  for (uint32_t v = 0; v < n; ++v) c.start[v + 1] += c.start[v];
+  c.items.resize(c.start[n]);
+  // Per-owner write cursor, seeded with each owner's first free slot.
+  std::vector<uint32_t> cursor(c.start.begin(), c.start.end() - 1);
+  emit_all(
+      [&](uint32_t owner, uint32_t item) { c.items[cursor[owner]++] = item; });
+  return c;
 }
 
 // Internal directed edge between display nodes.
@@ -160,10 +243,10 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   if (progress) progress->set(0.3f, "layout: edges");
   if (progress && progress->cancelled()) return make_cancelled();
 
-  // Adjacency (out) for DFS cycle-break and layering.
-  std::vector<std::vector<uint32_t>> out_adj(V);  // -> edge indices
-  for (uint32_t ei = 0; ei < edges.size(); ++ei)
-    out_adj[edges[ei].from].push_back(ei);
+  // Adjacency (out) for the DFS cycle-break, as edge indices per source node.
+  const Csr out_adj = build_csr(V, [&](auto&& emit) {
+    for (uint32_t ei = 0; ei < edges.size(); ++ei) emit(edges[ei].from, ei);
+  });
 
   // -- 2) Cycle break: iterative DFS, an edge to a node currently on the DFS
   // stack (gray) is a back-edge and gets reversed. Deterministic: nodes visited
@@ -180,8 +263,9 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
       color[s] = Gray;
       while (!stack.empty()) {
         auto& [u, ci] = stack.back();
-        if (ci < out_adj[u].size()) {
-          uint32_t ei = out_adj[u][ci++];
+        const CsrSpan uo = out_adj[u];
+        if (ci < uo.size()) {
+          uint32_t ei = uo[ci++];
           DEdge& de = edges[ei];
           uint32_t w = de.to;
           if (color[w] == Gray) {
@@ -202,31 +286,34 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   auto eff_from = [&](const DEdge& e) { return e.reversed ? e.to : e.from; };
   auto eff_to = [&](const DEdge& e) { return e.reversed ? e.from : e.to; };
 
+  // Effective (post-reversal) successors and in-degrees over the display graph.
+  // #98: sections 3, 3b and the clone duplication further down each used to
+  // derive this pair for themselves — three identical scans over the same edge
+  // list, each materializing its own V-entry vector-of-vectors. Derive it once
+  // here; the passes that consume in-degree destructively work on a copy.
+  std::vector<uint32_t> indeg(V, 0);
+  for (const DEdge& e : edges) ++indeg[eff_to(e)];
+  const Csr eff_out = build_csr(V, [&](auto&& emit) {
+    for (const DEdge& e : edges) emit(eff_from(e), eff_to(e));
+  });
+
   // -- 3) Longest-path layering. layer(v) = max over in-edges of layer(src)+1.
   // Compute via a topological pass using Kahn on the acyclic (post-reversal)
   // graph. O(V+E).
   std::vector<int32_t> layer(V, 0);
   {
-    std::vector<uint32_t> indeg(V, 0);
-    std::vector<std::vector<uint32_t>> eff_out(V);
-    for (const DEdge& e : edges) {
-      eff_out[eff_from(e)].push_back(eff_to(e));
-      ++indeg[eff_to(e)];
-    }
+    std::vector<uint32_t> pending = indeg;  // Kahn drains this to zero
     std::vector<uint32_t> ready;
     for (uint32_t v = 0; v < V; ++v)
-      if (indeg[v] == 0) ready.push_back(v);
+      if (pending[v] == 0) ready.push_back(v);
     std::sort(ready.begin(), ready.end());
     size_t head = 0;
-    std::vector<uint32_t> order;
-    order.reserve(V);
     // Process deterministically: maintain sorted-ish by popping in order.
     while (head < ready.size()) {
       uint32_t u = ready[head++];
-      order.push_back(u);
       for (uint32_t w : eff_out[u]) {
         if (layer[w] < layer[u] + 1) layer[w] = layer[u] + 1;
-        if (--indeg[w] == 0) ready.push_back(w);
+        if (--pending[w] == 0) ready.push_back(w);
       }
     }
     // Cycle remnants (shouldn't happen after reversal): leave layer as-is.
@@ -242,18 +329,12 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   // Only sources are moved (they have no predecessors, so lowering them can
   // never violate an edge from above); non-sources keep their longest-path rank.
   {
-    // Effective in/out degree + successor layers.
-    std::vector<uint32_t> indeg(V, 0);
-    std::vector<std::vector<uint32_t>> eff_out(V);
-    for (const DEdge& e : edges) {
-      eff_out[eff_from(e)].push_back(eff_to(e));
-      ++indeg[eff_to(e)];
-    }
     for (uint32_t v = 0; v < V; ++v) {
-      if (indeg[v] != 0) continue;      // only sources
-      if (eff_out[v].empty()) continue; // isolated node: leave at 0
+      if (indeg[v] != 0) continue;    // only sources
+      const CsrSpan outs = eff_out[v];
+      if (outs.empty()) continue;     // isolated node: leave at 0
       int32_t min_consumer = std::numeric_limits<int32_t>::max();
-      for (uint32_t w : eff_out[v])
+      for (uint32_t w : outs)
         min_consumer = std::min(min_consumer, layer[w]);
       // Sit one layer above the nearest consumer (never below 0).
       if (min_consumer != std::numeric_limits<int32_t>::max())
@@ -310,16 +391,18 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   // original node; clones re-point that consumer's edge. Deterministic.
   constexpr uint32_t kMaxDuplicate = 64;  // fan-out cap: above this stay shared
   {
-    std::vector<uint32_t> indeg(V, 0);
-    std::vector<std::vector<uint32_t>> out_routes(V);
-    for (uint32_t ri = 0; ri < routes.size(); ++ri) {
-      const RouteEdge& r = routes[ri];
-      if (r.u < V) out_routes[r.u].push_back(ri);
-      if (r.v < V) ++indeg[r.v];
-    }
+    // Route indices leaving each display node. The effective in-degree this pass
+    // needs is exactly `indeg` from the layering section: `routes` was built 1:1
+    // from `edges` with (u,v) = (eff_from, eff_to), and no route has been
+    // re-pointed yet — only `u` is ever re-pointed, and only in the loop below.
+    // So it is reused rather than recounted (#98).
+    Csr out_routes = build_csr(V, [&](auto&& emit) {
+      for (uint32_t ri = 0; ri < routes.size(); ++ri)
+        if (routes[ri].u < V) emit(routes[ri].u, ri);
+    });
     for (uint32_t s = 0; s < V; ++s) {
       if (indeg[s] != 0 || disp[s].is_group) continue;  // real sources only
-      std::vector<uint32_t>& outs = out_routes[s];
+      const CsrSpanMut outs = out_routes.slice(s);
       if (outs.size() < 2 || outs.size() > kMaxDuplicate) continue;
       std::sort(outs.begin(), outs.end(), [&](uint32_t a, uint32_t b) {
         uint32_t va = routes[a].v, vb = routes[b].v;
@@ -383,26 +466,34 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   if (progress) progress->set(0.5f, "layout: layering");
   if (progress && progress->cancelled()) return make_cancelled();
 
-  // Layer membership over ALL layout nodes; order index within a layer.
-  std::vector<std::vector<uint32_t>> layers(L);
-  for (uint32_t v = 0; v < M; ++v)
-    layers[static_cast<size_t>(nlayer[v])].push_back(v);
-  // Initial order: by layout-node id (deterministic).
-  for (auto& lv : layers) std::sort(lv.begin(), lv.end());
+  // Layer membership over ALL layout nodes; order index within a layer. Each
+  // layer's members are contiguous (#98) and the ordering passes below permute
+  // them strictly inside their own slice, so the offsets stay valid for the rest
+  // of the pipeline. Emitting v ascending already leaves every slice sorted
+  // ascending — which is the "initial order by layout-node id" the old code
+  // spelled out with a per-layer std::sort that could never move anything.
+  Csr layers = build_csr(static_cast<uint32_t>(L), [&](auto&& emit) {
+    for (uint32_t v = 0; v < M; ++v)
+      emit(static_cast<uint32_t>(nlayer[v]), v);
+  });
 
   std::vector<uint32_t> order_idx(M, 0);
   auto refresh_order = [&]() {
-    for (auto& lv : layers)
-      for (uint32_t p = 0; p < lv.size(); ++p) order_idx[lv[p]] = p;
+    for (size_t li = 0; li < L; ++li) {
+      const uint32_t b = layers.start[li];
+      const uint32_t e = layers.start[li + 1];
+      for (uint32_t k = b; k < e; ++k) order_idx[layers.items[k]] = k - b;
+    }
   };
   refresh_order();
 
   // Predecessor / successor adjacency (effective direction) for barycenters.
-  std::vector<std::vector<uint32_t>> preds(M), succs(M);
-  for (const auto& s : segs) {
-    succs[s.first].push_back(s.second);
-    preds[s.second].push_back(s.first);
-  }
+  const Csr succs = build_csr(M, [&](auto&& emit) {
+    for (const auto& s : segs) emit(s.first, s.second);
+  });
+  const Csr preds = build_csr(M, [&](auto&& emit) {
+    for (const auto& s : segs) emit(s.second, s.first);
+  });
 
   // Count total crossings between all adjacent layer pairs (for early-stop).
   // PERF: crossings between two layers = inversions in the lower endpoints once
@@ -441,11 +532,22 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
 
   // -- 4) Barycenter ordering. Alternate down (order by predecessor mean) and
   // up (by successor mean) sweeps; early-stop when crossings stop improving.
+  //
+  // #98: `keyed` is hoisted out of the lambda and reused. barycenter_sort runs
+  // once per layer per sweep direction — 200k calls at the 100k rung — so a
+  // vector constructed inside it was 200k malloc/free pairs, and that, not the
+  // sorting, was the single largest line item in the whole layout stage.
+  std::vector<std::pair<float, uint32_t>> keyed;
   auto barycenter_sort = [&](size_t li, bool use_preds) {
-    auto& lv = layers[li];
-    const auto& nbr = use_preds ? preds : succs;
+    const CsrSpanMut lv = layers.slice(li);
+    // A layer holding fewer than two nodes has exactly one possible ordering, so
+    // everything below is provably a no-op on it. Bailing here is not a micro-
+    // optimization: deep graphs are mostly one-node layers, and std::stable_sort
+    // heap-allocates its temporary buffer even for a single element.
+    if (lv.size() < 2) return;
+    const Csr& nbr = use_preds ? preds : succs;
     // Compute barycenter key per node; nodes with no neighbor keep their pos.
-    std::vector<std::pair<float, uint32_t>> keyed;
+    keyed.clear();
     keyed.reserve(lv.size());
     for (uint32_t v : lv) {
       float sum = 0.0f;
@@ -530,23 +632,32 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   //       monotone solutions is itself gap-feasible and is centered, so there is
   //       no net directional push.
   auto center_of = [&](uint32_t v) { return npos[v].x + nsize[v].x * 0.5f; };
+  // Width of the widest layer, which is all the scratch below ever needs.
+  size_t widest = 0;
+  for (size_t li = 0; li < L; ++li) widest = std::max(widest, layers[li].size());
+  // #98: `want`/`lo`/`hi` are sized ONCE for the widest layer instead of being
+  // re-assigned per layer, and `cs` is hoisted out of the per-layer loop. Those
+  // four buffers were four vector fills per layer per pass, which on a deep
+  // graph (the 100k rung is ~100k layers of ~1 node) is the whole cost of this
+  // pass. Reading a stale entry is impossible: each of want/lo/hi has every
+  // slot in [0,k) written before anything reads it, on every layer.
   auto align_pass = [&](bool use_preds) {
-    const auto& nbr = use_preds ? preds : succs;
-    std::vector<float> want, lo, hi;
+    const Csr& nbr = use_preds ? preds : succs;
+    std::vector<float> want(widest, 0.0f), lo(widest, 0.0f), hi(widest, 0.0f);
+    std::vector<float> cs;
     for (size_t li = 0; li < L; ++li) {
-      auto& lv = layers[li];
+      const CsrSpan lv = layers[li];
       const size_t k = lv.size();
       if (k == 0) continue;
       // Desired center per node = TRUE median of neighbor centers; a node with
       // no neighbor keeps its current center.
-      want.assign(k, 0.0f);
-      std::vector<float> cs;
       for (size_t p = 0; p < k; ++p) {
         uint32_t v = lv[p];
-        if (nbr[v].empty()) { want[p] = center_of(v); continue; }
+        const CsrSpan nb_of_v = nbr[v];
+        if (nb_of_v.empty()) { want[p] = center_of(v); continue; }
         cs.clear();
-        cs.reserve(nbr[v].size());
-        for (uint32_t nb : nbr[v]) cs.push_back(center_of(nb));
+        cs.reserve(nb_of_v.size());
+        for (uint32_t nb : nb_of_v) cs.push_back(center_of(nb));
         std::sort(cs.begin(), cs.end());
         const size_t c = cs.size();
         want[p] = (c & 1u) ? cs[c / 2] : (cs[c / 2 - 1] + cs[c / 2]) * 0.5f;
@@ -556,12 +667,10 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
         return (nsize[lv[p - 1]].x + nsize[lv[p]].x) * 0.5f + params.node_sep;
       };
       // Left-packed (only pushes right).
-      lo.assign(k, 0.0f);
       lo[0] = want[0];
       for (size_t p = 1; p < k; ++p)
         lo[p] = std::max(want[p], lo[p - 1] + gap(p));
       // Right-packed (only pushes left).
-      hi.assign(k, 0.0f);
       hi[k - 1] = want[k - 1];
       for (size_t p = k - 1; p-- > 0;)
         hi[p] = std::min(want[p], hi[p + 1] - gap(p + 1));
