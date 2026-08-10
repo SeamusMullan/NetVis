@@ -112,6 +112,21 @@ class DiffLoader {
   const MappedFile& file_of(size_t i) const;
   const std::string& model_dir_of(size_t i) const;
 
+  // An OWNING handle on slot `i`'s model, for a worker that must outlive a
+  // possible remove_comparison(). model_of() returns a bare pointer that dies
+  // with the slot; a background decode of model B's payload (#50) cannot rely on
+  // that, because the user can drop a comparison while its decode is in flight.
+  // Taking a copy of this shared_ptr keeps the model alive for the job's life.
+  //
+  // NOTE the MAPPING is NOT covered by this — MappedFile is move-only and dies
+  // with the slot. A worker that needs bytes must open its own mapping of
+  // path_of(i) (an mmap is ~1 ms, so this is cheap) rather than borrowing the
+  // slot's. Defined inline so it needs no .cpp definition.
+  std::shared_ptr<const ir::Model> model_ptr_of(size_t i) const {
+    const Comparison* c = slot(i);
+    return c ? c->model : nullptr;
+  }
+
   // --- Single-comparison surface == the ACTIVE slot --------------------------
   // Pre-#36 API, unchanged in meaning for the one-comparison case.
 

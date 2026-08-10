@@ -84,6 +84,7 @@
 
 #include "engine/DiffLoader.h"
 #include "engine/LayoutCache.h"
+#include "engine/TensorDiff.h"  // #50: cross-model same-tensor lookup
 #include "engine/plugin/declarative/Manifest.h"  // v0.6.0 #9: plugin discovery
 #include "engine/plugin/Registry.h"               // v0.7.0 #11: reset_to_builtins
 // GraphNav.h defines GraphNavState so ViewState's unique_ptr<GraphNavState>
@@ -645,13 +646,26 @@ void App::new_tab() {
 
 void App::close_tab(size_t i) {
   if (i >= tabs_.size()) return;
-  // #62: if the diff was loaded against THIS tab's session, clear it first — the
+  // #62: if a diff was loaded against THIS tab's session, clear it first — the
   // DiffLoader holds that session's address for identity comparison, and erasing
   // the tab frees the session, which would leave primary_session() dangling.
-  if (diff_loader_ &&
-      diff_loader_->primary_session() == tabs_[i]->session.get()) {
-    diff_loader_->clear();
-    tabs_[i]->view.diff_panel_open = false;
+  //
+  // #36: this must scan EVERY slot, not just the active one. Pre-N-way there was
+  // a single comparison, so checking primary_session() was checking all of them.
+  // Now a NON-active slot can be pinned to the closing session, and worse, a
+  // non-active slot can be mid-load against it — that load's completion
+  // dereferences the captured ModelSession* on the main thread, which is a
+  // use-after-free once this tab's session is destroyed. clear() retires every
+  // slot's token, so it cancels the in-flight loads as well as dropping the
+  // pinned pointers.
+  if (diff_loader_) {
+    const ModelSession* closing = tabs_[i]->session.get();
+    for (size_t k = 0; k < diff_loader_->comparison_count(); ++k) {
+      if (diff_loader_->primary_session_of(k) != closing) continue;
+      diff_loader_->clear();
+      tabs_[i]->view.diff_panel_open = false;
+      break;
+    }
   }
   // ~Tab shuts the pool down (joins workers) before the ModelSession dies.
   tabs_.erase(tabs_.begin() + static_cast<long>(i));
@@ -698,6 +712,32 @@ void App::inspect_tensor(const ir::TensorRef& t) {
   decode.error.clear();
   const uint64_t token = ++decode.token;
 
+  // v0.9.1b: the B-side compare (#50) and the quant preview (#49) are ABOUT the
+  // tensor being inspected, so a new inspection invalidates both. Bump their
+  // tokens (so an in-flight decode of the PREVIOUS tensor drops its result
+  // instead of landing under the new tensor's header) and clear their published
+  // state. Without this the panel can show one frame of the old tensor's B-side
+  // numbers against the new tensor's name — a silent wrong answer, which is
+  // worse than an empty panel. Both stay OFF until the user asks again: they are
+  // opt-in per contract, and re-arming them here would make the preview fire as
+  // a side effect of selection, which #49's scope explicitly forbids.
+  ++decode.cmp_token;
+  decode.cmp_requested = false;
+  decode.cmp_in_flight = false;
+  decode.cmp_done = false;
+  decode.cmp_ok = false;
+  decode.cmp_stats = TensorStats{};
+  decode.cmp_error.clear();
+  decode.cmp_label.clear();
+
+  ++decode.quant_token;
+  decode.quant_requested = false;
+  decode.quant_in_flight = false;
+  decode.quant_done = false;
+  decode.quant = QuantBlockPreview{};
+  decode.quant_error.clear();
+  decode.quant_block = 0;
+
   // Copy the tensor by value into the job (a captured reference would dangle).
   // TensorStats is the ONLY payload-reading path (spec §7.5); it runs on a
   // worker so the UI never blocks decoding a multi-GB tensor. The token guards
@@ -719,6 +759,160 @@ void App::inspect_tensor(const ir::TensorRef& t) {
           decode.done = true;
           decode.in_flight = false;
         });
+  });
+}
+
+// #50: decode the SAME-NAMED tensor out of the active comparison model, so the
+// inspector can show model A and model B side by side.
+//
+// LIFETIME is the whole difficulty here. The A-side decode above borrows the
+// tab's session and mapping and is safe because ~Tab joins its workers first.
+// The B side belongs to DiffLoader, which the user can mutate at any time —
+// remove_comparison() while this decode is in flight would free the mapping the
+// worker is reading. So this job borrows NOTHING from DiffLoader: it takes an
+// owning shared_ptr on model B (model_ptr_of) and opens its OWN mapping of the
+// comparison path on the worker. An mmap is ~1 ms, so a second mapping of an
+// already-resident file is far cheaper than the machinery needed to make a
+// borrowed one safe. The job then depends only on values it owns.
+void App::inspect_tensor_comparison() {
+  Tab* tab = tabs_[active_tab_].get();
+  PendingDecode& decode = tab->decode;
+
+  // Bump the token FIRST: every early return below is also a completion, and a
+  // stale in-flight decode must not overwrite whatever we settle on here.
+  const uint64_t token = ++decode.cmp_token;
+  decode.cmp_requested = true;
+  decode.cmp_in_flight = false;
+  decode.cmp_done = false;
+  decode.cmp_ok = false;
+  decode.cmp_stats = TensorStats{};
+  decode.cmp_error.clear();
+  decode.cmp_label.clear();
+
+  // Settle immediately with an honest reason rather than leaving the panel
+  // spinning on a decode that will never be submitted.
+  auto refuse = [&decode](std::string why) {
+    decode.cmp_done = true;
+    decode.cmp_error = std::move(why);
+  };
+
+  if (!decode.active) return refuse("no tensor is being inspected");
+
+  DiffLoader& dl = *diff_loader_;
+  const size_t slot = dl.active_comparison();
+  decode.cmp_slot = slot;
+  if (dl.comparison_count() == 0)
+    return refuse("no comparison model is loaded");
+  if (dl.state_of(slot) != DiffLoadState::Ready)
+    return refuse("the comparison model is still loading");
+
+  // #62: the comparison belongs to whichever tab loaded it. Comparing this tab's
+  // tensor against another tab's comparison model would be a silent
+  // wrong-answer, so require the identity match the tint path already requires.
+  if (dl.primary_session_of(slot) != tab->session.get())
+    return refuse("the comparison was loaded against a different tab");
+
+  std::shared_ptr<const ir::Model> mb = dl.model_ptr_of(slot);
+  const ir::Model* ma = tab->session->model();
+  if (!mb || !ma) return refuse("no comparison model is loaded");
+
+  const std::string_view name = ma->str(decode.tensor.name);
+  if (name.empty()) return refuse("this tensor has no name to match on");
+
+  const TensorLocator loc = find_tensor_by_name(*mb, name);
+  const ir::TensorRef* tb = loc.valid() ? resolve_tensor(*mb, loc) : nullptr;
+  if (!tb)
+    return refuse("the comparison model has no tensor named \"" +
+                  std::string(name) + "\"");
+
+  // Label which rung of the ladder this came from, so a 3-way comparison is
+  // unambiguous in the panel.
+  const std::string& cmp_path = dl.path_of(slot);
+  const size_t sep = cmp_path.find_last_of("/\\");
+  decode.cmp_label =
+      sep == std::string::npos ? cmp_path : cmp_path.substr(sep + 1);
+
+  // Copy everything the worker touches. `tc` by value (a captured reference into
+  // model B would dangle on removal even though the model itself is pinned —
+  // the TensorRef lives in the model's vector, which is stable, but copying is
+  // free at this size and removes the question entirely).
+  const ir::TensorRef tc = *tb;
+  const std::string dir = dl.model_dir_of(slot);
+  decode.cmp_in_flight = true;
+
+  // Runs on the DIFF JobSystem, not the tab's: this is comparison work, and its
+  // generation counter must not cross-cancel the tab's parse/layout jobs. ~App
+  // shuts diff_jobs_ down before diff_loader_ is destroyed.
+  diff_jobs_->submit([this, &decode, token, tc, mb, cmp_path, dir]() {
+    std::string errmsg;
+    TensorStats stats;
+    bool ok = false;
+
+    auto mapped = MappedFile::open(cmp_path);
+    if (!mapped) {
+      errmsg = mapped.error().message;
+    } else {
+      const MappedFile file = std::move(*mapped);
+      Result<TensorStats> r = compute_tensor_stats(tc, file, dir, mb.get());
+      ok = r.ok();
+      if (ok) {
+        stats = *r;
+      } else {
+        errmsg = r.error().message;
+      }
+    }
+
+    diff_jobs_->post_to_main([&decode, token, ok, stats, errmsg]() {
+      if (decode.cmp_token != token) return;  // superseded — drop it.
+      decode.cmp_stats = stats;
+      decode.cmp_ok = ok;
+      decode.cmp_error = errmsg;
+      decode.cmp_done = true;
+      decode.cmp_in_flight = false;
+    });
+  });
+}
+
+// #49: decode ONE quantized block of the inspected tensor for preview.
+//
+// Opt-in by contract, not merely by convention (see DECISIONS.md, "v0.9.1b —
+// dequantization scope"): this is only ever reached from an explicit user action
+// in the inspector, never as a side effect of inspect_tensor(). It reads at most
+// one block — strictly fewer bytes than the histogram pass the inspector has
+// already run over this same tensor.
+void App::preview_tensor_quant_block(uint32_t block_index) {
+  Tab* tab = tabs_[active_tab_].get();
+  PendingDecode& decode = tab->decode;
+  if (!decode.active) return;
+
+  ModelSession* sess = tab->session.get();
+  JobSystem* jobs = tab->jobs.get();
+
+  decode.quant_requested = true;
+  decode.quant_block = block_index;
+  decode.quant_in_flight = true;
+  decode.quant_done = false;
+  decode.quant = QuantBlockPreview{};
+  decode.quant_error.clear();
+  const uint64_t token = ++decode.quant_token;
+
+  // Same borrowing rules as inspect_tensor: the A-side session and mapping are
+  // kept alive by ~Tab joining this pool before the session dies.
+  const ir::TensorRef tc = decode.tensor;
+  jobs->submit([sess, jobs, &decode, token, tc, block_index]() {
+    Result<QuantBlockPreview> r = preview_quant_block(
+        tc, sess->file(), block_index, sess->model_dir(), sess->model());
+    const bool ok = r.ok();
+    QuantBlockPreview p = ok ? *r : QuantBlockPreview{};
+    std::string errmsg = ok ? std::string() : r.error().message;
+
+    jobs->post_to_main([&decode, token, p, errmsg]() {
+      if (decode.quant_token != token) return;  // superseded — drop it.
+      decode.quant = p;
+      decode.quant_error = errmsg;
+      decode.quant_done = true;
+      decode.quant_in_flight = false;
+    });
   });
 }
 
