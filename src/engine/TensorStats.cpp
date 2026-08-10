@@ -20,6 +20,8 @@
 #include <vector>
 
 #include "core/ByteReader.h"
+#include "core/Half.h"
+#include "parsers/gguf/GgufBlocks.h"
 
 namespace netvis {
 
@@ -152,39 +154,8 @@ Result<Payload> resolve_payload(const ir::TensorRef& t, const MappedFile& base,
   return out;
 }
 
-// F16 (IEEE half) bit pattern -> float.
-float f16_to_f32(uint16_t h) {
-  uint32_t sign = (h & 0x8000u) << 16;
-  uint32_t exp = (h >> 10) & 0x1F;
-  uint32_t mant = h & 0x3FF;
-  uint32_t bits;
-  if (exp == 0) {
-    if (mant == 0) {
-      bits = sign;  // +/- zero
-    } else {
-      // subnormal: normalize
-      exp = 1;
-      while ((mant & 0x400) == 0) { mant <<= 1; --exp; }
-      mant &= 0x3FF;
-      bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    }
-  } else if (exp == 0x1F) {
-    bits = sign | 0x7F800000u | (mant << 13);  // inf/nan
-  } else {
-    bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-  }
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
-
-// BF16 (upper 16 bits of a float) -> float.
-float bf16_to_f32(uint16_t b) {
-  uint32_t bits = static_cast<uint32_t>(b) << 16;
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
+// f16_to_f32 / bf16_to_f32 moved to core/Half.h in v0.9.1b — GgufBlocks.cpp
+// (parsers layer, below engine) needs the same F16 decode for quant-block scales.
 
 // Number of elements from byte_len given dtype (0 for quantized/unknown).
 uint64_t elem_count_from_bytes(const ir::TensorRef& t, Payload& p) {
@@ -525,6 +496,112 @@ Result<TensorThumbnail> compute_tensor_thumbnail(const ir::TensorRef& t,
   thumb.height = static_cast<uint32_t>(height);
   thumb.available = true;
   return thumb;
+}
+
+// The preview buffer (QuantBlockPreview::values) is sized for exactly one
+// dequant_block() call; pin it to GgufBlocks' own bound so a future widened
+// layout can't silently overflow it (mirrors the static_assert in
+// GgufBlocks.cpp that pins kQK to the same constant).
+static_assert(kQuantPreviewMaxElems == gguf::kMaxDequantBlockElems,
+             "QuantBlockPreview::values must match GgufBlocks' output bound");
+
+Result<QuantBlockPreview> preview_quant_block(const ir::TensorRef& t,
+                                              const MappedFile& base,
+                                              uint32_t block_index,
+                                              const std::string& model_dir,
+                                              const ir::Model* model) {
+  auto pr = resolve_payload(t, base, model_dir, model);
+  if (!pr) return pr.error();
+  Payload p = std::move(*pr);
+
+  // PAYLOAD READ: single accounted access for this preview, same convention as
+  // the other entry points (spec §2.1) — resolving the payload is what the
+  // counting test observes; the actual bytes TOUCHED below are bounded to one
+  // block regardless (that bound is the entire point of #49, see the header).
+  ByteReader::mark_payload_read();
+
+  QuantBlockPreview preview;  // available=false, empty reason, by default.
+  preview.block_index = block_index;
+
+  // #49 scope: quant_type_id is parser-specific (ir::TensorRef doc comment) —
+  // for a format other than GGUF it means nothing, and GgufBlocks only speaks
+  // ggml ids. Both checks below must pass before the id is trusted.
+  if (t.quant_type_id == UINT32_MAX) {
+    preview.unavailable_reason =
+        "no exact quantization type was recorded for this tensor";
+    return preview;
+  }
+  if (!model || model->str(model->format_name) != "GGUF") {
+    preview.unavailable_reason =
+        "single-block preview supports only GGUF's ggml quantization types";
+    return preview;
+  }
+
+  const gguf::GgmlBlockLayout layout = gguf::ggml_block_layout(t.quant_type_id);
+  // Same enum drives both lookups, so an id this build doesn't know yields an
+  // empty name here exactly when it yields block_bytes==0 below — consistent,
+  // not a coincidence.
+  preview.type_name = std::string(gguf::ggml_type_name(t.quant_type_id));
+
+  if (layout.block_bytes == 0) {
+    preview.unavailable_reason = std::string(
+        gguf::dequant_status_message(gguf::DequantStatus::UnknownType));
+    return preview;
+  }
+  if (!layout.quantized) {
+    preview.unavailable_reason = std::string(
+        gguf::dequant_status_message(gguf::DequantStatus::NotQuantized));
+    return preview;
+  }
+
+  // Blocks available from the RESOLVED payload length, via DIVISION (never
+  // multiplication) — house rule (spec hostile-input discipline): a
+  // short/truncated payload naturally floors to fewer blocks, so a stale or
+  // hostile block_index fails the bound check just below instead of forming
+  // an out-of-range pointer.
+  preview.total_blocks = p.len / layout.block_bytes;
+
+  if (!layout.dequant_supported) {
+    // Known geometry (K-quant / IQ* super-block) but decode is deliberately
+    // out of scope (#49) — still return the honest type_name + total_blocks
+    // so the panel can say "Q4_K, 1024 blocks, preview unsupported".
+    preview.unavailable_reason = std::string(
+        gguf::dequant_status_message(gguf::DequantStatus::UnsupportedLayout));
+    return preview;
+  }
+
+  if (block_index >= preview.total_blocks) {
+    preview.unavailable_reason = "block index out of range for this tensor";
+    return preview;
+  }
+
+  // SAFE: block_index < total_blocks == p.len / block_bytes (floor division),
+  // so block_index * block_bytes < p.len for any block_bytes > 0 — the product
+  // cannot overflow uint64_t (block_bytes is a handful of bytes; p.len already
+  // fits in uint64_t) and the resulting pointer + avail stay inside the
+  // resolved payload without needing a separate saturating-multiply guard.
+  const uint64_t byte_off = static_cast<uint64_t>(block_index) *
+                            static_cast<uint64_t>(layout.block_bytes);
+  const uint8_t* block_ptr = p.ptr + byte_off;
+  const uint64_t avail = p.len - byte_off;
+
+  uint32_t elem_count = 0;
+  const gguf::DequantStatus st = gguf::dequant_block(
+      t.quant_type_id, block_ptr, avail, preview.values.data(), &elem_count);
+  if (st != gguf::DequantStatus::Ok) {
+    // Should not happen given the checks above (avail >= block_bytes is
+    // guaranteed by the total_blocks/block_index bound), but dequant_block is
+    // the authority on its own preconditions — surface whatever it says
+    // rather than assume success.
+    preview.unavailable_reason = std::string(gguf::dequant_status_message(st));
+    return preview;
+  }
+
+  preview.available = true;
+  preview.elem_count = elem_count;
+  preview.first_elem =
+      static_cast<uint64_t>(block_index) * layout.elems_per_block;
+  return preview;
 }
 
 Result<bool> export_npy(const ir::TensorRef& t, const MappedFile& base,

@@ -8,6 +8,19 @@
 //
 // Export buttons call export_npy / export_raw (which stream from the mmap) after
 // a native save dialog, then toast the outcome.
+//
+// v0.9.1b adds two OPT-IN sections that stay inert until asked for (neither
+// fires as a side effect of selecting a tensor):
+//   #50 cross-model compare -- decodes the SAME-NAMED tensor out of the active
+//       DiffLoader comparison slot via App::inspect_tensor_comparison() and
+//       renders it beside the A-side stats/histogram with a B-A delta.
+//   #49 single-block dequant preview -- for a quantized_unsupported tensor,
+//       decodes exactly ONE block via App::preview_tensor_quant_block() and
+//       renders the raw floats. View-only; never exported (DECISIONS.md
+//       "v0.9.1b -- dequantization scope").
+// Both kick their async request only on a real state change (tensor/slot/
+// block), never unconditionally every frame -- see the staleness comments on
+// draw_quant_preview / draw_comparison_section below.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +31,11 @@
 // LayoutEngine.h defines SizeFn, referenced by the frozen ModelSession.h that
 // App.h pulls in without including it; include it first so App.h compiles.
 #include "engine/LayoutEngine.h"
+// #50: DiffLoader owns the comparison-model slots the cross-model compare
+// section reads (comparison_count/active_comparison/state_of/error_of).
+// Reachable transitively via view/App.h already, but named explicitly here
+// (matching DiffPanel.cpp) so this TU documents its own dependency.
+#include "engine/DiffLoader.h"
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
 #include "view/App.h"
@@ -142,6 +160,250 @@ void do_export(App& app, const ir::TensorRef& t, bool raw) {
   }
 }
 
+// #49: the block selector + kick-on-change + render for the single-block
+// dequant preview. Called only while ViewState::inspector_quant_preview is on
+// (the caller gates it), so this function's only job is deciding WHEN to
+// (re)request a decode and how to draw whatever PendingDecode::quant currently
+// holds.
+void draw_quant_preview(App& app, PendingDecode& d) {
+  // Stale-request tracking is keyed on the PendingDecode's OWN ADDRESS plus its
+  // A-side token, not the bare token: PendingDecode lives one-per-tab and each
+  // tab's token sequence starts at 0 independently, so two tabs can carry the
+  // same token value at the same moment. Keying on pointer identity is the same
+  // discipline DiffPanel's CacheKey and the #62 tint guard already use, for the
+  // same reason (see MEMORY: "process-global static caches must key on model/
+  // report POINTER identity").
+  static const PendingDecode* s_owner = nullptr;
+  static uint64_t s_owner_token = UINT64_MAX;
+  static uint32_t s_owner_block = UINT32_MAX;
+
+  const bool new_tensor = s_owner != &d || s_owner_token != d.token;
+  // Don't inherit a stale index from the PREVIOUS tensor's block ladder.
+  if (new_tensor) d.quant_block = 0;
+
+  // Block selector: prev/next steppers + a direct index box. `total` is 0
+  // until the first successful preview reports the tensor's real block count,
+  // so the next-button/clamp only engage once it is known -- clamping to an
+  // unknown bound would itself be a guess, and preview_quant_block() already
+  // reports an out-of-range index honestly (available=false) rather than
+  // faulting, so an unclamped OOB request here is still safe.
+  const uint64_t total = d.quant.total_blocks;
+  ImGui::BeginDisabled(d.quant_block == 0);
+  if (ImGui::ArrowButton("##quant_prev", ImGuiDir_Left)) --d.quant_block;
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  int block_i = static_cast<int>(d.quant_block);
+  ImGui::SetNextItemWidth(90.0f);
+  if (ImGui::InputInt("block", &block_i, 1, 10))
+    d.quant_block = block_i < 0 ? 0u : static_cast<uint32_t>(block_i);
+  ImGui::SameLine();
+  ImGui::BeginDisabled(total > 0 &&
+                       static_cast<uint64_t>(d.quant_block) + 1 >= total);
+  if (ImGui::ArrowButton("##quant_next", ImGuiDir_Right)) ++d.quant_block;
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  if (total > 0)
+    ImGui::TextDisabled("of %llu", static_cast<unsigned long long>(total));
+  else
+    ImGui::TextDisabled("(block count unknown until previewed)");
+
+  // Re-kick ONLY when what's on screen no longer matches (tensor, block). An
+  // unconditional per-frame call would bump quant_token every frame, so the
+  // job would never win the race to publish before being superseded --
+  // exactly the "spinner forever" failure mode the spec warns against.
+  if (new_tensor || s_owner_block != d.quant_block) {
+    app.preview_tensor_quant_block(d.quant_block);
+    s_owner = &d;
+    s_owner_token = d.token;
+    s_owner_block = d.quant_block;
+  }
+
+  if (d.quant_in_flight) {
+    draw_spinner(10.0f, 2.5f, ImGui::GetColorU32(ImGuiCol_Text));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Decoding block...");
+    return;
+  }
+  if (!d.quant_done) return;  // request just posted; lands in a frame or two
+
+  if (!d.quant_error.empty()) {
+    ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f), "Preview failed");
+    ImGui::TextWrapped("%s", d.quant_error.c_str());
+    return;
+  }
+
+  const QuantBlockPreview& q = d.quant;
+  if (!q.available) {
+    // Honest per spec: never render a partial/approximated value here -- show
+    // the engine's exact, fixed reason (e.g. a K-quant super-block) verbatim.
+    ImGui::TextWrapped("%s", q.unavailable_reason.c_str());
+    return;
+  }
+
+  ImGui::Text("type: %s   block %u of %llu", q.type_name.c_str(), q.block_index,
+             static_cast<unsigned long long>(q.total_blocks));
+  ImGui::Text("elements [%llu, %llu)",
+             static_cast<unsigned long long>(q.first_elem),
+             static_cast<unsigned long long>(q.first_elem + q.elem_count));
+
+  // A small grid of the decoded floats. No export button here, EVER: exporting
+  // dequantized payload is an explicit non-goal (DECISIONS.md "v0.9.1b --
+  // dequantization scope"). This preview is view-only by contract -- if a
+  // future change wants to export these values, that is the wrong side of the
+  // non-goal and belongs in a design discussion, not a quick button here.
+  const ImGuiTableFlags gflags =
+      ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit;
+  if (ImGui::BeginTable("quant_values", 8, gflags)) {
+    for (uint32_t i = 0; i < q.elem_count; ++i) {
+      if (i % 8 == 0) ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(static_cast<int>(i % 8));
+      ImGui::Text("%g", static_cast<double>(q.values[i]));
+    }
+    ImGui::EndTable();
+  }
+}
+
+// #50: the cross-model same-tensor compare toggle + B-side render. `s` is the
+// already-computed A-side stats (the caller only reaches here once s is valid,
+// i.e. never for a quantized_unsupported A-side tensor -- its min/max/mean/std
+// are meaningless placeholders, so a delta against them would be too).
+void draw_comparison_section(App& app, PendingDecode& d, const TensorStats& s) {
+  ImGui::SeparatorText("Comparison");
+  // Sticky across tensor selections: the flag lives in ViewState (not here) so
+  // a user walking a quant ladder doesn't have to re-enable it per tensor.
+  ImGui::Checkbox("Compare with comparison model", &app.view().inspector_compare);
+  if (!app.view().inspector_compare) return;
+
+  DiffLoader& diff = app.diff_loader();
+  if (diff.comparison_count() == 0) {
+    ImGui::TextDisabled("No comparison model loaded (Diff panel opens one).");
+    return;
+  }
+
+  const size_t slot = diff.active_comparison();
+  const DiffLoadState state = diff.state_of(slot);
+  if (state == DiffLoadState::Loading || state == DiffLoadState::Empty) {
+    draw_spinner(10.0f, 2.5f, ImGui::GetColorU32(ImGuiCol_Text));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Comparison model is loading...");
+    return;
+  }
+  if (state == DiffLoadState::Failed) {
+    ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f),
+                       "Comparison model failed to load");
+    ImGui::TextWrapped("%s", diff.error_of(slot).c_str());
+    return;
+  }
+
+  // Same pointer+token staleness discipline as draw_quant_preview, PLUS the
+  // active slot: a quant-ladder user can switch which comparison is "active"
+  // (#36) without touching the inspected tensor, and the B side must follow.
+  static const PendingDecode* s_owner = nullptr;
+  static uint64_t s_owner_token = UINT64_MAX;
+  static size_t s_owner_slot = SIZE_MAX;
+  if (s_owner != &d || s_owner_token != d.token || s_owner_slot != slot) {
+    app.inspect_tensor_comparison();
+    s_owner = &d;
+    s_owner_token = d.token;
+    s_owner_slot = slot;
+  }
+
+  if (d.cmp_in_flight) {
+    draw_spinner(10.0f, 2.5f, ImGui::GetColorU32(ImGuiCol_Text));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Decoding comparison tensor...");
+    return;
+  }
+  if (!d.cmp_done) return;  // request just posted
+
+  if (!d.cmp_ok) {
+    ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f), "Comparison unavailable");
+    if (!d.cmp_label.empty()) ImGui::TextDisabled("(%s)", d.cmp_label.c_str());
+    ImGui::TextWrapped("%s", d.cmp_error.c_str());
+    return;
+  }
+  if (d.cmp_stats.quantized_unsupported) {
+    ImGui::TextWrapped(
+        "%s's copy of this tensor uses a quantized block format; only "
+        "metadata is available there (use the block preview above on THIS "
+        "side; there is no B-side equivalent here), so no value comparison "
+        "is shown.",
+        d.cmp_label.empty() ? "The comparison model" : d.cmp_label.c_str());
+    return;
+  }
+
+  const TensorStats& cs = d.cmp_stats;
+  ImGui::Text("B = %s", d.cmp_label.c_str());
+
+  const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;
+  if (ImGui::BeginTable("cmp_stats", 4, flags)) {
+    ImGui::TableSetupColumn("stat", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableSetupColumn("A");
+    ImGui::TableSetupColumn("B");
+    ImGui::TableSetupColumn("B - A");
+    ImGui::TableHeadersRow();
+    // Deltas are B - A (matching the sign convention engine/TensorDiff.h and
+    // the #31 cost-delta panel already use, so a user reading both agrees on
+    // which side a positive number favors).
+    auto frow = [](const char* k, double a, double b) {
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::TextUnformatted(k);
+      ImGui::TableSetColumnIndex(1);
+      ImGui::Text("%g", a);
+      ImGui::TableSetColumnIndex(2);
+      ImGui::Text("%g", b);
+      ImGui::TableSetColumnIndex(3);
+      ImGui::Text("%+g", b - a);
+    };
+    auto urow = [](const char* k, uint64_t a, uint64_t b) {
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::TextUnformatted(k);
+      ImGui::TableSetColumnIndex(1);
+      ImGui::Text("%llu", static_cast<unsigned long long>(a));
+      ImGui::TableSetColumnIndex(2);
+      ImGui::Text("%llu", static_cast<unsigned long long>(b));
+      ImGui::TableSetColumnIndex(3);
+      // Signed delta -- an unsigned subtraction on a shrink would wrap to
+      // ~1.8e19 instead of reading negative (the same bug class engine/
+      // TensorDiff.h's d_zero_count()/d_nan_inf_count() guard against).
+      ImGui::Text("%+lld", static_cast<long long>(b) - static_cast<long long>(a));
+    };
+    frow("min", s.min, cs.min);
+    frow("max", s.max, cs.max);
+    frow("mean", s.mean, cs.mean);
+    frow("std", s.std, cs.std);
+    urow("zeros", s.zero_count, cs.zero_count);
+    urow("nan/inf", s.nan_inf_count, cs.nan_inf_count);
+    urow("count", s.count, cs.count);
+    ImGui::EndTable();
+  }
+
+  // Histograms side by side, each scaled to its OWN [hist_min, hist_max] --
+  // NOT forced onto a shared range. compute_tensor_stats bucketizes during its
+  // one streaming pass and only the 64 bucket COUNTS survive; the raw values
+  // that produced them are gone by design (that's the whole point of the
+  // zero-payload streaming decode). Rebinning onto a common range from here
+  // would need either the discarded raw values or a second, wider decode of
+  // whichever side has the narrower range -- not worth another payload read
+  // for a preview panel. So both are drawn self-scaled (draw_histogram already
+  // labels each with its own min/max underneath) and the mismatch is called
+  // out explicitly rather than left implicit: two histograms with different
+  // x-axes and no label would be exactly the misleading chart the honesty
+  // rules forbid.
+  ImGui::TextDisabled(
+      "Each histogram is scaled to its OWN range (see min/max below it) -- "
+      "bucket i in A and bucket i in B are not necessarily the same values.");
+  ImGui::Columns(2, "cmp_hist_cols", false);
+  ImGui::TextUnformatted("A");
+  draw_histogram(s);
+  ImGui::NextColumn();
+  ImGui::TextUnformatted(d.cmp_label.c_str());
+  draw_histogram(cs);
+  ImGui::Columns(1);
+}
+
 }  // namespace
 
 // Draw the Weight Inspector panel (spec §8.3). Called once per frame.
@@ -198,11 +460,30 @@ void draw_weight_inspector(App& app) {
 
   const TensorStats& s = d.stats;
 
-  // GGUF quantized blocks are labels only in v1 (spec §7.5, §12).
+  // #49 (DECISIONS.md "v0.9.1b -- dequantization scope"): GGUF quantized
+  // blocks are metadata-only in the normal decode path above -- TensorStats
+  // never materializes per-element floats for a block format, so min/max/
+  // mean/std/histogram would all read as a meaningless 0 here (spec §7.5,
+  // §12). NetVis still does NOT dequantize this tensor as a transform: it
+  // never converts the whole payload to float, never writes a dequantized
+  // file, and never hands dequantized data to a plugin. What IS supported is
+  // a bounded, opt-in, view-only preview of a single decoded block, so a user
+  // can see real numbers behind the metadata without NetVis crossing into
+  // "dequantizer" territory.
   if (s.quantized_unsupported) {
     ImGui::TextWrapped(
-        "Dequantization is not supported in v1. This tensor uses a quantized "
-        "block format (e.g. GGUF Q4/Q8); only its metadata is shown.");
+        "This tensor uses a quantized block format (e.g. GGUF Q4/Q8). NetVis "
+        "does not dequantize it as a whole -- below is an optional, "
+        "read-only preview of ONE decoded block (up to %u values) for the "
+        "legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0); K-quants and IQ* "
+        "formats report why they can't be previewed instead of guessing.",
+        kQuantPreviewMaxElems);
+
+    // #49: opt-in BY CONTRACT, not merely by convention -- default off, and
+    // nothing below fires until the user explicitly flips this checkbox.
+    ImGui::Checkbox("Preview one block", &app.view().inspector_quant_preview);
+    if (app.view().inspector_quant_preview) draw_quant_preview(app, d);
+
     ImGui::End();
     return;
   }
@@ -319,6 +600,11 @@ void draw_weight_inspector(App& app) {
   if (ImGui::Button("Export .npy")) do_export(app, t, /*raw=*/false);
   ImGui::SameLine();
   if (ImGui::Button("Export raw .bin")) do_export(app, t, /*raw=*/true);
+
+  // #50: appended after everything above so the existing single-tensor
+  // sections (stats/histogram/extremes/warnings/per-channel/export) render
+  // exactly as before whether or not the user ever opens this.
+  draw_comparison_section(app, d, s);
 
   ImGui::End();
 }

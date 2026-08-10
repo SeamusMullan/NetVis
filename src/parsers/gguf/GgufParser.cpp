@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/ByteReader.h"
@@ -28,6 +29,7 @@
 #include "core/Result.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "parsers/gguf/GgufBlocks.h"
 
 namespace netvis::gguf {
 namespace {
@@ -286,6 +288,14 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
     if (!off) return off.error();
 
     t.dtype = map_ggml_type(*gtype);
+    // #49: map_ggml_type is LOSSY on purpose — ~20 block layouts collapse onto
+    // the Q4/Q8 buckets. Keep the exact id (for the single-block preview, which
+    // cannot decode a bucket) and the exact name (so the inspector shows "Q4_K"
+    // instead of "Q4"). Both are recorded from the already-read tensor-info
+    // table; no payload byte is touched here.
+    t.quant_type_id = *gtype;
+    const std::string_view exact = gguf::ggml_type_name(*gtype);
+    if (!exact.empty()) t.dtype_label = model.intern(exact);
 
     RawTensor rt;
     rt.ref = std::move(t);

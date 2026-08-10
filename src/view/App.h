@@ -55,6 +55,38 @@ struct PendingDecode {
   TensorStats stats;
   std::string error;
   uint64_t token = 0;    // guards against stale completions
+
+  // --- v0.9.1b additions (APPEND-ONLY) ---------------------------------------
+  // #50: the SAME-NAMED tensor decoded out of the active comparison model, for
+  // the side-by-side view. Independent of the A-side above: the compare is
+  // opt-in, so these stay inert until the user asks, and a missing/failed B side
+  // never disturbs the A-side stats that are already on screen.
+  //
+  // Guarded by its own token because the two decodes are separate jobs that can
+  // complete out of order, and because the comparison model can be swapped or
+  // removed (#36) while a B-side decode is in flight — a stale completion must
+  // not paint numbers from a model that is no longer loaded.
+  bool cmp_requested = false;   // user asked for the cross-model compare
+  bool cmp_in_flight = false;
+  bool cmp_done = false;
+  bool cmp_ok = false;
+  TensorStats cmp_stats;
+  std::string cmp_error;        // non-empty explains why the B side is absent
+  std::string cmp_label;        // which comparison it came from (its basename)
+  uint64_t cmp_token = 0;
+  // Which DiffLoader slot the B side was decoded from, so the panel can detect
+  // that the active comparison changed underneath it.
+  size_t cmp_slot = 0;
+
+  // #49: the single-block dequant preview for `tensor`. view-only; never
+  // exported, never cached to disk, never handed to a plugin.
+  bool quant_requested = false;
+  bool quant_in_flight = false;
+  bool quant_done = false;
+  QuantBlockPreview quant;
+  std::string quant_error;      // transport/mapping failure (vs quant.unavailable_reason)
+  uint32_t quant_block = 0;     // which block index the user is looking at
+  uint64_t quant_token = 0;
 };
 
 // A toast message (errors / notices, spec §8.7, §6.5 TorchScript notice).
@@ -197,6 +229,28 @@ struct ViewState {
   // what save_prefs persists — acceptable (a single-user preference).
   double custom_ridge = 0.0;
   std::vector<std::pair<std::string, double>> machine_profiles;
+
+  // --- v0.9.1b additions (APPEND-ONLY) ---------------------------------------
+  // #34: the per-tensor weight-stat diff table in DiffPanel. The MATCH LIST
+  // itself is free to rebuild (names/shapes only, no payload), but the per-row
+  // STATS are not — each row costs two full tensor decodes — so rows are decoded
+  // strictly on demand and the results are kept here, keyed by row.
+  //
+  // The cache key is (primary model ptr, comparison model ptr, DiffLoader slot).
+  // Pointer identity is the right key for the same reason the #62 tint guard uses
+  // it: per-tab sessions make generation counters collide, and a reopened model
+  // can land on the same generation with entirely different content.
+  std::string tensor_diff_filter;
+  int32_t tensor_diff_selected = -1;   // row index into the cached match list
+  bool tensor_diff_open = false;       // section expanded (drives lazy rebuild)
+
+  // #50: the inspector's cross-model compare toggle. Sticky across tensor
+  // selections so a user walking a quant ladder does not re-enable it per tensor.
+  bool inspector_compare = false;
+
+  // #49: the inspector's dequant-preview toggle. Off by default — the preview is
+  // opt-in by contract, not merely by convention.
+  bool inspector_quant_preview = false;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather
@@ -248,6 +302,20 @@ class App {
 
   // Kick an async decode for the weight inspector (spec §8.3).
   void inspect_tensor(const ir::TensorRef& t);
+
+  // #50: kick an async decode of the SAME-NAMED tensor out of the ACTIVE
+  // comparison model (DiffLoader slot `active_comparison()`), filling the cmp_*
+  // side of the active tab's PendingDecode. No-op unless the inspector currently
+  // holds a tensor and that slot is Ready. If the comparison has no tensor of
+  // that name, this completes immediately with cmp_ok = false and an honest
+  // cmp_error rather than leaving the panel spinning.
+  void inspect_tensor_comparison();
+
+  // #49: kick an async single-block dequant preview for the tensor currently in
+  // the inspector, filling the quant_* side of the active tab's PendingDecode.
+  // `block_index` selects the block. Opt-in: only ever called from an explicit
+  // user action in the inspector, never as part of inspect_tensor().
+  void preview_tensor_quant_block(uint32_t block_index);
 
   void add_toast(const std::string& text, bool is_error);
 

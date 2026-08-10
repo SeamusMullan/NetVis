@@ -181,6 +181,7 @@ GGUF_TYPE_STRING = 8
 
 GGML_TYPE_F32 = 0
 GGML_TYPE_Q4_0 = 2
+GGML_TYPE_Q4_K = 12
 
 
 def gguf_string(s):
@@ -234,6 +235,66 @@ def build_gguf():
     data += b"".join(struct.pack("<f", float(i)) for i in range(6))  # 24 bytes
     data += b"\x00" * (q4_off - len(data))     # pad to q4 offset (32)
     data += b"\x00" * q4_bytes                 # 18 bytes Q4_0 block (opaque)
+
+    return bytes(header) + bytes(data)
+
+
+def _q4_0_block(d):
+    """One 18-byte Q4_0 block: f16 scale `d` + 16 packed-nibble bytes (#49).
+    qs[j] packs element j in the LOW nibble (value j-8) and element j+16 in
+    the HIGH nibble (value 7-j) -- an ASYMMETRIC ramp, not a repeated value,
+    so tests/test_quant_preview.cpp can tell a low/high-nibble swap apart from
+    a correct decode by the actual numbers it gets back."""
+    qs = bytes((j | ((15 - j) << 4)) for j in range(16))
+    return struct.pack("<e", d) + qs
+
+
+def build_gguf_quant():
+    """GGUF v3 fixture with QUANTIZED tensors, for the #49 single-block preview
+    tests (tests/test_quant_preview.cpp). Three tensors:
+      weight_f32  - plain F32, exercises preview's "not quantized" refusal.
+      weight_q4k  - Q4_K (a K-quant super-block): GgufBlocks.cpp deliberately
+                    refuses to decode these, so its 144 bytes are left opaque
+                    (zero-filled) -- only the type id and length matter.
+      weight_q4_0 - Q4_0, TWO hand-encoded blocks with KNOWN values (block 0
+                    scale=1.0, block 1 scale=2.0 -- doubled, so a block_index
+                    mixup that always decodes block 0 is caught too).
+    Tensor table order == data order == ascending offset, so each quantized
+    tensor's byte length (GgufParser.cpp: gap to the next tensor's offset, or
+    to end-of-data for the last) comes out exactly right without needing
+    per-tensor alignment padding: F32@0 (16B, sized from shape), Q4_K@16
+    (144B = gap to Q4_0's offset), Q4_0@160 LAST (36B = gap to end-of-data).
+    """
+    alignment = 32
+
+    f32_bytes = struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)
+    assert len(f32_bytes) == 16
+    q4k_bytes = b"\x00" * 144  # opaque K-quant super-block; never decoded
+    q4_0_bytes = _q4_0_block(1.0) + _q4_0_block(2.0)
+    assert len(q4_0_bytes) == 36  # two 18-byte blocks
+
+    f32_off = 0
+    q4k_off = f32_off + len(f32_bytes)    # 16
+    q4_0_off = q4k_off + len(q4k_bytes)   # 160
+
+    header = bytearray()
+    header += b"GGUF"
+    header += struct.pack("<I", 3)  # version 3
+    header += struct.pack("<Q", 3)  # tensor_count
+    header += struct.pack("<Q", 1)  # metadata_kv_count
+    header += gguf_kv_u32("general.alignment", alignment)
+    header += gguf_tensor_info("weight_f32", [4], GGML_TYPE_F32, f32_off)
+    header += gguf_tensor_info("weight_q4k", [256], GGML_TYPE_Q4_K, q4k_off)
+    header += gguf_tensor_info("weight_q4_0", [64], GGML_TYPE_Q4_0, q4_0_off)
+
+    pad = (-len(header)) % alignment
+    header += b"\x00" * pad
+
+    data = bytearray()
+    data += f32_bytes
+    data += q4k_bytes
+    data += q4_0_bytes
+    assert len(data) == q4_0_off + len(q4_0_bytes)
 
     return bytes(header) + bytes(data)
 
@@ -1712,6 +1773,8 @@ def main():
     write("weights.bin", weights_bin)
     write("model.safetensors", build_safetensors())
     write("model.gguf", build_gguf())
+    # Quantized GGUF fixture (#49): Q4_0 (2 known blocks) + Q4_K (refused).
+    write("model_quant.gguf", build_gguf_quant())
     build_pytorch(os.path.join(out_dir, "model.pt"))
     build_npz(os.path.join(out_dir, "model.npz"))
     build_torchscript(os.path.join(out_dir, "model_ts.pt"))
