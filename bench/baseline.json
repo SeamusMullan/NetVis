@@ -9,41 +9,48 @@
       "ir_edges": 1123,
       "display_nodes": 1000,
       "layout_boxes": 1000,
-      "peak_rss_bytes": 6004736,
+      "peak_rss_bytes": 5742592,
       "stages": [
         {
           "name": "collapse",
-          "ms": 0.13963,
-          "min_ms": 0.131671,
-          "max_ms": 0.166051,
+          "ms": 0.131339,
+          "min_ms": 0.128946,
+          "max_ms": 0.173403,
           "repeats": 5
         },
         {
           "name": "shape_infer",
-          "ms": 0.232434,
-          "min_ms": 0.201517,
-          "max_ms": 0.322201,
+          "ms": 0.152596,
+          "min_ms": 0.151884,
+          "max_ms": 0.194676,
           "repeats": 5
         },
         {
           "name": "layout",
-          "ms": 0.423692,
-          "min_ms": 0.362105,
-          "max_ms": 0.839011,
+          "ms": 0.122916,
+          "min_ms": 0.11312,
+          "max_ms": 0.1615,
           "repeats": 5
         },
         {
           "name": "cost",
-          "ms": 0.658148,
-          "min_ms": 0.337353,
-          "max_ms": 1.179301,
+          "ms": 0.250191,
+          "min_ms": 0.227543,
+          "max_ms": 0.286032,
           "repeats": 5
         },
         {
           "name": "visible_scan",
-          "ms": 0.002284,
-          "min_ms": 0.002284,
-          "max_ms": 0.002284,
+          "ms": 0.00405,
+          "min_ms": 0.00405,
+          "max_ms": 0.00405,
+          "repeats": 5
+        },
+        {
+          "name": "visible_scan_zoomed",
+          "ms": 0.001307,
+          "min_ms": 0.001307,
+          "max_ms": 0.001307,
           "repeats": 5
         }
       ]
@@ -54,41 +61,100 @@
       "ir_edges": 11248,
       "display_nodes": 10000,
       "layout_boxes": 10000,
-      "peak_rss_bytes": 19832832,
+      "peak_rss_bytes": 17477632,
       "stages": [
         {
           "name": "collapse",
-          "ms": 1.618751,
-          "min_ms": 1.428243,
-          "max_ms": 1.894292,
+          "ms": 1.596421,
+          "min_ms": 1.53218,
+          "max_ms": 1.999881,
           "repeats": 5
         },
         {
           "name": "shape_infer",
-          "ms": 2.028144,
-          "min_ms": 1.666798,
-          "max_ms": 2.37727,
+          "ms": 2.019045,
+          "min_ms": 1.754613,
+          "max_ms": 2.763906,
           "repeats": 5
         },
         {
           "name": "layout",
-          "ms": 3.894758,
-          "min_ms": 3.646445,
-          "max_ms": 4.514063,
+          "ms": 1.284542,
+          "min_ms": 1.204364,
+          "max_ms": 1.526148,
           "repeats": 5
         },
         {
           "name": "cost",
-          "ms": 2.543847,
-          "min_ms": 2.367686,
-          "max_ms": 3.129242,
+          "ms": 2.485048,
+          "min_ms": 2.312048,
+          "max_ms": 2.656944,
           "repeats": 5
         },
         {
           "name": "visible_scan",
-          "ms": 0.024405,
-          "min_ms": 0.024405,
-          "max_ms": 0.024405,
+          "ms": 0.040218,
+          "min_ms": 0.040218,
+          "max_ms": 0.040218,
+          "repeats": 5
+        },
+        {
+          "name": "visible_scan_zoomed",
+          "ms": 0.00959,
+          "min_ms": 0.00959,
+          "max_ms": 0.00959,
+          "repeats": 5
+        }
+      ]
+    },
+    {
+      "label": "synthetic-100k",
+      "ir_nodes": 100000,
+      "ir_edges": 112498,
+      "display_nodes": 100000,
+      "layout_boxes": 100000,
+      "peak_rss_bytes": 134635520,
+      "stages": [
+        {
+          "name": "collapse",
+          "ms": 20.656519,
+          "min_ms": 19.460043,
+          "max_ms": 21.867781,
+          "repeats": 5
+        },
+        {
+          "name": "shape_infer",
+          "ms": 21.096508,
+          "min_ms": 19.547181,
+          "max_ms": 23.407761,
+          "repeats": 5
+        },
+        {
+          "name": "layout",
+          "ms": 16.519585,
+          "min_ms": 15.333764,
+          "max_ms": 20.165571,
+          "repeats": 5
+        },
+        {
+          "name": "cost",
+          "ms": 27.962417,
+          "min_ms": 25.824371,
+          "max_ms": 28.232118,
+          "repeats": 5
+        },
+        {
+          "name": "visible_scan",
+          "ms": 0.729331,
+          "min_ms": 0.729331,
+          "max_ms": 0.729331,
+          "repeats": 5
+        },
+        {
+          "name": "visible_scan_zoomed",
+          "ms": 0.092692,
+          "min_ms": 0.092692,
+          "max_ms": 0.092692,
           "repeats": 5
         }
       ]
