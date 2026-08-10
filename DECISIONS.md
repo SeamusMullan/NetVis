@@ -372,3 +372,29 @@ cross-file adversarial review sweep). Full spec: `docs/v0.4.0-plan.md`.
 
 Suite: 126 cases / 835 assertions, GUI + ASan/UBSan clean. Version is tag-driven
 (CI `-DNETVIS_VERSION`), no hardcoded string to bump.
+
+> **Note (2026-08-10):** this log has no entries for v0.5.0 → v0.9.1. The per-release
+> rationale for that arc lives in `docs/v*.md` and the PR bodies (#87–#95, #119); a
+> backfill pass into this file is tracked as part of #114 (format-honesty audit) /
+> #115 (user guide). New decisions are appended below going forward.
+
+## v0.9.1b — dequantization scope (the one non-goal that moved)
+
+- **The README non-goal "no dequantization of GGUF quant blocks" is narrowed, not
+  dropped.** It was written when the only conceivable dequant was a payload
+  transform, and it collided with #49 (opt-in view-only quant-block preview). The
+  frozen rule now: dequantization is prohibited as a **transform** — NetVis never
+  dequantizes a model, never writes or exports dequantized payload, and never
+  exposes dequantization to plugins (that stays in the v1.0 non-goals as a plugin
+  capability). A **bounded, opt-in, view-only preview of a single quant block**,
+  rendered inside the existing weight-inspector decode job, is permitted.
+- **Why it does not violate the zero-payload thesis.** The thesis is that
+  *structural parse* never reads tensor bytes and that there is exactly **one**
+  payload reader (the inspector's decode job). A block preview rides that same job
+  and reads *strictly fewer* bytes than the histogram pass the inspector already
+  runs over the whole tensor. It adds no second reader, no cached decoded copy, and
+  no artifact on disk — so both invariants (zero-payload structural parse, single
+  decode path) survive unchanged.
+- **The line that keeps it honest:** the preview is view-only and per-block. The
+  moment a feature wants a *whole-tensor* dequantized buffer, a dequantized export,
+  or a plugin-visible dequant API, it is back on the wrong side of the non-goal.

@@ -59,8 +59,9 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   camera to a value's producer or consumers.
 - **Model diff:** open a second model as a comparison and the graph tints nodes
   **added / removed / changed** — before/after quantization or fine-tuning at a
-  glance. The comparison loads on its own background pipeline; the main thread
-  never stalls.
+  glance, with a summary panel listing every change (click to fly to it) and a
+  **match-by-name / match-by-topology** toggle. The comparison loads on its own
+  background pipeline; the main thread never stalls.
 - **Analyzer mode:** a static, zero-payload cost report — per-node and model-wide
   **FLOPs, parameter counts, weight bytes, and peak activation memory** computed
   from shapes alone (no weights read), plus a **quant-coverage** table (per-dtype
@@ -83,21 +84,34 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   preferences persist across sessions.
 - **Weight inspector:** lazily decodes a tensor to streaming stats (min/max/mean/std,
   zero & NaN/Inf counts, 64-bucket histogram) without materializing a converted
-  copy. Export to `.npy` or raw `.bin`.
+  copy, plus a **per-channel stat breakdown**, **outlier / dead-channel flags**,
+  in-tensor **value search**, and a **2D weight heatmap thumbnail**. Export to
+  `.npy` or raw `.bin`.
 - **Shape inference (ONNX):** best-effort propagation over the common ops (incl.
   constant-driven Reshape/Slice/Gather/Concat/Transpose/Split, attention,
   recurrent LSTM/GRU/RNN multi-output, quantized QLinear*/Integer/QDQ, and dtype
   propagation) fills in edge shape labels in the background — which in turn feed
   the analyzer's FLOP estimates. TFLite `If`/`While`/`CallOnce` subgraphs are
   linked and divable.
-- **Search:** fuzzy, case-insensitive substring/subsequence search over all names;
-  Enter flies the camera to the hit.
+- **Search:** fuzzy, case-insensitive substring/subsequence search over all names,
+  plus **regex** and **field-scoped** queries (`op:`, `name:`, `dtype:`, `shape:`,
+  `params:`) and a results-list panel; Enter flies the camera to the hit.
+- **Plugins:** extend NetVis without rebuilding it — **declarative** op definitions
+  (JSON: category, colour, FLOP/shape rules) and a sandboxed **WASM** tier for
+  custom parsers, passes, and op handlers. No native code, no raw byte access, no
+  syscalls; every plugin is capability-gated and individually trusted/enabled from
+  the Plugins panel. See `docs/plugin-abi.md` and `plugins/examples/`.
 - **Tensor-table mode:** graph-less formats (GGUF/SafeTensors/PyTorch) show a
   virtualized, sortable tensor table with a dotted-key module hierarchy.
 - **Safety:** the PyTorch pickle reader is a *restricted VM* with an explicit
   allowlist — unknown reduce targets become inert placeholders, never executed.
-- Dark/light themes, PNG export of the current view, recent files, drag-and-drop,
-  CLI open, and a status bar with per-stage load timings.
+- **Export & sharing:** PNG and **vector SVG/PDF** export of the current view,
+  shareable view-state files, copy-node-as-JSON, TSV cost summaries, a diff change
+  report (Markdown/TSV), and a **headless report CLI** that emits a JSON model
+  report with no window at all.
+- Dark/light themes, **multi-model tabs**, a **command palette**, async first-layout
+  with progress + cancel, recent files, drag-and-drop, CLI open, and a status bar
+  with per-stage load timings and the format-detection reason.
 
 ## Performance
 
@@ -206,7 +220,15 @@ cd build && cpack        # generator auto-selected per OS
 
 ## Non-goals (v1)
 
-No model editing, no inference/execution, no dequantization of GGUF quant blocks,
-no TorchScript/FX graph reconstruction, no web build. (A plugin system — declarative
-op definitions plus a sandboxed WASM tier for parsers/passes — is designed for a
-future release; see `docs/v0.6.0-plan.md`.)
+No model editing, no inference/execution, no web build, and no native `.so`/`.dll`
+plugins — extensions stay declarative or WASM-sandboxed.
+
+**Dequantization** is a non-goal as a *transform*: NetVis will not dequantize a
+model, export dequantized payload, or expose dequantization to plugins. A bounded,
+opt-in, **view-only** single-block preview inside the weight inspector is in scope
+(#49) — it reads no more bytes than the inspector already does and produces no
+artifact.
+
+**TorchScript** currently ships as a best-effort op *inventory*, not a compute
+graph; full graph reconstruction is planned for v0.9.4 rather than excluded (see
+`docs/v1.0-plan.md`).
