@@ -163,10 +163,16 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Download all packaged artifacts
+      # Only the per-OS installers. `merge-multiple` with no pattern downloads
+      # EVERY artifact any job in the run uploaded, which silently swept the perf
+      # gate's bench-current.json into the v0.9.3 release as a published asset.
+      # A release should contain exactly what a user installs, so the pattern is
+      # explicit and a new diagnostic artifact cannot leak into a release again.
+      - name: Download the packaged installers
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: netvis-*
           merge-multiple: true
       - name: List artifacts
         run: ls -la dist
