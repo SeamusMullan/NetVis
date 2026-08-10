@@ -20,6 +20,7 @@
 #include <cstring>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "core/ByteReader.h"
@@ -326,13 +327,43 @@ uint32_t infer_shapes_ext(Model& model, uint32_t graph_index,
 
   // Seed value dtypes/shapes from initializers by name (initializers carry both
   // shape and dtype even though their payload is unread).
-  for (const ir::TensorRef& init : g.initializers) {
-    for (auto& v : g.values) {
-      if (v.name == init.name && init.name.valid()) {
-        Shape s;
-        for (int64_t d : init.shape) s.push_back(d);
-        if (set_shape(v, s, init.dtype)) ++resolved;
-      }
+  //
+  // PERF (#97 harness finding, v0.9.3): this was a nested loop over
+  // initializers x values with no index and no early exit — O(I*V). The #97
+  // benchmark measured it at 6439.7 ms of a 6462 ms shape-inference stage on the
+  // 100k-node rung (25,000 initializers x 125,001 values ~ 3.1e9 iterations);
+  // with initializers cleared the same stage took 22.7 ms for an identical
+  // resolved count. It is ~99.6% of the stage and it scales quadratically:
+  // 0.28 ms at 1k, 14.5 ms at 10k, 6854 ms at 100k. Every real ONNX or OpenVINO
+  // model with thousands of initializers pays this on open.
+  //
+  // Now O(V + I): index the values by name once, then one lookup per
+  // initializer. Keying on the raw StringId is correct here and only here —
+  // both sides come from the SAME model's arena, so id equality IS content
+  // equality (the cross-model rule that forbids this lives in ModelDiff, where
+  // the two arenas are independent).
+  //
+  // Behaviour is preserved exactly for the duplicate-name case: the old loop
+  // visited every matching value, so a name shared by several values seeded all
+  // of them. The index therefore maps one name to a LIST of value indices, not
+  // to a single index — collapsing that to a first-match would silently stop
+  // seeding duplicates on hostile or unusual models.
+  {
+    std::unordered_map<uint32_t, SmallVec<uint32_t, 1>> by_name;
+    by_name.reserve(g.values.size());
+    for (uint32_t vi = 0; vi < g.values.size(); ++vi) {
+      const ir::ValueInfo& v = g.values[vi];
+      if (!v.name.valid()) continue;
+      by_name[v.name.id].push_back(vi);
+    }
+    for (const ir::TensorRef& init : g.initializers) {
+      if (!init.name.valid()) continue;
+      auto it = by_name.find(init.name.id);
+      if (it == by_name.end()) continue;
+      Shape s;
+      for (int64_t d : init.shape) s.push_back(d);
+      for (uint32_t vi : it->second)
+        if (set_shape(g.values[vi], s, init.dtype)) ++resolved;
     }
   }
 

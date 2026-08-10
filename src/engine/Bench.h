@@ -114,6 +114,21 @@ struct BenchOptions {
   bool quick = false;
 };
 
+// Parse the bench CLI flags out of argv:
+//   --bench                 run the default ladder
+//   --bench-quick           skip the 100k rung
+//   --bench-repeats=N       median-of-N (clamped to [1, 999]; 0 would divide by
+//                           zero when taking the median)
+//   --bench-model=<path>    also time a real model file; repeatable
+// Unrecognized arguments are ignored, so the GUI binary can share this parser
+// without rejecting its own flags. Lives here rather than in a main() so the GUI
+// entry point and the headless netvis_bench target cannot drift apart — two
+// copies of a flag parser is two behaviours the gate could disagree about.
+BenchOptions parse_bench_args(int argc, char** argv);
+
+// True if any argument selects benchmark mode.
+bool wants_bench(int argc, char** argv);
+
 // Run every rung and return the results. Synchronous, single-threaded, no
 // JobSystem, no GL. Deterministic for a fixed spec + repeats.
 //

@@ -1,0 +1,97 @@
+{
+  "schema": "netvis.bench.v1",
+  "hardware_concurrency": 16,
+  "build": "release",
+  "cases": [
+    {
+      "label": "synthetic-1k",
+      "ir_nodes": 1000,
+      "ir_edges": 1123,
+      "display_nodes": 1000,
+      "layout_boxes": 1000,
+      "peak_rss_bytes": 6004736,
+      "stages": [
+        {
+          "name": "collapse",
+          "ms": 0.13963,
+          "min_ms": 0.131671,
+          "max_ms": 0.166051,
+          "repeats": 5
+        },
+        {
+          "name": "shape_infer",
+          "ms": 0.232434,
+          "min_ms": 0.201517,
+          "max_ms": 0.322201,
+          "repeats": 5
+        },
+        {
+          "name": "layout",
+          "ms": 0.423692,
+          "min_ms": 0.362105,
+          "max_ms": 0.839011,
+          "repeats": 5
+        },
+        {
+          "name": "cost",
+          "ms": 0.658148,
+          "min_ms": 0.337353,
+          "max_ms": 1.179301,
+          "repeats": 5
+        },
+        {
+          "name": "visible_scan",
+          "ms": 0.002284,
+          "min_ms": 0.002284,
+          "max_ms": 0.002284,
+          "repeats": 5
+        }
+      ]
+    },
+    {
+      "label": "synthetic-10k",
+      "ir_nodes": 10000,
+      "ir_edges": 11248,
+      "display_nodes": 10000,
+      "layout_boxes": 10000,
+      "peak_rss_bytes": 19832832,
+      "stages": [
+        {
+          "name": "collapse",
+          "ms": 1.618751,
+          "min_ms": 1.428243,
+          "max_ms": 1.894292,
+          "repeats": 5
+        },
+        {
+          "name": "shape_infer",
+          "ms": 2.028144,
+          "min_ms": 1.666798,
+          "max_ms": 2.37727,
+          "repeats": 5
+        },
+        {
+          "name": "layout",
+          "ms": 3.894758,
+          "min_ms": 3.646445,
+          "max_ms": 4.514063,
+          "repeats": 5
+        },
+        {
+          "name": "cost",
+          "ms": 2.543847,
+          "min_ms": 2.367686,
+          "max_ms": 3.129242,
+          "repeats": 5
+        },
+        {
+          "name": "visible_scan",
+          "ms": 0.024405,
+          "min_ms": 0.024405,
+          "max_ms": 0.024405,
+          "repeats": 5
+        }
+      ]
+    }
+  ]
+}

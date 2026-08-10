@@ -64,35 +64,15 @@ int run_report(const std::string& path) {
   return 0;
 }
 
-// Headless benchmark path (#97). Recognizes:
-//   --bench                 run the default 1k/10k/100k ladder
-//   --bench-quick           skip the 100k rung (the CI-fast signal)
-//   --bench-repeats=N       median-of-N (default 5)
-//   --bench-model=<path>    also time a real model file; repeatable
+// Headless benchmark path (#97). The flags and their parsing live in
+// engine/Bench.h so this binary and the dedicated headless netvis_bench target
+// cannot drift apart — CI gates on netvis_bench's numbers, and two flag parsers
+// would be two behaviours the gate could silently disagree about.
+//
 // Prints the harness JSON to stdout and exits. Never creates the App, so it
-// needs no display — that is what lets CI gate on it.
-int run_bench(int argc, char** argv) {
-  netvis::BenchOptions opt;
-  for (int i = 1; i < argc; ++i) {
-    std::string_view a = argv[i];
-    if (a == "--bench-quick") {
-      opt.quick = true;
-      continue;
-    }
-    constexpr std::string_view kRepeats = "--bench-repeats=";
-    if (a.substr(0, kRepeats.size()) == kRepeats) {
-      // A bad or zero value would make the median meaningless, so clamp rather
-      // than trust it; 0 repeats would also divide by zero downstream.
-      const long n = std::strtol(std::string(a.substr(kRepeats.size())).c_str(),
-                                 nullptr, 10);
-      opt.repeats = n > 0 ? static_cast<uint32_t>(n < 999 ? n : 999) : 1;
-      continue;
-    }
-    constexpr std::string_view kModel = "--bench-model=";
-    if (a.substr(0, kModel.size()) == kModel)
-      opt.model_paths.emplace_back(a.substr(kModel.size()));
-  }
-
+// needs no display.
+int run_bench_cli(int argc, char** argv) {
+  const netvis::BenchOptions opt = netvis::parse_bench_args(argc, argv);
   netvis::Result<std::vector<netvis::BenchCase>> cases = netvis::run_bench(opt);
   if (!cases) {
     std::fprintf(stderr, "netvis --bench: %s\n", cases.error().message.c_str());
@@ -100,16 +80,6 @@ int run_bench(int argc, char** argv) {
   }
   std::printf("%s\n", netvis::build_bench_json(*cases).c_str());
   return 0;
-}
-
-// True if any argument selects the benchmark mode.
-bool wants_bench(int argc, char** argv) {
-  for (int i = 1; i < argc; ++i) {
-    std::string_view a = argv[i];
-    if (a == "--bench" || a == "--bench-quick") return true;
-    if (a.substr(0, 8) == "--bench-") return true;
-  }
-  return false;
 }
 
 }  // namespace
@@ -120,8 +90,8 @@ int main(int argc, char** argv) {
   if (parse_report_arg(argc, argv, report_path, report_mode) && report_mode) {
     return run_report(report_path);  // headless: never creates the App
   }
-  if (wants_bench(argc, argv)) {
-    return run_bench(argc, argv);  // headless: never creates the App
+  if (netvis::wants_bench(argc, argv)) {
+    return run_bench_cli(argc, argv);  // headless: never creates the App
   }
 
   // GUI path (unchanged): argv[1] is an optional initial file to open.
