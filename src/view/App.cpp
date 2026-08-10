@@ -1009,7 +1009,11 @@ void App::save_view_state(const std::string& path) {
 
   std::ofstream f(path);
   if (f) {
-    f << j.dump(2);
+    // `replace` rather than the default strict UTF-8 handler: this document
+    // carries the model PATH, and a path is not guaranteed valid UTF-8 on Linux.
+    // Strict would throw out of a save the user explicitly asked for. See
+    // save_recent for the full reasoning.
+    f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
     add_toast("View saved", false);
   } else {
     add_toast("Could not write view file", true);
@@ -1155,10 +1159,28 @@ void App::load_recent() {
 }
 
 void App::save_recent() {
-  nlohmann::json j = nlohmann::json::array();
-  for (const std::string& s : recent_) j.push_back(s);
-  std::ofstream f(layout_cache_dir() + "/recent.json");
-  if (f) f << j.dump(2);
+  // CRASH GUARD (v0.9.4). nlohmann's dump() defaults to the STRICT UTF-8 error
+  // handler and throws type_error.316 on a string that is not valid UTF-8. The
+  // strings here are filesystem PATHS, which on Linux are byte sequences with no
+  // encoding guarantee at all — so opening a file whose path contains invalid
+  // UTF-8 threw out of save_recent, through add_recent, through open_file, and
+  // terminated the app. A file viewer must not die because of the name of a file
+  // it was asked to view.
+  //
+  // `replace` substitutes U+FFFD instead of throwing: the recent list is a
+  // convenience, and a slightly mangled entry is enormously better than a crash.
+  // The catch is still there for anything else dump() might raise.
+  try {
+    nlohmann::json j = nlohmann::json::array();
+    for (const std::string& s : recent_) j.push_back(s);
+    const std::string text =
+        j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+    std::ofstream f(layout_cache_dir() + "/recent.json");
+    if (f) f << text;
+  } catch (...) {
+    // Best-effort, exactly like save_prefs: failing to persist a convenience
+    // must never interrupt the user.
+  }
 }
 
 void App::add_recent(const std::string& path) {
@@ -1228,7 +1250,10 @@ void App::save_prefs() {
     j["machine_profiles"] = profs;
   }
   std::ofstream f(layout_cache_dir() + "/view_prefs.json");
-  if (f) f << j.dump(2);
+  // `replace` for the same reason as save_recent: machine-profile names are
+  // free text the user can paste into, so strict UTF-8 could throw out of a
+  // routine preference save.
+  if (f) f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 void App::load_prefs() {
