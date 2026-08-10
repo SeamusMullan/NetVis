@@ -28,6 +28,62 @@ namespace netvis {
 
 namespace {
 
+// #123: the result set for a query, cached across frames.
+//
+// Both the overlay and the results panel used to call index.query() EVERY frame
+// — two full linear scans of the whole index per frame when both are open. The
+// original comment called that "cheap enough per spec §7.4 … without extra
+// caching state", which held when the index was small; at ~1M entries it is two
+// complete sweeps per frame for a result set that only changes when the query,
+// the model, or the index does.
+//
+// The key must include the model POINTER and the index identity, not just the
+// query string. Per-tab JobSystems mean generation counters all start at 0, so
+// two tabs can present an identical (generation, graph) pair — this project has
+// shipped that bug three times. Entry pointer + count identifies the index a
+// hit's `entry` field indexes into, which is the thing that must not go stale:
+// a hit resolved against a rebuilt index would read the wrong entry.
+//
+// `limit` is part of the key rather than serving a smaller request from a larger
+// cached one. query() applies the cap during ranking, so the first 100 of a
+// 500-hit request are not guaranteed to be the same 100 a limit-100 request
+// returns, and quietly assuming otherwise would silently change what the overlay
+// shows.
+struct QueryCache {
+  const SearchEntry* entries = nullptr;
+  size_t entry_count = 0;
+  const ir::Model* model = nullptr;
+  std::string query;
+  bool types_ready = false;
+  uint32_t limit = 0;
+  bool valid = false;
+  std::vector<SearchHit> hits;
+};
+
+const std::vector<SearchHit>& cached_query(const SearchIndex& index,
+                                           const ir::Model& model,
+                                           const std::string& query,
+                                           bool types_ready, uint32_t limit,
+                                           QueryCache& cache) {
+  const SearchEntry* entries =
+      index.entries().empty() ? nullptr : index.entries().data();
+  const bool hit = cache.valid && cache.entries == entries &&
+                   cache.entry_count == index.entries().size() &&
+                   cache.model == &model && cache.types_ready == types_ready &&
+                   cache.limit == limit && cache.query == query;
+  if (hit) return cache.hits;
+
+  cache.entries = entries;
+  cache.entry_count = index.entries().size();
+  cache.model = &model;
+  cache.query = query;
+  cache.types_ready = types_ready;
+  cache.limit = limit;
+  cache.hits = index.query(query, model, types_ready, limit);
+  cache.valid = true;
+  return cache.hits;
+}
+
 // Short tag for the results list, per hit kind.
 const char* kind_tag(SearchKind k) {
   switch (k) {
@@ -180,17 +236,26 @@ void draw_search_bar(App& app) {
     vs.search_query = buf;
   }
 
-  // Run the query fresh each frame — cheap enough per spec §7.4 and keeps results
-  // in sync with the live buffer without extra caching state. #52/#54: the field-
-  // aware overload handles op:/name:/dtype:/shape:/params: predicates against the
-  // live model, and falls back to the fuzzy path for a bare query.
-  std::vector<SearchHit> hits;
+  // #123: cached across frames, keyed on the query + the index + the model (see
+  // QueryCache). Results still track the live buffer exactly — the query string
+  // is part of the key, so a keystroke is a miss and recomputes — but holding a
+  // key steady no longer costs a full index scan per frame. #52/#54: the
+  // field-aware overload handles op:/name:/dtype:/shape:/params: predicates
+  // against the live model, and falls back to the fuzzy path for a bare query.
+  static QueryCache overlay_cache;
+  static const std::vector<SearchHit> kNoHits;
+  const std::vector<SearchHit>* hits_p = &kNoHits;
   if (model && !vs.search_query.empty()) {
     // types_ready gates dtype/shape/params predicates on shape inference having
     // published (else those fields are worker-mutated — a data race to read).
+    // It is part of the cache key too: the same query legitimately returns more
+    // once shapes land, and serving the pre-inference answer afterwards would be
+    // the same stale-derived-state bug the cost report once had.
     const bool types_ready = app.session().stage() == LoadStage::Ready;
-    hits = index.query(vs.search_query, *model, types_ready, 100);
+    hits_p = &cached_query(index, *model, vs.search_query, types_ready, 100,
+                           overlay_cache);
   }
+  const std::vector<SearchHit>& hits = *hits_p;
 
   // Keyboard navigation over the results.
   int nres = static_cast<int>(hits.size());
@@ -279,10 +344,14 @@ void draw_search_results_panel(App& app) {
     return;
   }
 
-  // Unbounded-ish list (cap generous); click any row to fly there.
+  // Unbounded-ish list (cap generous); click any row to fly there. #123: its own
+  // cache slot, because `limit` is part of the key — see QueryCache for why the
+  // 500-hit answer cannot be truncated to serve the overlay's 100.
   const bool types_ready = app.session().stage() == LoadStage::Ready;
-  std::vector<SearchHit> hits =
-      index.query(vs.search_query, *model, types_ready, 500);
+  static QueryCache panel_cache;
+  const std::vector<SearchHit>& hits =
+      cached_query(index, *model, vs.search_query, types_ready, 500,
+                   panel_cache);
   ImGui::TextDisabled("%zu match%s", hits.size(), hits.size() == 1 ? "" : "es");
 
   if (ImGui::BeginChild("##results_list")) {
@@ -290,8 +359,11 @@ void draw_search_results_panel(App& app) {
       if (hits[i].entry >= index.entries().size()) continue;
       const SearchEntry& e = index.entries()[hits[i].entry];
       ImGui::PushID(static_cast<int>(i));
-      std::string label = e.display.empty() ? "(anon)" : e.display;
-      if (ImGui::Selectable(label.c_str(), false,
+      // #123: no per-row std::string. e.display is already a std::string owned
+      // by the index, so copying it once per visible row per frame bought
+      // nothing but an allocation.
+      const char* label = e.display.empty() ? "(anon)" : e.display.c_str();
+      if (ImGui::Selectable(label, false,
                             ImGuiSelectableFlags_SpanAllColumns)) {
         // resolve_hit clears search_open (overlay) but leaves this panel open.
         resolve_hit(app, e);
