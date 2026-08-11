@@ -479,7 +479,7 @@ void draw_pinned_strip(App& app, ImVec2 canvas_origin, ImVec2 canvas_size) {
       if (!nm.empty()) label.assign(nm);
     }
     // Truncate very long names so the strip stays readable.
-    if (label.size() > 22) { label.resize(21); label += "…"; }
+    if (label.size() > 22) { label.resize(21); label += "..."; }
     ImVec2 ts = ImGui::CalcTextSize(label.c_str());
     float chip_w = ts.x + 2.0f * pad + x_w;
     // Wrap to a new row if we'd overflow the canvas width.

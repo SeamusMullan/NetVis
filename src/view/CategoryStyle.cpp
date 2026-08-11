@@ -201,7 +201,7 @@ constexpr bool encoding_distinct() {
 static_assert(hues_distinct(kAccessibleDark), "dark hues must be distinct");
 static_assert(hues_distinct(kAccessibleLight), "light hues must be distinct");
 static_assert(encoding_distinct(),
-              "two categories share BOTH hue and pattern — the accessible "
+              "two categories share BOTH hue and pattern - the accessible "
               "encoding cannot disambiguate them (#104)");
 
 // Out-of-range clamps to Other, matching the pre-#104 App::category_color

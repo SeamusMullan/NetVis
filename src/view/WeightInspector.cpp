@@ -551,7 +551,7 @@ void draw_weight_inspector(App& app) {
   // rows). Capped tensors show a note instead of an unbounded table.
   if (s.per_channel_capped) {
     ImGui::SeparatorText("Per-channel");
-    ImGui::TextDisabled("too many channels (>%u) — per-channel stats omitted",
+    ImGui::TextDisabled("too many channels (>%u) - per-channel stats omitted",
                         kMaxChannels);
   } else if (!s.per_channel.empty()) {
     char hdr[48];

@@ -386,7 +386,7 @@ void draw_cost_section(App& app) {
           per_inst.act_bytes = nc.act_bytes / instances;
           per_inst.flops_known = nc.flops_known;
 
-          ImGui::Text("Group: %s (×%u)", grp.label.c_str(), instances);
+          ImGui::Text("Group: %s (x%u)", grp.label.c_str(), instances);
           ImGui::Separator();
           ImGui::TextUnformatted("Per instance:");
           if (per_inst.flops_known) {
@@ -790,7 +790,7 @@ void draw_cost_section(App& app) {
       ImGui::SetTooltip(
           "ORDER-OF-MAGNITUDE estimate: max(known FLOPs / peak FLOP/s, bytes "
           "moved / bandwidth) at the selected machine balance. Derived from "
-          "datasheet peaks, NOT a measurement — expect optimism vs. a real run.");
+          "datasheet peaks, NOT a measurement - expect optimism vs. a real run.");
 
     // If a node/group is selected, estimate its latency too (mirror the selected
     // NodeCost obtained above via sum_node_costs).
@@ -936,7 +936,7 @@ void draw_cost_section(App& app) {
     double eff_bits = report->effective_bits_per_param();
     double vs_fp32 = report->size_vs_fp32();
     ImGui::Text("Effective bits/param: %.2f", eff_bits);
-    ImGui::Text("Size vs fp32: %.2f×", vs_fp32);
+    ImGui::Text("Size vs fp32: %.2fx", vs_fp32);
   }
 
   // --- Per-node cost table (graph mode only; collapsed so it doesn't dominate) -

@@ -116,6 +116,19 @@ class ViewHistory {
 
   size_t size() const { return entries_.size(); }
 
+  // Read-only inspection of the ring. The UI wants these to show how deep the
+  // undo stack is, and tests want them to assert on the ring's shape rather than
+  // inferring it by walking undo() — an inference that would pass just as
+  // happily against a subtly wrong implementation.
+  //
+  // `at` is bounds-checked to a null return rather than UB: an index here comes
+  // from a caller's own bookkeeping, and this class already refuses every other
+  // out-of-range request instead of trusting one.
+  size_t cursor() const { return cursor_; }
+  const ViewSnapshot* at(size_t i) const {
+    return i < entries_.size() ? &entries_[i] : nullptr;
+  }
+
  private:
   std::vector<ViewSnapshot> entries_;
   size_t cursor_ = 0;      // index of the CURRENT state within entries_

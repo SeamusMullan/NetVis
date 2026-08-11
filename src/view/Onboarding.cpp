@@ -106,7 +106,7 @@ void draw_copy_link(App& app, const char* url) {
   }
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
-        "Click to copy. NetVis never opens a network connection —\n"
+        "Click to copy. NetVis never opens a network connection \u2014\n"
         "paste this into your browser, then open the file you download.");
   ImGui::PopID();
 }
@@ -149,7 +149,7 @@ void draw_empty_state(App& app) {
 
   ImGui::TextWrapped(
       "NetVis reads neural-network model files and shows you what is inside "
-      "them — the compute graph, the tensors, and what they cost.");
+      "them \u2014 the compute graph, the tensors, and what they cost.");
   ImGui::Spacing();
 
   // --- How to open something ------------------------------------------------

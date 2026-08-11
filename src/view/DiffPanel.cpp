@@ -345,7 +345,7 @@ void draw_comparison_ladder(App& app, bool lock_slots) {
           ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChanged),
                              "other model");
           ImGui::SetItemTooltip(
-              "Diffed against a different model/tab — counts are for that "
+              "Diffed against a different model/tab - counts are for that "
               "pair. Re-add it here to diff the current model.");
         }
         break;
@@ -429,7 +429,7 @@ void draw_cost_delta(const DiffLoader& dl, const ModelSession& s, size_t slot,
         static_cast<double>(a_wbytes);
     ImGui::TextDisabled("weights %+.1f%% vs primary", pct);
   }
-  ImGui::TextDisabled("Static estimate — analytical FLOPs, not measured.");
+  ImGui::TextDisabled("Static estimate - analytical FLOPs, not measured.");
 }
 
 // #34 PHASE 2 render: the ONE decoded pair. Every failure mode gets its own
@@ -476,7 +476,7 @@ void draw_tensor_delta_result(const TensorDeltaSlot& st) {
             ? (d.b.quantized_unsupported ? "Both sides use" : "The primary uses")
             : "The comparison uses";
     ImGui::TextDisabled(
-        "%s a quantized layout NetVis cannot decode — no value delta.", which);
+        "%s a quantized layout NetVis cannot decode - no value delta.", which);
     return;
   }
 
@@ -904,7 +904,7 @@ void draw_diff_panel(App& app) {
     // A disabled widget does not hover, so the explanation is plain text rather
     // than a tooltip that would never appear.
     ImGui::SameLine();
-    ImGui::TextDisabled("(%d loaded — the maximum; remove one first)",
+    ImGui::TextDisabled("(%d loaded - the maximum; remove one first)",
                         static_cast<int>(kMaxComparisons));
   }
   if (dl.comparison_count() > 0) {
@@ -996,7 +996,7 @@ void draw_diff_panel(App& app) {
   // after the summary.
   if (!primary_matches) {
     ImGui::TextDisabled(
-        "Diff was computed for a different model/tab — switch to that tab or "
+        "Diff was computed for a different model/tab - switch to that tab or "
         "re-add the comparison here to diff this model.");
     ImGui::End();
     return;

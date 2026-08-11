@@ -23,6 +23,13 @@
 #include "engine/ModelSession.h"
 #include "engine/plugin/PluginPrefs.h"   // #11: PluginEnableSet, PluginKind
 #include "engine/OpCategory.h"
+// Included, not forward-declared: ViewState holds a unique_ptr<ViewHistory>,
+// so EVERY translation unit that destroys a ViewState needs the complete type.
+// Forward-declaring it makes each such TU fail with an incomplete-type error at
+// ~unique_ptr, which is a confusing way to learn about a dependency. This
+// header is ImGui-free and cheap (it lives in netvis_core precisely so the
+// tests can link it), so including it costs nothing.
+#include "engine/ViewSnapshot.h"
 #include "view/CategoryStyle.h"   // #104: accessible palette + non-colour cue
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
@@ -34,7 +41,6 @@ namespace netvis {
 // Navigation state lives in its own view header; ViewState holds it by pointer
 // so App.h stays light. Forward-declared here, defined in view/GraphNav.h.
 struct GraphNavState;
-class ViewHistory;  // view/ViewHistory.h (#106) — held by unique_ptr below
 
 // Static cost/analyzer report (v0.3.0). Forward-declared so App.h needn't include
 // engine/CostModel.h; ViewState holds it by unique_ptr, rebuilt by ensure_cost().
@@ -283,6 +289,12 @@ struct ViewState {
   // `nav` and `cost` are — ViewState is copied around and a history is large.
   // Per-tab, because a tab is the unit a user thinks of as "this view".
   std::unique_ptr<ViewHistory> history;
+  // What the ring's entries were captured against. IR node indices and
+  // CollapseTree group indices are both assigned per build, so an entry is only
+  // applicable within one (generation, graph) — when either moves, the ring is
+  // dropped rather than left offering steps that would be refused.
+  uint64_t history_owner_generation = UINT64_MAX;
+  uint32_t history_owner_graph = UINT32_MAX;
   // Set when a change is applied BY an undo/redo, so the frame that applies it
   // does not immediately record the result as a new history entry (which would
   // make redo unreachable after a single undo).
