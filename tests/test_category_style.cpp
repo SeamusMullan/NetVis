@@ -10,7 +10,12 @@
 // directory reaches only the `imgui` target, which the test executable does not
 // link. Neither wall can be climbed from inside tests/ — the unreachable include
 // lives in a frozen header, not here — so the tests below are gated on
-// __has_include("imgui.h"). That probe is the honest one to use because the
+// (Historical note: this file used to be gated on __has_include("imgui.h")
+// because CategoryStyle.h pulled in ImGui and could not be reached from
+// netvis_tests. The header is now ImGui-free — CategoryStyle::color is a plain
+// uint32_t in IM_COL32 byte order — and CategoryStyle.cpp is compiled into
+// netvis_core, so the suite runs for real. The old note read:)
+// __has_include("imgui.h"). That probe was the honest one to use because the
 // single CMake edit that makes imgui.h reachable to netvis_tests is the same edit
 // that must add CategoryStyle.cpp to its sources; if only half of it lands, the
 // build fails loudly at link rather than quietly passing.
@@ -19,7 +24,7 @@
 // netvis_tests the imgui *headers* and compile src/view/CategoryStyle.cpp
 // directly into the test executable. Deliberately NOT into netvis_core — core is
 // GUI-free by design (spec §9) and must stay that way; CategoryStyle.cpp needs
-// only the ImU32 typedef and the IM_COL32 macro, both header-only, so nothing is
+// only the uint32_t typedef and the IM_COL32 macro, both header-only, so nothing is
 // linked and no layering rule is bent.
 //
 // Until then the compile-time static_asserts in src/view/CategoryStyle.cpp carry
@@ -28,8 +33,6 @@
 // lost while this file is inert is the pinning of concrete colour values.
 
 #include <doctest/doctest.h>
-
-#if __has_include("imgui.h")
 
 #include <cstdint>
 #include <set>
@@ -60,13 +63,21 @@ std::vector<OpCategory> all_categories() {
 // state what it is NOT. Uses the same float multiply-and-truncate as the
 // pre-#104 code, because a rounding difference would make the comparison
 // meaningless.
-ImU32 scaled_by_072(ImU32 c) {
-  const unsigned r = (c >> IM_COL32_R_SHIFT) & 0xFFu;
-  const unsigned g = (c >> IM_COL32_G_SHIFT) & 0xFFu;
-  const unsigned b = (c >> IM_COL32_B_SHIFT) & 0xFFu;
-  return IM_COL32(static_cast<unsigned>(r * 0.72f),
-                  static_cast<unsigned>(g * 0.72f),
-                  static_cast<unsigned>(b * 0.72f), 255);
+// Shifts spelled out rather than using IM_COL32_*_SHIFT: this TU is deliberately
+// ImGui-free (that is what makes it linkable at all). The byte order is ImGui's
+// 0xAABBGGRR, pinned by the explicit-value checks below — if it were wrong,
+// those would fail loudly rather than this helper agreeing with itself.
+uint32_t pack(unsigned r, unsigned g, unsigned b) {
+  return (255u << 24) | (b << 16) | (g << 8) | r;
+}
+
+uint32_t scaled_by_072(uint32_t c) {
+  const unsigned r = c & 0xFFu;
+  const unsigned g = (c >> 8) & 0xFFu;
+  const unsigned b = (c >> 16) & 0xFFu;
+  return pack(static_cast<unsigned>(r * 0.72f),
+              static_cast<unsigned>(g * 0.72f),
+              static_cast<unsigned>(b * 0.72f));
 }
 
 }  // namespace
@@ -99,13 +110,13 @@ TEST_CASE("accessible mode: hue reuse is real, and bounded to the safe set") {
   // colour count is exactly the size of the published palette (so nobody
   // "fixed" the crowding by inventing a ninth hue), and hues genuinely repeat
   // (so the pattern channel is load-bearing rather than decorative).
-  std::set<ImU32> colors;
+  std::set<uint32_t> colors;
   for (OpCategory c : all_categories())
     colors.insert(category_style(c, true, true).color);
   CHECK(colors.size() == 8);
   CHECK(colors.size() < all_categories().size());
 
-  std::set<ImU32> light;
+  std::set<uint32_t> light;
   for (OpCategory c : all_categories())
     light.insert(category_style(c, false, true).color);
   CHECK(light.size() == 8);
@@ -161,8 +172,8 @@ TEST_CASE("accessible light table is explicit, not the dark table * 0.72") {
   // "different somewhere". Conv is Okabe-Ito Blue #0072B2 on dark; the 0.72
   // scale of that is (0,82,128), and the shipped light value is (0,86,138) —
   // chosen to hold contrast against a light canvas rather than to be dimmer.
-  const ImU32 conv_dark = category_style(OpCategory::Conv, true, true).color;
-  const ImU32 conv_light = category_style(OpCategory::Conv, false, true).color;
+  const uint32_t conv_dark = category_style(OpCategory::Conv, true, true).color;
+  const uint32_t conv_light = category_style(OpCategory::Conv, false, true).color;
   CHECK(conv_dark == 0xFFB27200u);   // (0,114,178)
   CHECK(conv_light == 0xFF8A5600u);  // (0,86,138)
   CHECK(conv_light != scaled_by_072(conv_dark));
@@ -170,8 +181,8 @@ TEST_CASE("accessible light table is explicit, not the dark table * 0.72") {
   // Pool is Okabe-Ito Yellow #F0E442, the entry where a uniform scale fails
   // hardest: (172,164,47) is still a pale wash on white, whereas the explicit
   // (176,155,30) is a readable gold that keeps Yellow above Orange in luminance.
-  const ImU32 pool_dark = category_style(OpCategory::Pool, true, true).color;
-  const ImU32 pool_light = category_style(OpCategory::Pool, false, true).color;
+  const uint32_t pool_dark = category_style(OpCategory::Pool, true, true).color;
+  const uint32_t pool_light = category_style(OpCategory::Pool, false, true).color;
   CHECK(pool_dark == 0xFF42E4F0u);   // (240,228,66)
   CHECK(pool_light == 0xFF1E9BB0u);  // (176,155,30)
   CHECK(pool_light != scaled_by_072(pool_dark));
@@ -256,17 +267,3 @@ TEST_CASE("pattern_name is never null and never empty") {
   REQUIRE(fallback != nullptr);
   CHECK(std::string(fallback).size() > 0);
 }
-
-#else  // !__has_include("imgui.h")
-
-// Reported by doctest as SKIPPED, not passed. That distinction is the point: a
-// green run must not imply #104 was verified when the translation unit under
-// test was never linked in. See the header comment for the one-edit fix.
-TEST_CASE(
-    "#104 category palette NOT VERIFIED — netvis_tests cannot reach imgui.h or "
-    "src/view/CategoryStyle.cpp (see file header for the CMake fix)" *
-    doctest::skip()) {
-  FAIL("unreachable: this case is decorated skip()");
-}
-
-#endif  // __has_include("imgui.h")

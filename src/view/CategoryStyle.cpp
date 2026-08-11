@@ -23,6 +23,17 @@
 // tests/test_category_style.cpp for why that caveat exists).
 #include "view/CategoryStyle.h"
 
+// IM_COL32 without including ImGui: the macro is pure bit packing, and
+// reproducing those four shifts here is what keeps this file linkable into
+// netvis_core (and therefore testable). Byte order is ImGui's, so the value is
+// interchangeable with anything IM_COL32 produces.
+namespace {
+constexpr uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  return (static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(b) << 16) |
+         (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(r);
+}
+}  // namespace
+
 #include <cstddef>
 
 namespace netvis {
@@ -222,7 +233,7 @@ CategoryStyle category_style(OpCategory c, bool dark, bool accessible) {
     const Accessible& a = kAccessible[idx];
     const Rgb p = (dark ? kAccessibleDark : kAccessibleLight)
                       [static_cast<size_t>(a.hue)];
-    out.color = IM_COL32(p.r, p.g, p.b, 255);
+    out.color = pack_rgba(p.r, p.g, p.b, 255);
     out.pattern = a.pattern;
     return out;
   }
@@ -236,7 +247,7 @@ CategoryStyle category_style(OpCategory c, bool dark, bool accessible) {
     p.g = static_cast<uint8_t>(p.g * 0.72f);
     p.b = static_cast<uint8_t>(p.b * 0.72f);
   }
-  out.color = IM_COL32(p.r, p.g, p.b, 255);
+  out.color = pack_rgba(p.r, p.g, p.b, 255);
   out.pattern = CategoryPattern::Solid;  // default view gains no new cue.
   return out;
 }

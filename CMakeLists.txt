@@ -184,6 +184,7 @@ file(GLOB_RECURSE NETVIS_CORE_SRC CONFIGURE_DEPENDS
 # ImGui type. Anything that needs ImVec2/ImU32 stays in the GUI target.
 list(APPEND NETVIS_CORE_SRC
   ${CMAKE_SOURCE_DIR}/src/view/SessionStore.cpp   # #103: JSON + filesystem only
+  ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp  # #104: pure colour tables
 )
 
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
@@ -265,7 +266,8 @@ if(NETVIS_BUILD_APP)
   # this target, and since netvis links netvis_core that is a duplicate-symbol
   # link error — the failure mode is confusing enough to be worth this comment.
   list(REMOVE_ITEM NETVIS_VIEW_SRC
-    ${CMAKE_SOURCE_DIR}/src/view/SessionStore.cpp)
+    ${CMAKE_SOURCE_DIR}/src/view/SessionStore.cpp
+    ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp)
 
   # WIN32 => link the GUI subsystem so double-clicking the .exe does NOT open a
   # console window alongside the app (CMake keeps `int main` as the entry via

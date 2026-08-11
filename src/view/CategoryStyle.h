@@ -25,7 +25,6 @@
 #include <cstdint>
 
 #include "engine/OpCategory.h"
-#include "imgui.h"
 
 namespace netvis {
 
@@ -40,7 +39,12 @@ enum class CategoryPattern : uint8_t {
 };
 
 struct CategoryStyle {
-  ImU32 color = 0;
+  // Packed RGBA, ImGui's IM_COL32 byte order (0xAABBGGRR). A plain uint32_t
+  // rather than ImU32 so this header carries NO ImGui dependency and can live in
+  // netvis_core — which is what lets netvis_tests link and actually verify the
+  // palette instead of skipping it. ImU32 IS unsigned int, so every existing
+  // ImGui call site takes this unchanged.
+  uint32_t color = 0;
   CategoryPattern pattern = CategoryPattern::Solid;
 };
 
