@@ -15,6 +15,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
 
@@ -95,6 +96,10 @@
 #include "view/GraphNav.h"
 #include "view/PanelHelpers.h"  // #56: display_index_for_node (re-select on load)
 #include "view/PluginsPanel.h"
+#include "view/Onboarding.h"        // #105: empty state + Help menu
+#include "view/PreferencesPanel.h"  // #102: the unified Settings window
+#include "view/SessionStore.h"      // #103: tabs + camera persistence
+#include "view/ViewHistory.h"       // #106: capture_view / apply_view
 
 // tinyfiledialogs ships only a .c/.h that is NOT on our include path; its two
 // entry points are plain C, so we declare them ourselves (spec §8.7). At link
@@ -133,10 +138,30 @@ ImFont* try_load_font(ImGuiIO& io, float size) {
       "/System/Library/Fonts/SFNS.ttf",
       "C:\\Windows\\Fonts\\segoeui.ttf",
   };
+  // v0.9.4: ImGui's default glyph range is U+0020..U+00FF, so every character
+  // above that renders as the missing-glyph box — which this codebase reads as a
+  // literal '?' on screen. The UI is full of typographic punctuation (em dashes
+  // in DiffPanel, CostPanel, GraphNav and elsewhere), and it has been shipping
+  // broken: an xvfb screenshot of the v0.9.4 empty state showed "what is inside
+  // them ?" where an em dash belonged.
+  //
+  // Rather than hunt every string and flatten it to ASCII — which would have to
+  // be re-policed on every new panel — extend the atlas once with the handful of
+  // punctuation code points the UI actually uses. The array must outlive the
+  // call: ImGui stores the POINTER, so a stack-local range would dangle and
+  // produce a garbled atlas.
+  static const ImWchar kRanges[] = {
+      0x0020, 0x00FF,  // Basic Latin + Latin-1 Supplement (ImGui's default)
+      0x2013, 0x2014,  // en dash, em dash
+      0x2018, 0x201D,  // curly single + double quotes
+      0x2026, 0x2026,  // horizontal ellipsis
+      0x00D7, 0x00D7,  // multiplication sign (the collapse-group "xN" badge)
+      0,
+  };
   for (const char* path : kCandidates) {
     std::ifstream probe(path, std::ios::binary);
     if (!probe) continue;
-    ImFont* f = io.Fonts->AddFontFromFileTTF(path, size);
+    ImFont* f = io.Fonts->AddFontFromFileTTF(path, size, nullptr, kRanges);
     if (f != nullptr) return f;
   }
   return nullptr;
@@ -301,7 +326,20 @@ bool App::init(const std::string& initial_path) {
 
   load_recent();
 
-  if (!initial_path.empty()) open_file(initial_path);
+  if (!initial_path.empty()) {
+    // An explicit CLI path WINS over the remembered session: the user named a
+    // file, and burying it under five restored tabs would ignore what they
+    // asked for.
+    open_file(initial_path);
+  } else if (view().restore_session) {
+    // #103: opt-in, so this is reached only when the pref was persisted on.
+    const size_t skipped = restore_last_session();
+    if (skipped > 0) {
+      add_toast(std::to_string(skipped) +
+                    " remembered file(s) could not be reopened",
+                false);
+    }
+  }
   return true;
 }
 
@@ -329,6 +367,10 @@ int App::run() {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     glfwSwapBuffers(window_);
   }
+
+  // #103: capture the workspace BEFORE teardown, while the tabs and their
+  // cameras still exist. A no-op unless the pref is on.
+  save_session_now();
 
   // Orderly teardown: backends, context, window, GLFW.
   ImGui_ImplOpenGL3_Shutdown();
@@ -414,6 +456,9 @@ void App::frame() {
     ImGuiID right_bottom = ImGui::DockBuilderSplitNode(
         right, ImGuiDir_Down, 0.45f, nullptr, &right);
 
+    // #105: the empty state shares the centre node with the graph/table, so a
+    // first-run user meets it where the content will appear.
+    ImGui::DockBuilderDockWindow("Welcome", center);
     ImGui::DockBuilderDockWindow("Graph", center);
     ImGui::DockBuilderDockWindow("Tensors", center);
     ImGui::DockBuilderDockWindow("Properties", right);
@@ -498,6 +543,16 @@ void App::frame() {
       ImGui::MenuItem("Model diff panel", nullptr, &view().diff_panel_open);
       // Plugins management panel (v0.6.0 #11).
       ImGui::MenuItem("Plugins", nullptr, &view().show_plugins);
+      ImGui::Separator();
+      // #102: the Preferences window gathers every persisted setting. The menu
+      // items above deliberately STAY — this is additive, and removing them
+      // would break the muscle memory of everyone using the app today.
+      ImGui::MenuItem("Preferences...", nullptr, &view().show_preferences);
+      ImGui::EndMenu();
+    }
+    // #105: a Help menu, which the app did not have at all.
+    if (ImGui::BeginMenu("Help")) {
+      draw_help_menu(*this);
       ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -534,9 +589,20 @@ void App::frame() {
   draw_search_results_panel(*this);  // #53: persistent results panel (self-hides)
   draw_status_bar(*this);
   draw_toasts(*this);
+  // v0.9.4: all three self-guard (Preferences and Shortcuts on their ViewState
+  // toggles, the empty state on there being no model), so they are unconditional
+  // here exactly like the panels above.
+  draw_preferences_panel(*this);   // #102
+  draw_empty_state(*this);         // #105
+  draw_shortcuts_window(*this);    // #105
   draw_command_palette(*this);   // #59: Ctrl+P fuzzy action palette (drawn on top)
 
   handle_shortcuts();
+
+  // #106: record AFTER input and panels have run, so this frame's edits are what
+  // gets captured. Cheap when nothing changed — ViewHistory drops a snapshot
+  // identical to the current entry, which is the common case at 120 fps.
+  record_view_history();
 
   // Age out toasts using the frame delta (spec §8.7).
   const float dt = ImGui::GetIO().DeltaTime;
@@ -590,9 +656,27 @@ void App::handle_shortcuts() {
       ImGui::IsKeyPressed(ImGuiKey_E, false)) {
     session().expand_all();
   }
+  // #106: undo/redo. Gated on `typing` because Ctrl+Z inside a text field means
+  // "undo my typing" to every user alive, and stealing it to rewind the graph
+  // would be actively hostile. Ctrl+Y and Ctrl+Shift+Z are both accepted — the
+  // former is the Windows convention, the latter the macOS/Linux one, and a user
+  // should not have to learn which this app picked.
+  if (!typing && io.KeyCtrl && !io.KeyShift &&
+      ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+    undo_view();
+  }
+  if (!typing && io.KeyCtrl &&
+      (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
+       (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)))) {
+    redo_view();
+  }
+
   if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
     view().search_open = false;
     command_palette_open_ = false;
+    // Escape also closes the two v0.9.4 windows, matching every other overlay.
+    view().show_preferences = false;
+    view().show_shortcuts = false;
   }
 }
 
@@ -917,36 +1001,147 @@ void App::preview_tensor_quant_block(uint32_t block_index) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.4 — undo/redo, session, category style
+// ---------------------------------------------------------------------------
+
+// #106. Called once per frame at the end of frame(), so a change made this frame
+// becomes the next undo target.
+void App::record_view_history() {
+  Tab* tab = tabs_[active_tab_].get();
+  ViewState& vs = tab->view;
+
+  // The frame that APPLIES an undo must not record its result: the ring would
+  // then hold the restored state as a fresh entry and redo would be unreachable.
+  // (ViewHistory's identical-drop already tolerates this, but skipping keeps the
+  // camera-coalescing run state clean.)
+  if (vs.suppress_history) {
+    vs.suppress_history = false;
+    return;
+  }
+  if (tab->session->model() == nullptr) return;
+
+  if (!vs.history) vs.history = std::make_unique<ViewHistory>();
+
+  // A history entry is only applicable within one (generation, graph): IR node
+  // indices and CollapseTree group indices are both assigned per build. Rather
+  // than let apply_view() refuse entry after entry, drop the ring outright when
+  // the model or the graph moves — offering the user undo steps that silently do
+  // nothing is worse than offering none.
+  const uint64_t gen = tab->session->generation();
+  const uint32_t graph = tab->session->current_graph();
+  if (vs.history_owner_generation != gen || vs.history_owner_graph != graph) {
+    vs.history->clear();
+    vs.history_owner_generation = gen;
+    vs.history_owner_graph = graph;
+  }
+
+  vs.history->push(capture_view(vs, *tab->session));
+}
+
+namespace {
+
+// Shared by undo_view/redo_view: apply a stepped-to snapshot, or step back if it
+// turns out not to be applicable. `step` returns the entry to try.
+template <typename StepFn>
+void step_history(App& app, ViewState& vs, ModelSession& session, StepFn step) {
+  if (!vs.history) return;
+  const ViewSnapshot* s = step();
+  if (s == nullptr) return;
+  // apply_view refuses a snapshot whose (generation, graph) or collapse-bitset
+  // size does not match the live session. That should not happen — the ring is
+  // cleared on both changes — but a refusal must not leave the cursor moved onto
+  // an entry that was never applied, so report it rather than failing silently.
+  if (!apply_view(*s, vs, session)) {
+    app.add_toast("Cannot undo across a model or graph change", true);
+    vs.history->clear();
+    return;
+  }
+  vs.suppress_history = true;
+}
+
+}  // namespace
+
+void App::undo_view() {
+  Tab* tab = tabs_[active_tab_].get();
+  ViewState& vs = tab->view;
+  step_history(*this, vs, *tab->session,
+               [&]() { return vs.history ? vs.history->undo() : nullptr; });
+}
+
+void App::redo_view() {
+  Tab* tab = tabs_[active_tab_].get();
+  ViewState& vs = tab->view;
+  step_history(*this, vs, *tab->session,
+               [&]() { return vs.history ? vs.history->redo() : nullptr; });
+}
+
+// #103. Writes nothing when the pref is off, so disabling restore also stops the
+// file being maintained (clearing it is clear_session's job, called on the
+// toggle itself).
+void App::save_session_now() {
+  if (!view().restore_session) return;
+  SessionState s;
+  s.active_tab = active_tab_;
+  for (const std::unique_ptr<Tab>& t : tabs_) {
+    if (!t || !t->session) continue;
+    SessionTab st;
+    st.path = t->session->path();
+    st.pan_x = t->view.cam.pan.x;
+    st.pan_y = t->view.cam.pan.y;
+    st.zoom = t->view.cam.zoom;
+    s.tabs.push_back(std::move(st));
+  }
+  save_session(s);
+}
+
+size_t App::restore_last_session() {
+  const SessionState s = load_session();
+  if (s.tabs.empty()) return 0;
+
+  size_t skipped = 0;
+  size_t opened = 0;
+  for (const SessionTab& st : s.tabs) {
+    // A remembered file may have been moved or deleted since. Skipping is the
+    // only sane behaviour: a launch must not fail because one of five remembered
+    // models is gone. The count is returned so the caller can say so.
+    std::error_code ec;
+    if (!std::filesystem::exists(st.path, ec) || ec) {
+      ++skipped;
+      continue;
+    }
+    open_file(st.path);
+    // open_file() may have created a tab; the camera belongs to whichever tab is
+    // now active. The model is still loading, but the camera is view state and
+    // is applied immediately — the canvas simply uses it once boxes exist.
+    view().cam.pan = ImVec2(st.pan_x, st.pan_y);
+    view().cam.zoom = st.zoom;
+    ++opened;
+  }
+  if (opened > 0 && s.active_tab < tabs_.size()) switch_tab(s.active_tab);
+  return skipped;
+}
+
+// #104. The single place the live palette is resolved, so the canvas, legend and
+// minimap cannot disagree about what a category looks like.
+CategoryStyle App::category_style_for(OpCategory c) const {
+  return category_style(c, tabs_[active_tab_]->view.dark_theme,
+                        tabs_[active_tab_]->view.accessible_palette);
+}
+
+// ---------------------------------------------------------------------------
 // Op-category palette (spec §8.1)
 // ---------------------------------------------------------------------------
 ImU32 App::category_color(OpCategory c, bool dark) {
-  // Dark-first palette: distinct, moderately saturated hues so adjacent node
-  // categories read apart at a glance. Indexed by OpCategory order.
-  struct RGB { uint8_t r, g, b; };
-  static const RGB kPalette[] = {
-      {/*Conv*/ 79, 143, 247},    {/*MatMul*/ 138, 110, 246},
-      {/*Activation*/ 76, 201, 176}, {/*Norm*/ 232, 168, 56},
-      {/*Pool*/ 90, 179, 90},     {/*Elementwise*/ 224, 108, 118},
-      {/*Shape*/ 120, 130, 148},  {/*Reduce*/ 210, 120, 200},
-      {/*Tensor*/ 150, 160, 90},  {/*ControlFlow*/ 200, 90, 130},
-      {/*IO*/ 96, 172, 214},
-      // v0.4.0 categories — MUST stay index-aligned with the OpCategory enum,
-      // inserted before Other (see OpCategory.h). Distinct hues from the above.
-      {/*Attention*/ 216, 100, 208}, {/*Recurrent*/ 96, 190, 150},
-      {/*Quantize*/ 214, 178, 72},
-      {/*Other*/ 128, 128, 136},
-  };
-  int idx = static_cast<int>(c);
-  if (idx < 0 || idx >= static_cast<int>(sizeof(kPalette) / sizeof(kPalette[0])))
-    idx = static_cast<int>(OpCategory::Other);
-  RGB p = kPalette[idx];
-  if (!dark) {
-    // On a light theme, darken the hue so text/edges keep contrast.
-    p.r = static_cast<uint8_t>(p.r * 0.72f);
-    p.g = static_cast<uint8_t>(p.g * 0.72f);
-    p.b = static_cast<uint8_t>(p.b * 0.72f);
-  }
-  return IM_COL32(p.r, p.g, p.b, 255);
+  // v0.9.4: the palette moved to view/CategoryStyle.cpp, which also owns the
+  // accessible variant (#104). This delegates rather than keeping a second copy
+  // of the fifteen-entry table — two tables would silently drift, and only one
+  // of them has tests pinning its values.
+  //
+  // Kept as a function because existing call sites use it and it is the
+  // colour-only question. Anything that should honour the user's accessibility
+  // setting must call App::category_style_for instead, which threads
+  // ViewState::accessible_palette through.
+  return category_style(c, dark, /*accessible=*/false).color;
 }
 
 // ---------------------------------------------------------------------------
@@ -987,7 +1182,7 @@ void App::save_view_state(const std::string& path) {
   nlohmann::json j;
   j["kind"] = "netvis-view";
   j["version"] = 1;
-  j["model"] = s.path();          // informational — which model this view was for
+  j["model"] = s.path();          // informational - which model this view was for
   j["graph"] = s.current_graph();
   j["cam"] = {{"pan_x", vs.cam.pan.x}, {"pan_y", vs.cam.pan.y},
               {"zoom", vs.cam.zoom}};
@@ -1009,7 +1204,11 @@ void App::save_view_state(const std::string& path) {
 
   std::ofstream f(path);
   if (f) {
-    f << j.dump(2);
+    // `replace` rather than the default strict UTF-8 handler: this document
+    // carries the model PATH, and a path is not guaranteed valid UTF-8 on Linux.
+    // Strict would throw out of a save the user explicitly asked for. See
+    // save_recent for the full reasoning.
+    f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
     add_toast("View saved", false);
   } else {
     add_toast("Could not write view file", true);
@@ -1054,7 +1253,7 @@ void App::load_view_state(const std::string& path) {
     const bool same_model = m != nullptr && saved_model == s.path();
     if (!same_model) {
       add_toast(m == nullptr ? "View loaded (open a model to restore selection)"
-                             : "View loaded (camera only — saved for another model)",
+                             : "View loaded (camera only - saved for another model)",
                 false);
       return;
     }
@@ -1155,10 +1354,28 @@ void App::load_recent() {
 }
 
 void App::save_recent() {
-  nlohmann::json j = nlohmann::json::array();
-  for (const std::string& s : recent_) j.push_back(s);
-  std::ofstream f(layout_cache_dir() + "/recent.json");
-  if (f) f << j.dump(2);
+  // CRASH GUARD (v0.9.4). nlohmann's dump() defaults to the STRICT UTF-8 error
+  // handler and throws type_error.316 on a string that is not valid UTF-8. The
+  // strings here are filesystem PATHS, which on Linux are byte sequences with no
+  // encoding guarantee at all — so opening a file whose path contains invalid
+  // UTF-8 threw out of save_recent, through add_recent, through open_file, and
+  // terminated the app. A file viewer must not die because of the name of a file
+  // it was asked to view.
+  //
+  // `replace` substitutes U+FFFD instead of throwing: the recent list is a
+  // convenience, and a slightly mangled entry is enormously better than a crash.
+  // The catch is still there for anything else dump() might raise.
+  try {
+    nlohmann::json j = nlohmann::json::array();
+    for (const std::string& s : recent_) j.push_back(s);
+    const std::string text =
+        j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+    std::ofstream f(layout_cache_dir() + "/recent.json");
+    if (f) f << text;
+  } catch (...) {
+    // Best-effort, exactly like save_prefs: failing to persist a convenience
+    // must never interrupt the user.
+  }
 }
 
 void App::add_recent(const std::string& path) {
@@ -1220,6 +1437,13 @@ void App::save_prefs() {
   j["plugins"] = plugin_enabled_.to_json();
   // #4/#30 (v0.8.3): custom roofline ridge + named machine profiles.
   j["edge_routing"] = view().edge_routing;  // #22 (v0.9.0)
+  // v0.9.4: the settings a user sets once and expects to survive a restart. The
+  // two WINDOW toggles (show_preferences/show_shortcuts) are deliberately NOT
+  // here — a settings window that reopens itself every launch is a nuisance, not
+  // a restored preference.
+  j["accessible_palette"] = view().accessible_palette;  // #104
+  j["ui_scale"] = view().ui_scale;                      // #104
+  j["restore_session"] = view().restore_session;        // #103
   if (view().custom_ridge > 0.0) j["custom_ridge"] = view().custom_ridge;
   if (!view().machine_profiles.empty()) {
     nlohmann::json profs = nlohmann::json::array();
@@ -1228,7 +1452,10 @@ void App::save_prefs() {
     j["machine_profiles"] = profs;
   }
   std::ofstream f(layout_cache_dir() + "/view_prefs.json");
-  if (f) f << j.dump(2);
+  // `replace` for the same reason as save_recent: machine-profile names are
+  // free text the user can paste into, so strict UTF-8 could throw out of a
+  // routine preference save.
+  if (f) f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 void App::load_prefs() {
@@ -1281,6 +1508,19 @@ void App::load_prefs() {
     if (j.contains("edge_routing") && j["edge_routing"].is_number_integer()) {
       int er = j["edge_routing"].get<int>();
       if (er >= 0 && er <= 2) view().edge_routing = er;
+    }
+    if (j.contains("accessible_palette") && j["accessible_palette"].is_boolean())
+      view().accessible_palette = j["accessible_palette"].get<bool>();
+    if (j.contains("restore_session") && j["restore_session"].is_boolean())
+      view().restore_session = j["restore_session"].get<bool>();
+    // CLAMPED on load, not merely on edit. A persisted 0, a negative, or a NaN
+    // would render an unusable window — and the setting that caused it lives
+    // inside that window, so the user could not reach it to undo the damage.
+    // Written as !(in range) so NaN is rejected too, where a naive comparison
+    // would let it through.
+    if (j.contains("ui_scale") && j["ui_scale"].is_number()) {
+      const float sc = j["ui_scale"].get<float>();
+      view().ui_scale = !(sc >= 0.75f && sc <= 2.0f) ? 1.0f : sc;
     }
     if (j.contains("custom_ridge") && j["custom_ridge"].is_number())
       view().custom_ridge = j["custom_ridge"].get<double>();

@@ -174,6 +174,19 @@ file(GLOB_RECURSE NETVIS_CORE_SRC CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/parsers/*.cpp
   ${CMAKE_SOURCE_DIR}/src/engine/*.cpp)
 
+# v0.9.4: a few files live under src/view/ by topic but carry NO ImGui/GLFW
+# dependency, and belong in the core library so netvis_tests (which links
+# netvis_core only) can actually exercise them. Without this their tests compile
+# and then fail to LINK, which is worse than having no test: it breaks the build
+# while appearing to add coverage.
+#
+# The bar for this list is strict — the file must include no view header and no
+# ImGui type. Anything that needs ImVec2/ImU32 stays in the GUI target.
+list(APPEND NETVIS_CORE_SRC
+  ${CMAKE_SOURCE_DIR}/src/view/SessionStore.cpp   # #103: JSON + filesystem only
+  ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp  # #104: pure colour tables
+)
+
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
 target_include_directories(netvis_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(netvis_core
@@ -247,6 +260,14 @@ if(NETVIS_BUILD_APP)
 
   file(GLOB_RECURSE NETVIS_VIEW_SRC CONFIGURE_DEPENDS
     ${CMAKE_SOURCE_DIR}/src/view/*.cpp)
+
+  # Drop the files already compiled into netvis_core (see the list above the
+  # add_library call). The glob would otherwise compile them a SECOND time into
+  # this target, and since netvis links netvis_core that is a duplicate-symbol
+  # link error — the failure mode is confusing enough to be worth this comment.
+  list(REMOVE_ITEM NETVIS_VIEW_SRC
+    ${CMAKE_SOURCE_DIR}/src/view/SessionStore.cpp
+    ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp)
 
   # WIN32 => link the GUI subsystem so double-clicking the .exe does NOT open a
   # console window alongside the app (CMake keeps `int main` as the entry via

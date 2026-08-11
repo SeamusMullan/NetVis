@@ -387,8 +387,18 @@ TEST_CASE("#97 peak_rss_bytes: honest 0-or-plausible; peak >= current when known
   // counter IS available, the high-water mark can never read BELOW the
   // current snapshot — peak is monotonic non-decreasing for the process
   // lifetime (Rss.h's PLATFORM NOTE). That is the whole of what is checked.
-  uint64_t peak = peak_rss_bytes();
+  // ORDER MATTERS, and getting it wrong made this test flaky. It used to read
+  // peak first and current second, which is a time-of-check race against the
+  // process itself: anything allocated between the two reads raises `current`
+  // above a `peak` that was sampled before the growth. CI caught it exactly
+  // once, off by a single 4 KiB page (44249088 >= 44253184).
+  //
+  // Reading current FIRST makes the assertion sound rather than merely
+  // usually-true: peak is monotonic non-decreasing, so a peak sampled LATER
+  // necessarily covers any current sampled earlier, whatever the process did in
+  // between.
   uint64_t current = current_rss_bytes();
+  uint64_t peak = peak_rss_bytes();
   if (peak == 0) {
     CHECK(peak == 0);  // unknown platform counter; nothing further to assert
   } else {

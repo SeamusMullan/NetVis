@@ -30,8 +30,15 @@ namespace {
 //       and multiple boxes may share a display_id (consumers key off display_id).
 //   v4: symmetric x-alignment (true median + centered overlap resolution) and a
 //       de-shear pass that removes the systematic rightward drift.
+//   v5 (#122): barycenter early-stop now rolls back to the best ordering seen.
+//       Previously the loop broke AFTER a sweep had already permuted the layers,
+//       so a sweep that failed to reduce crossings had its worse ordering
+//       published. Node positions change for any graph whose final sweep did not
+//       improve — which at the 100k rung is every graph, since exactly one sweep
+//       runs and it does not improve. Without this bump a stale .nvl would hide
+//       the fix entirely.
 constexpr uint32_t kMagic = 0x4C56454Eu;  // "NEVL" little-endian
-constexpr uint32_t kVersion = 4;
+constexpr uint32_t kVersion = 5;
 
 // On-disk header. POD, written/read verbatim. All fields little-endian on the
 // platforms we target (x86-64 / arm64); the cache is machine-local so we do not

@@ -572,10 +572,26 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   {
     uint64_t best = count_crossings();
     int sweeps = std::max(0, params.barycenter_sweeps);
+    // #122: a sweep PERMUTES `layers` before its result can be judged, so the
+    // early-stop below cannot simply break — that would publish the ordering the
+    // sweep just made WORSE. Standard Sugiyama keeps the best ordering seen, so
+    // the pre-sweep state (which is the best so far, since the loop only
+    // continues on a strict improvement) is snapshotted and restored when the
+    // sweep fails to beat it.
+    //
+    // Cost is one copy of the layer items per sweep, not per layer: ~450 KB at
+    // the 100k rung against a sweep that is already tens of milliseconds. Copying
+    // only on improvement would be the same count in the common case and would
+    // leave the losing sweep's permutation live at the moment we need to undo it.
+    //
+    // Exhausting the sweep budget needs no restore: every iteration that does not
+    // break ended with c < best, so the final state IS the best seen.
+    std::vector<uint32_t> best_items;
     for (int s = 0; s < sweeps; ++s) {
       // #61: poll cancellation once per sweep (the sweep loop is the dominant
       // cost on large graphs). Coarse-grained: never inside the per-layer loops.
       if (progress && progress->cancelled()) return make_cancelled();
+      best_items = layers.items;
       // Down sweep: order each layer by predecessor barycenters, top->bottom.
       for (size_t li = 1; li < L; ++li) barycenter_sort(li, /*use_preds=*/true);
       refresh_order();
@@ -583,7 +599,12 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
       for (size_t li = L; li-- > 0;) barycenter_sort(li, /*use_preds=*/false);
       refresh_order();
       uint64_t c = count_crossings();
-      if (c >= best) break;  // early-stop: no improvement
+      if (c >= best) {
+        // No improvement: roll back to the ordering that produced `best`.
+        layers.items = std::move(best_items);
+        refresh_order();
+        break;
+      }
       best = c;
     }
   }
