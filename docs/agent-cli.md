@@ -147,6 +147,19 @@ The footprint case drives eight distinct models through the default cap-4
 cache and reports RSS at cap and after the churn — the growth stays bounded by
 the cap, not by how many models the session touches.
 
+The repo is also installable as a **Claude Code plugin**: it doubles as its
+own single-plugin marketplace, so
+
+```
+/plugin marketplace add SeamusMullan/NetVis
+/plugin install netvis@netvis
+```
+
+registers the server for every session. The plugin launches an in-checkout
+build when one exists (`build/core` or `build/release`) and falls back to a
+`netvis_mcp` on PATH, so build once and it just works; `/mcp` shows the
+connection status.
+
 When the server is not running, it costs nothing: MCP state lives only inside
 the server object, the tool table is built lazily on first use, and none of
 the engine paths the performance table gates were touched — the engine ladder

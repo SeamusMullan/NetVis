@@ -1,0 +1,13 @@
+{
+  "name": "netvis",
+  "owner": {
+    "name": "NetVis"
+  },
+  "plugins": [
+    {
+      "name": "netvis",
+      "source": "./",
+      "description": "Model-file analysis tools (structure, shapes, weight stats, cost, diff) over the NetVis zero-payload parser."
+    }
+  ]
+}
