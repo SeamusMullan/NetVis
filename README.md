@@ -114,7 +114,10 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   search, connectivity, per-node cost ranking, model diff — so scripts and
   coding agents can analyze and debug a model with no display. Stateless by
   design (instant open makes re-opening per call free) and zero payload reads
-  except the explicit `tensor` verb. See `docs/agent-cli.md`.
+  except the explicit `tensor` verb. The same surface is served as **MCP
+  tools** over stdio by `netvis_mcp` (also `netvis mcp` / `netvis_query mcp`),
+  with an LRU model cache so an agent session parses a multi-gigabyte file
+  once. See `docs/agent-cli.md`.
 - Dark/light themes, **multi-model tabs**, a **command palette**, async first-layout
   with progress + cancel, recent files, drag-and-drop, CLI open, and a status bar
   with per-stage load timings and the format-detection reason.

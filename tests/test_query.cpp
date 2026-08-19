@@ -17,7 +17,10 @@
 #include <nlohmann/json.hpp>
 
 #include "core/ByteReader.h"
+#include "engine/CostModel.h"
+#include "engine/GraphAdjacency.h"
 #include "engine/QueryCli.h"
+#include "engine/SearchIndex.h"
 
 using namespace netvis;
 using json = nlohmann::json;
@@ -172,6 +175,27 @@ TEST_CASE("Query: table-mode models answer through flat_tensors") {
   // Graph verbs on a graph-less model fail loudly instead of faking a graph.
   Result<std::string> io = run_query({"io", kSafetensors});
   CHECK(!io);
+}
+
+TEST_CASE("Query: derived analyses are memoized per model") {
+  if (!have(kOnnx)) return;
+  Result<HeadlessModel> hm = load_model_headless(kOnnx);
+  REQUIRE(hm);
+
+  // Address stability across calls is the memoization contract a session host
+  // (the MCP server) relies on: one build per analysis per model, not per call.
+  const CostReport* cost = &hm->cost_for(0);
+  CHECK(cost == &hm->cost_for(0));
+  const GraphAdjacency* adj = &hm->adjacency_for(0);
+  CHECK(adj == &hm->adjacency_for(0));
+  const SearchIndex* search = &hm->search_index();
+  CHECK(search == &hm->search_index());
+
+  // Memoized analyses stay structural: still not one payload byte.
+  ByteReader::payload_read_counter() = 0;
+  (void)hm->cost_for(0);
+  (void)hm->search_index();
+  CHECK(ByteReader::payload_read_counter() == 0);
 }
 
 TEST_CASE("Query: malformed invocations fail loudly, never silently") {

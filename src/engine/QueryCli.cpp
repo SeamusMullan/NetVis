@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <unordered_map>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -30,6 +31,47 @@
 #include "parsers/Parser.h"
 
 namespace netvis {
+
+// Memoized derived analyses, built on first use. Lives behind a unique_ptr so
+// the header stays light and a HeadlessModel that never gets queried never
+// allocates any of this.
+struct DerivedAnalyses {
+  std::unordered_map<uint32_t, CostReport> cost;
+  std::unordered_map<uint32_t, GraphAdjacency> adjacency;
+  std::unique_ptr<SearchIndex> search;
+};
+
+HeadlessModel::HeadlessModel() = default;
+HeadlessModel::HeadlessModel(HeadlessModel&&) noexcept = default;
+HeadlessModel& HeadlessModel::operator=(HeadlessModel&&) noexcept = default;
+HeadlessModel::~HeadlessModel() = default;
+
+const CostReport& HeadlessModel::cost_for(uint32_t graph_index) const {
+  if (!derived_) derived_ = std::make_unique<DerivedAnalyses>();
+  auto it = derived_->cost.find(graph_index);
+  if (it == derived_->cost.end())
+    it = derived_->cost.emplace(graph_index, compute_cost(model, graph_index)).first;
+  return it->second;
+}
+
+const GraphAdjacency& HeadlessModel::adjacency_for(uint32_t graph_index) const {
+  if (!derived_) derived_ = std::make_unique<DerivedAnalyses>();
+  auto it = derived_->adjacency.find(graph_index);
+  if (it == derived_->adjacency.end()) {
+    it = derived_->adjacency.emplace(graph_index, GraphAdjacency()).first;
+    it->second.build(model, graph_index);
+  }
+  return it->second;
+}
+
+const SearchIndex& HeadlessModel::search_index() const {
+  if (!derived_) derived_ = std::make_unique<DerivedAnalyses>();
+  if (!derived_->search) {
+    derived_->search = std::make_unique<SearchIndex>();
+    derived_->search->build(model);
+  }
+  return *derived_->search;
+}
 
 namespace {
 
@@ -275,7 +317,7 @@ Result<std::string> verb_nodes(const HeadlessModel& hm, const Options& o) {
   const std::string* op = o.flag("op");
   std::string contains = o.flag("contains") ? lower(*o.flag("contains")) : std::string();
 
-  const CostReport cost = compute_cost(hm.model, *gi);
+  const CostReport& cost = hm.cost_for(*gi);
 
   json rows = json::array();
   uint64_t matched = 0;
@@ -329,7 +371,7 @@ Result<std::string> verb_node(const HeadlessModel& hm, const Options& o) {
     attrs.push_back(attr_json(hm.model, g.attributes[n.attributes.begin + a]));
   j["attributes"] = std::move(attrs);
 
-  const CostReport cost = compute_cost(hm.model, *gi);
+  const CostReport& cost = hm.cost_for(*gi);
   if (*ni < cost.per_node.size()) {
     const NodeCost& c = cost.per_node[*ni];
     json cj;
@@ -341,8 +383,7 @@ Result<std::string> verb_node(const HeadlessModel& hm, const Options& o) {
     j["cost"] = std::move(cj);
   }
 
-  GraphAdjacency adj;
-  adj.build(hm.model, *gi);
+  const GraphAdjacency& adj = hm.adjacency_for(*gi);
   auto emit_nodes = [&](const std::vector<uint32_t>& ids) {
     json arr = json::array();
     for (uint32_t id : ids) {
@@ -469,11 +510,10 @@ Result<std::string> verb_search(const HeadlessModel& hm, const Options& o) {
     limit = *v;
   }
 
-  SearchIndex index;
-  index.build(hm.model);
+  const SearchIndex& index = hm.search_index();
   // types_ready=true is safe here: shape inference already ran synchronously in
-  // load_model_headless, and this process is single-threaded — the data race
-  // the GUI guards against cannot occur.
+  // load_model_headless, and the query dispatch is single-threaded — the data
+  // race the GUI guards against cannot occur.
   std::vector<SearchHit> hits = index.query(o.positional[1], hm.model, true, limit);
 
   json rows = json::array();
@@ -522,8 +562,7 @@ Result<std::string> verb_neighbors(const HeadlessModel& hm, const Options& o) {
   if (dir != "in" && dir != "out" && dir != "both")
     return err("query neighbors: --dir expects in|out|both");
 
-  GraphAdjacency adj;
-  adj.build(hm.model, *gi);
+  const GraphAdjacency& adj = hm.adjacency_for(*gi);
   auto emit = [&](const std::vector<uint32_t>& ids) {
     json arr = json::array();
     for (uint32_t id : ids) {
@@ -567,7 +606,7 @@ Result<std::string> verb_cost(const HeadlessModel& hm, const Options& o) {
       by != "intensity")
     return err("query cost: --by expects flops|params|weight_bytes|act_bytes|intensity");
 
-  const CostReport cost = compute_cost(hm.model, *gi);
+  const CostReport& cost = hm.cost_for(*gi);
   std::vector<uint32_t> order(cost.per_node.size());
   for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
   auto key = [&](uint32_t i) -> double {
@@ -608,16 +647,17 @@ Result<std::string> verb_cost(const HeadlessModel& hm, const Options& o) {
 }
 
 // Model diff — the GUI's added/removed/changed tinting as JSON. The second
-// model loads through the same headless pipeline as the first, so both sides
-// are shape-inferred identically.
-Result<std::string> verb_diff(const HeadlessModel& hm, const Options& o) {
+// model loads through the same provider as the first, so both sides are
+// shape-inferred identically (and share the host's cache when there is one).
+Result<std::string> verb_diff(const HeadlessModel& hm, const Options& o,
+                              const ModelProvider& provider) {
   if (o.positional.size() < 2) return err("query diff: expected <model-a> <model-b>");
-  auto other = load_model_headless(o.positional[1]);
+  auto other = provider(o.positional[1]);
   if (!other) return other.error();
 
   auto gi = resolve_graph(hm, o);
   if (!gi) return gi.error();
-  if (!other->model.has_graph || other->model.graphs.empty())
+  if (!(*other)->model.has_graph || (*other)->model.graphs.empty())
     return err("query diff: comparison model has no compute graph");
 
   uint64_t limit = 100;
@@ -631,12 +671,12 @@ Result<std::string> verb_diff(const HeadlessModel& hm, const Options& o) {
     return err("query diff: --match expects name|topology");
 
   const ModelDiffResult d =
-      diff_models(hm.model, *gi, other->model, 0,
+      diff_models(hm.model, *gi, (*other)->model, 0,
                   match == "name" ? DiffMatch::NameThenTopology : DiffMatch::TopologyOnly);
   if (!d.valid) return err("query diff: graph index out of range");
 
   json j = envelope("diff", hm);
-  j["model_b"] = other->display_path;
+  j["model_b"] = (*other)->display_path;
   j["graph"] = *gi;
   j["match"] = match;
   j["same"] = d.same;
@@ -647,7 +687,7 @@ Result<std::string> verb_diff(const HeadlessModel& hm, const Options& o) {
   // The change lists an agent acts on. Capped by --limit per list; the counts
   // above are always exact.
   const ir::Graph& ga = hm.model.graphs[*gi];
-  const ir::Graph& gb = other->model.graphs[0];
+  const ir::Graph& gb = (*other)->model.graphs[0];
   auto emit = [&](const ir::Model& m, const ir::Graph& g, const std::vector<DiffStatus>& st,
                   DiffStatus want) {
     json arr = json::array();
@@ -663,7 +703,7 @@ Result<std::string> verb_diff(const HeadlessModel& hm, const Options& o) {
   };
   j["changed_nodes"] = emit(hm.model, ga, d.a_status, DiffStatus::Changed);
   j["removed_nodes"] = emit(hm.model, ga, d.a_status, DiffStatus::Removed);
-  j["added_nodes"] = emit(other->model, gb, d.b_status, DiffStatus::Added);
+  j["added_nodes"] = emit((*other)->model, gb, d.b_status, DiffStatus::Added);
   return j.dump();
 }
 
@@ -698,6 +738,14 @@ Result<HeadlessModel> load_model_headless(const std::string& path) {
 }
 
 Result<std::string> run_query(const std::vector<std::string>& args) {
+  return run_query(args, [](const std::string& path) -> Result<std::shared_ptr<HeadlessModel>> {
+    Result<HeadlessModel> hm = load_model_headless(path);
+    if (!hm) return hm.error();
+    return std::make_shared<HeadlessModel>(hm.take());
+  });
+}
+
+Result<std::string> run_query(const std::vector<std::string>& args, const ModelProvider& provider) {
   if (args.empty())
     return err(
         "query: expected a verb "
@@ -722,19 +770,19 @@ Result<std::string> run_query(const std::vector<std::string>& args) {
   if (!opts) return opts.error();
   if (opts->positional.empty()) return err("query " + verb + ": expected a model file path");
 
-  auto hm = load_model_headless(opts->positional[0]);
+  auto hm = provider(opts->positional[0]);
   if (!hm) return hm.error();
 
-  if (verb == "summary") return verb_summary(*hm);
-  if (verb == "io") return verb_io(*hm, *opts);
-  if (verb == "nodes") return verb_nodes(*hm, *opts);
-  if (verb == "node") return verb_node(*hm, *opts);
-  if (verb == "tensors") return verb_tensors(*hm, *opts);
-  if (verb == "tensor") return verb_tensor(*hm, *opts);
-  if (verb == "search") return verb_search(*hm, *opts);
-  if (verb == "cost") return verb_cost(*hm, *opts);
-  if (verb == "diff") return verb_diff(*hm, *opts);
-  return verb_neighbors(*hm, *opts);
+  if (verb == "summary") return verb_summary(**hm);
+  if (verb == "io") return verb_io(**hm, *opts);
+  if (verb == "nodes") return verb_nodes(**hm, *opts);
+  if (verb == "node") return verb_node(**hm, *opts);
+  if (verb == "tensors") return verb_tensors(**hm, *opts);
+  if (verb == "tensor") return verb_tensor(**hm, *opts);
+  if (verb == "search") return verb_search(**hm, *opts);
+  if (verb == "cost") return verb_cost(**hm, *opts);
+  if (verb == "diff") return verb_diff(**hm, *opts, provider);
+  return verb_neighbors(**hm, *opts);
 }
 
 bool wants_query(int argc, char** argv) {

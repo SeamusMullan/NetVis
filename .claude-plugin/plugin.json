@@ -1,0 +1,16 @@
+{
+  "name": "netvis",
+  "version": "1.0.0",
+  "displayName": "NetVis",
+  "author": {
+    "name": "NetVis contributors"
+  },
+  "description": "Analyze neural-network model files from the agent: graph structure, shapes, weight stats, search, per-node cost and model diffs, served as MCP tools over an instant zero-payload parser.",
+  "repository": "https://github.com/SeamusMullan/NetVis",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "mcpServers": {
+    "netvis": {
+      "command": "netvis_mcp"
+    }
+  }
+}

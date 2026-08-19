@@ -189,6 +189,9 @@ list(APPEND NETVIS_CORE_SRC
 
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
 target_include_directories(netvis_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+# Version string for headless surfaces (the MCP serverInfo). Same value CPack
+# stamps on installers, so a served version always matches the artifact's.
+target_compile_definitions(netvis_core PUBLIC NETVIS_VERSION_STRING="${NETVIS_VERSION}")
 target_link_libraries(netvis_core
   PUBLIC nlohmann_json::nlohmann_json netvis_sanitize
   PRIVATE netvis_warnings)
@@ -364,6 +367,26 @@ target_include_directories(netvis_query PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(netvis_query PRIVATE netvis_warnings)
 
 # =============================================================================
+#  netvis_mcp — MCP server over the query engine. Links only netvis_core.
+#
+#  MCP clients spawn their servers over stdio and own the process for the
+#  session, so this is the binary an agent's server configuration points at.
+#  The GUI binary (`netvis mcp`) and netvis_query (`netvis_query mcp`) start
+#  the identical loop from engine/McpServer.h, so all three entries are
+#  interchangeable and cannot drift. Deliberately NOT gated on NETVIS_BUILD_APP.
+# =============================================================================
+add_executable(netvis_mcp ${CMAKE_SOURCE_DIR}/src/mcp_main.cpp)
+target_link_libraries(netvis_mcp PRIVATE netvis_core)
+target_include_directories(netvis_mcp PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(netvis_mcp PRIVATE netvis_warnings)
+
+# The headless binaries ship in the per-OS installers alongside the app: an MCP
+# client resolves `netvis_mcp` from PATH on every platform (bare names get the
+# platform's executable-extension handling for free, exactly like npx-style
+# servers), so distribution is what makes the plugin work out of the box.
+install(TARGETS netvis_query netvis_mcp RUNTIME DESTINATION bin)
+
+# =============================================================================
 #  netvis_tests — links only netvis_core (spec §9, headless ctest).
 # =============================================================================
 if(NETVIS_BUILD_TESTS)
@@ -438,7 +461,9 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_PACKAGE_NAME "NetVis")
     set(CPACK_NSIS_DISPLAY_NAME "NetVis")
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
-    set(CPACK_NSIS_MODIFY_PATH OFF)
+    # ON: the installer offers to add bin/ to PATH, which is what lets an MCP
+    # client resolve `netvis_mcp` by bare name after a normal install.
+    set(CPACK_NSIS_MODIFY_PATH ON)
     # Installer + Add/Remove-Programs icon (the exe's own icon is embedded via the
     # .rc). MUI_ICON/UNICON must be a valid multi-size .ico.
     set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/assets/netvis.ico")

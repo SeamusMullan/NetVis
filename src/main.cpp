@@ -13,6 +13,8 @@
 //   * Headless query (`netvis query <verb> ...`): the agent-facing analysis CLI —
 //     one structural question per invocation, one line of JSON out. Same
 //     headless contract; see engine/QueryCli.h and docs/agent-cli.md.
+//   * MCP server (`netvis mcp`): serve the same query surface to MCP clients
+//     over stdio until EOF. See engine/McpServer.h.
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -23,6 +25,7 @@
 // App.h) but not included there; pre-include it so App.h compiles.
 #include "engine/Bench.h"
 #include "engine/LayoutEngine.h"
+#include "engine/McpServer.h"
 #include "engine/QueryCli.h"
 #include "engine/ReportJson.h"
 #include "view/App.h"
@@ -99,6 +102,9 @@ int main(int argc, char** argv) {
   }
   if (netvis::wants_query(argc, argv)) {
     return netvis::run_query_cli(argc, argv);  // headless: never creates the App
+  }
+  if (netvis::wants_mcp(argc, argv)) {
+    return netvis::run_mcp_stdio();  // headless: never creates the App
   }
 
   // GUI path (unchanged): argv[1] is an optional initial file to open.

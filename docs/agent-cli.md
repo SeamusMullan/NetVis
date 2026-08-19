@@ -100,6 +100,81 @@ Tensor listings also carry `dtype_label`, the format-native type name
 types map to a generic IR dtype, so when the two differ the label is the honest
 answer to "what is this tensor really".
 
+## MCP server
+
+`netvis_mcp` serves the same ten answers as MCP tools (`netvis_summary`,
+`netvis_nodes`, `netvis_tensor`, ...) over stdio JSON-RPC, for clients that
+speak the Model Context Protocol. It is a pure adapter: every tool call is
+translated into the exact `netvis query` argument vector and dispatched through
+the same code, so the tools and the CLI cannot drift. Point a client at the
+dedicated binary, or at `netvis mcp` / `netvis_query mcp` — all three start
+the identical loop.
+
+The server's lifetime is the client session (stdio servers are spawned and
+owned by their client), and within a session an LRU cache keyed by path and
+revalidated by file size and mtime keeps the last few parsed models warm — a
+burst of queries against one multi-gigabyte file parses it once. The cap is
+small by design (structure for a very large graph can reach ~100 MB) and can
+be overridden with `NETVIS_MCP_CACHE_MODELS`. Payload bytes stay on disk;
+`netvis_tensor` remains the only reader.
+
+```json
+{ "mcpServers": { "netvis": { "command": "/path/to/netvis_mcp" } } }
+```
+
+Within a session, derived analyses (the cost report, the search index, the
+adjacency) are memoized per cached model, so warm tool calls pay only their own
+query. Numbers come from the footprint harness, not from claims — reproduce
+them with:
+
+```sh
+./build/core/netvis_bench --bench-mcp     # JSON to stdout
+```
+
+Same machine class as the README's engine table, median of 5, on the synthetic
+chain ladder:
+
+| | 1k nodes | 10k nodes | 100k nodes |
+|---|---|---|---|
+| cold call (load + analyze) | 0.95 ms | 9.7 ms | 122 ms |
+| warm `nodes` | 0.012 ms | 0.030 ms | 0.19 ms |
+| warm `search` | 0.041 ms | 0.28 ms | 3.0 ms |
+| warm `cost` | 0.061 ms | 0.56 ms | 6.2 ms |
+| warm `neighbors` | 0.010 ms | 0.011 ms | 0.014 ms |
+| `ping` / `tools/list` | 1.3 µs / 50 µs | — | — |
+
+The footprint case drives eight distinct models through the default cap-4
+cache and reports RSS at cap and after the churn — the growth stays bounded by
+the cap, not by how many models the session touches.
+
+The repo is also installable as a **Claude Code plugin**: it doubles as its
+own single-plugin marketplace, so
+
+```
+/plugin marketplace add SeamusMullan/NetVis
+/plugin install netvis@netvis
+```
+
+registers the server for every session. The plugin resolves `netvis_mcp` from
+PATH — the same bare-name pattern npx-style servers use, which gets each
+platform's executable resolution (including Windows `.exe` handling) for free,
+with no wrapper script in the middle. The per-OS installers ship the binary
+(the Windows installer offers the PATH entry); from source it is one build and
+one copy:
+
+```sh
+cmake --preset core-only && cmake --build --preset core-only
+# Linux/macOS                          # Windows (PowerShell)
+cp build/core/netvis_mcp ~/.local/bin  # copy build\core\netvis_mcp.exe into a PATH dir
+```
+
+`/mcp` shows the connection status.
+
+When the server is not running, it costs nothing: MCP state lives only inside
+the server object, the tool table is built lazily on first use, and none of
+the engine paths the performance table gates were touched — the engine ladder
+reproduces the README numbers unchanged on this branch.
+
 ## Relation to `--report`
 
 `netvis --report <model>` predates `query` and is kept as-is for compatibility;

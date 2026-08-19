@@ -45,6 +45,9 @@
 // display is unavailable, exactly like ReportJson and Bench.
 #pragma once
 
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -54,6 +57,11 @@
 
 namespace netvis {
 
+class GraphAdjacency;
+class SearchIndex;
+struct CostReport;
+struct DerivedAnalyses;
+
 // Schema identifier for every query response. Bump when any verb's payload
 // shape changes so consumers can gate on it.
 inline constexpr const char* kQuerySchema = "netvis.query.v1";
@@ -62,11 +70,30 @@ inline constexpr const char* kQuerySchema = "netvis.query.v1";
 // resolve bundle path -> mmap -> parse -> ONNX shape inference on the main
 // graph. `model_dir` is the directory of the mapped file, for resolving ONNX
 // external data when a payload is (explicitly) read.
+//
+// The accessors below memoize the derived analyses (cost report, adjacency,
+// search index) on first use, so a host that keeps a model loaded across
+// queries — the MCP session — pays for each analysis once instead of per
+// call. A single-use CLI invocation builds exactly what its one verb needs,
+// so the laziness costs the stateless path nothing. NOT thread-safe: the
+// query dispatch is single-threaded by design.
 struct HeadlessModel {
   MappedFile file;
   ir::Model model;
   std::string display_path;  // what the caller asked to open
   std::string model_dir;     // directory of the mapped file
+
+  HeadlessModel();
+  HeadlessModel(HeadlessModel&&) noexcept;
+  HeadlessModel& operator=(HeadlessModel&&) noexcept;
+  ~HeadlessModel();
+
+  const CostReport& cost_for(uint32_t graph_index) const;
+  const GraphAdjacency& adjacency_for(uint32_t graph_index) const;
+  const SearchIndex& search_index() const;
+
+ private:
+  mutable std::unique_ptr<DerivedAnalyses> derived_;  // built on first use
 };
 
 // Open `path` headlessly. Shared by the report CLI and every query verb so the
@@ -74,10 +101,20 @@ struct HeadlessModel {
 // (message suitable for stderr) on a map/parse failure.
 Result<HeadlessModel> load_model_headless(const std::string& path);
 
+// How run_query obtains a model for a path. The default provider performs a
+// fresh load_model_headless per call — the right shape for the stateless CLI,
+// where instant open makes re-loading free. A long-lived host (the MCP server)
+// injects a caching provider instead, so a session of queries against the same
+// file parses it once. Providers return shared ownership because a cache and an
+// in-flight query may both hold the model.
+using ModelProvider =
+    std::function<Result<std::shared_ptr<HeadlessModel>>(const std::string& path)>;
+
 // One parsed query invocation. `args` are the raw tokens after `query`.
-// run_query resolves the verb, loads the model, and builds the JSON response.
-// PURE aside from file I/O; never throws; no window.
+// run_query resolves the verb, obtains the model(s) through `provider`, and
+// builds the JSON response. PURE aside from file I/O; never throws; no window.
 Result<std::string> run_query(const std::vector<std::string>& args);
+Result<std::string> run_query(const std::vector<std::string>& args, const ModelProvider& provider);
 
 // Process entry for `netvis query ...`: prints run_query's JSON (plus newline)
 // to stdout, or the error to stderr. Returns the process exit code (0 ok,

@@ -1,0 +1,14 @@
+{
+  "name": "netvis",
+  "description": "The NetVis model-analysis plugin: MCP tools for graph structure, shapes, weight stats, cost and diffs.",
+  "owner": {
+    "name": "NetVis"
+  },
+  "plugins": [
+    {
+      "name": "netvis",
+      "source": "./",
+      "description": "Model-file analysis tools (structure, shapes, weight stats, cost, diff) over the NetVis zero-payload parser."
+    }
+  ]
+}
