@@ -1,5 +1,6 @@
 {
   "name": "netvis",
+  "description": "The NetVis model-analysis plugin: MCP tools for graph structure, shapes, weight stats, cost and diffs.",
   "owner": {
     "name": "NetVis"
   },
