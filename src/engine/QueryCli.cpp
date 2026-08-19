@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <unordered_map>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -30,6 +31,47 @@
 #include "parsers/Parser.h"
 
 namespace netvis {
+
+// Memoized derived analyses, built on first use. Lives behind a unique_ptr so
+// the header stays light and a HeadlessModel that never gets queried never
+// allocates any of this.
+struct DerivedAnalyses {
+  std::unordered_map<uint32_t, CostReport> cost;
+  std::unordered_map<uint32_t, GraphAdjacency> adjacency;
+  std::unique_ptr<SearchIndex> search;
+};
+
+HeadlessModel::HeadlessModel() = default;
+HeadlessModel::HeadlessModel(HeadlessModel&&) noexcept = default;
+HeadlessModel& HeadlessModel::operator=(HeadlessModel&&) noexcept = default;
+HeadlessModel::~HeadlessModel() = default;
+
+const CostReport& HeadlessModel::cost_for(uint32_t graph_index) const {
+  if (!derived_) derived_ = std::make_unique<DerivedAnalyses>();
+  auto it = derived_->cost.find(graph_index);
+  if (it == derived_->cost.end())
+    it = derived_->cost.emplace(graph_index, compute_cost(model, graph_index)).first;
+  return it->second;
+}
+
+const GraphAdjacency& HeadlessModel::adjacency_for(uint32_t graph_index) const {
+  if (!derived_) derived_ = std::make_unique<DerivedAnalyses>();
+  auto it = derived_->adjacency.find(graph_index);
+  if (it == derived_->adjacency.end()) {
+    it = derived_->adjacency.emplace(graph_index, GraphAdjacency()).first;
+    it->second.build(model, graph_index);
+  }
+  return it->second;
+}
+
+const SearchIndex& HeadlessModel::search_index() const {
+  if (!derived_) derived_ = std::make_unique<DerivedAnalyses>();
+  if (!derived_->search) {
+    derived_->search = std::make_unique<SearchIndex>();
+    derived_->search->build(model);
+  }
+  return *derived_->search;
+}
 
 namespace {
 
@@ -275,7 +317,7 @@ Result<std::string> verb_nodes(const HeadlessModel& hm, const Options& o) {
   const std::string* op = o.flag("op");
   std::string contains = o.flag("contains") ? lower(*o.flag("contains")) : std::string();
 
-  const CostReport cost = compute_cost(hm.model, *gi);
+  const CostReport& cost = hm.cost_for(*gi);
 
   json rows = json::array();
   uint64_t matched = 0;
@@ -329,7 +371,7 @@ Result<std::string> verb_node(const HeadlessModel& hm, const Options& o) {
     attrs.push_back(attr_json(hm.model, g.attributes[n.attributes.begin + a]));
   j["attributes"] = std::move(attrs);
 
-  const CostReport cost = compute_cost(hm.model, *gi);
+  const CostReport& cost = hm.cost_for(*gi);
   if (*ni < cost.per_node.size()) {
     const NodeCost& c = cost.per_node[*ni];
     json cj;
@@ -341,8 +383,7 @@ Result<std::string> verb_node(const HeadlessModel& hm, const Options& o) {
     j["cost"] = std::move(cj);
   }
 
-  GraphAdjacency adj;
-  adj.build(hm.model, *gi);
+  const GraphAdjacency& adj = hm.adjacency_for(*gi);
   auto emit_nodes = [&](const std::vector<uint32_t>& ids) {
     json arr = json::array();
     for (uint32_t id : ids) {
@@ -469,11 +510,10 @@ Result<std::string> verb_search(const HeadlessModel& hm, const Options& o) {
     limit = *v;
   }
 
-  SearchIndex index;
-  index.build(hm.model);
+  const SearchIndex& index = hm.search_index();
   // types_ready=true is safe here: shape inference already ran synchronously in
-  // load_model_headless, and this process is single-threaded — the data race
-  // the GUI guards against cannot occur.
+  // load_model_headless, and the query dispatch is single-threaded — the data
+  // race the GUI guards against cannot occur.
   std::vector<SearchHit> hits = index.query(o.positional[1], hm.model, true, limit);
 
   json rows = json::array();
@@ -522,8 +562,7 @@ Result<std::string> verb_neighbors(const HeadlessModel& hm, const Options& o) {
   if (dir != "in" && dir != "out" && dir != "both")
     return err("query neighbors: --dir expects in|out|both");
 
-  GraphAdjacency adj;
-  adj.build(hm.model, *gi);
+  const GraphAdjacency& adj = hm.adjacency_for(*gi);
   auto emit = [&](const std::vector<uint32_t>& ids) {
     json arr = json::array();
     for (uint32_t id : ids) {
@@ -567,7 +606,7 @@ Result<std::string> verb_cost(const HeadlessModel& hm, const Options& o) {
       by != "intensity")
     return err("query cost: --by expects flops|params|weight_bytes|act_bytes|intensity");
 
-  const CostReport cost = compute_cost(hm.model, *gi);
+  const CostReport& cost = hm.cost_for(*gi);
   std::vector<uint32_t> order(cost.per_node.size());
   for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
   auto key = [&](uint32_t i) -> double {

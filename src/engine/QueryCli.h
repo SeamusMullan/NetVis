@@ -45,6 +45,7 @@
 // display is unavailable, exactly like ReportJson and Bench.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -56,6 +57,11 @@
 
 namespace netvis {
 
+class GraphAdjacency;
+class SearchIndex;
+struct CostReport;
+struct DerivedAnalyses;
+
 // Schema identifier for every query response. Bump when any verb's payload
 // shape changes so consumers can gate on it.
 inline constexpr const char* kQuerySchema = "netvis.query.v1";
@@ -64,11 +70,30 @@ inline constexpr const char* kQuerySchema = "netvis.query.v1";
 // resolve bundle path -> mmap -> parse -> ONNX shape inference on the main
 // graph. `model_dir` is the directory of the mapped file, for resolving ONNX
 // external data when a payload is (explicitly) read.
+//
+// The accessors below memoize the derived analyses (cost report, adjacency,
+// search index) on first use, so a host that keeps a model loaded across
+// queries — the MCP session — pays for each analysis once instead of per
+// call. A single-use CLI invocation builds exactly what its one verb needs,
+// so the laziness costs the stateless path nothing. NOT thread-safe: the
+// query dispatch is single-threaded by design.
 struct HeadlessModel {
   MappedFile file;
   ir::Model model;
   std::string display_path;  // what the caller asked to open
   std::string model_dir;     // directory of the mapped file
+
+  HeadlessModel();
+  HeadlessModel(HeadlessModel&&) noexcept;
+  HeadlessModel& operator=(HeadlessModel&&) noexcept;
+  ~HeadlessModel();
+
+  const CostReport& cost_for(uint32_t graph_index) const;
+  const GraphAdjacency& adjacency_for(uint32_t graph_index) const;
+  const SearchIndex& search_index() const;
+
+ private:
+  mutable std::unique_ptr<DerivedAnalyses> derived_;  // built on first use
 };
 
 // Open `path` headlessly. Shared by the report CLI and every query verb so the

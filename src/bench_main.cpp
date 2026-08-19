@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "engine/Bench.h"
+#include "engine/McpBench.h"
 
 namespace {
 
@@ -23,6 +24,7 @@ void print_usage() {
                "  --bench-repeats=N       median-of-N (default 5)\n"
                "  --bench-model=<path>    also time a real model file "
                "(repeatable)\n"
+               "  --bench-mcp             MCP server footprint harness\n"
                "\n"
                "Writes the harness JSON to stdout. Compare it against a "
                "committed\nbaseline with tools/bench_gate.py.\n");
@@ -31,6 +33,19 @@ void print_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // MCP footprint harness (--bench-mcp): protocol overhead, cold/warm tool
+  // calls over the synthetic ladder, and the cache's RSS bound. Same JSON-to-
+  // stdout contract as the engine ladder.
+  if (netvis::wants_mcp_bench(argc, argv)) {
+    netvis::Result<std::string> out = netvis::run_mcp_bench();
+    if (!out) {
+      std::fprintf(stderr, "netvis_bench: %s\n", out.error().message.c_str());
+      return 1;
+    }
+    std::printf("%s\n", out->c_str());
+    return 0;
+  }
+
   // Running with no flags at all is a usage error rather than an implicit full
   // ladder: the 100k rung is expensive, and a bare invocation is far more likely
   // to be a mistake than a request for the slowest possible run.

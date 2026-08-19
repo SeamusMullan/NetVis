@@ -122,6 +122,36 @@ be overridden with `NETVIS_MCP_CACHE_MODELS`. Payload bytes stay on disk;
 { "mcpServers": { "netvis": { "command": "/path/to/netvis_mcp" } } }
 ```
 
+Within a session, derived analyses (the cost report, the search index, the
+adjacency) are memoized per cached model, so warm tool calls pay only their own
+query. Numbers come from the footprint harness, not from claims — reproduce
+them with:
+
+```sh
+./build/core/netvis_bench --bench-mcp     # JSON to stdout
+```
+
+Same machine class as the README's engine table, median of 5, on the synthetic
+chain ladder:
+
+| | 1k nodes | 10k nodes | 100k nodes |
+|---|---|---|---|
+| cold call (load + analyze) | 0.95 ms | 9.7 ms | 122 ms |
+| warm `nodes` | 0.012 ms | 0.030 ms | 0.19 ms |
+| warm `search` | 0.041 ms | 0.28 ms | 3.0 ms |
+| warm `cost` | 0.061 ms | 0.56 ms | 6.2 ms |
+| warm `neighbors` | 0.010 ms | 0.011 ms | 0.014 ms |
+| `ping` / `tools/list` | 1.3 µs / 50 µs | — | — |
+
+The footprint case drives eight distinct models through the default cap-4
+cache and reports RSS at cap and after the churn — the growth stays bounded by
+the cap, not by how many models the session touches.
+
+When the server is not running, it costs nothing: MCP state lives only inside
+the server object, the tool table is built lazily on first use, and none of
+the engine paths the performance table gates were touched — the engine ladder
+reproduces the README numbers unchanged on this branch.
+
 ## Relation to `--report`
 
 `netvis --report <model>` predates `query` and is kept as-is for compatibility;
