@@ -134,9 +134,14 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"mean", OpCategory::Elementwise},
       {"greaterorequal", OpCategory::Elementwise},
       {"lessorequal", OpCategory::Elementwise},
+      {"greaterequal", OpCategory::Elementwise},
+      {"lessequal", OpCategory::Elementwise},
+      {"select", OpCategory::Elementwise},
       // Tensor
       {"constant", OpCategory::Tensor},
       {"cast", OpCategory::Tensor},
+      {"convert", OpCategory::Tensor},
+      {"range", OpCategory::Tensor},
       // Shape
       {"reshape", OpCategory::Shape},
       {"transpose", OpCategory::Shape},
@@ -151,6 +156,8 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"pad", OpCategory::Shape},
       {"tile", OpCategory::Shape},
       {"shape", OpCategory::Shape},
+      {"shapeof", OpCategory::Shape},
+      {"broadcast", OpCategory::Shape},
       // Reduce
       {"reducesum", OpCategory::Reduce},
       {"reducemean", OpCategory::Reduce},
@@ -165,6 +172,7 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"argmax", OpCategory::Reduce},
       {"argmin", OpCategory::Reduce},
       {"cumsum", OpCategory::Reduce},
+      {"topk", OpCategory::Reduce},
       // ControlFlow
       {"if", OpCategory::ControlFlow},
       {"loop", OpCategory::ControlFlow},
@@ -172,6 +180,12 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       // Attention
       {"attention", OpCategory::Attention},
       {"multiheadattention", OpCategory::Attention},
+      {"scaleddotproductattention", OpCategory::Attention},
+      // IO
+      {"parameter", OpCategory::IO},
+      {"result", OpCategory::IO},
+      {"readvalue", OpCategory::IO},
+      {"assign", OpCategory::IO},
       // Recurrent
       {"lstm", OpCategory::Recurrent},
       {"gru", OpCategory::Recurrent},
