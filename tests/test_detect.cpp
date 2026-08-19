@@ -230,6 +230,21 @@ TEST_CASE("OpCategory: gap-fill samples") {
   CHECK(categorize_op("ReduceL2") == OpCategory::Reduce);
   // Mish is an activation.
   CHECK(categorize_op("Mish") == OpCategory::Activation);
+  // Common exported-graph spellings of the same concepts.
+  CHECK(categorize_op("Convert") == OpCategory::Tensor);
+  CHECK(categorize_op("Broadcast") == OpCategory::Shape);
+  CHECK(categorize_op("ScaledDotProductAttention") == OpCategory::Attention);
+  CHECK(categorize_op("ShapeOf") == OpCategory::Shape);
+  CHECK(categorize_op("Select") == OpCategory::Elementwise);
+  CHECK(categorize_op("LessEqual") == OpCategory::Elementwise);
+  CHECK(categorize_op("GreaterEqual") == OpCategory::Elementwise);
+  CHECK(categorize_op("TopK") == OpCategory::Reduce);
+  CHECK(categorize_op("Range") == OpCategory::Tensor);
+  // Graph state and I/O boundary markers.
+  CHECK(categorize_op("ReadValue") == OpCategory::IO);
+  CHECK(categorize_op("Assign") == OpCategory::IO);
+  CHECK(categorize_op("Parameter") == OpCategory::IO);
+  CHECK(categorize_op("Result") == OpCategory::IO);
 }
 
 TEST_CASE("OpCategory: category_name is non-empty for every category") {
