@@ -14,9 +14,14 @@
 #include <string_view>
 #include <vector>
 
+#include "engine/McpServer.h"
 #include "engine/QueryCli.h"
 
 int main(int argc, char** argv) {
+  if (netvis::wants_mcp(argc, argv)) {
+    return netvis::run_mcp_stdio();  // serve MCP over stdio until EOF
+  }
+
   std::vector<std::string> args;
   int start = 1;
   if (argc > 1 && std::string_view(argv[1]) == "query") start = 2;

@@ -100,6 +100,28 @@ Tensor listings also carry `dtype_label`, the format-native type name
 types map to a generic IR dtype, so when the two differ the label is the honest
 answer to "what is this tensor really".
 
+## MCP server
+
+`netvis_mcp` serves the same ten answers as MCP tools (`netvis_summary`,
+`netvis_nodes`, `netvis_tensor`, ...) over stdio JSON-RPC, for clients that
+speak the Model Context Protocol. It is a pure adapter: every tool call is
+translated into the exact `netvis query` argument vector and dispatched through
+the same code, so the tools and the CLI cannot drift. Point a client at the
+dedicated binary, or at `netvis mcp` / `netvis_query mcp` — all three start
+the identical loop.
+
+The server's lifetime is the client session (stdio servers are spawned and
+owned by their client), and within a session an LRU cache keyed by path and
+revalidated by file size and mtime keeps the last few parsed models warm — a
+burst of queries against one multi-gigabyte file parses it once. The cap is
+small by design (structure for a very large graph can reach ~100 MB) and can
+be overridden with `NETVIS_MCP_CACHE_MODELS`. Payload bytes stay on disk;
+`netvis_tensor` remains the only reader.
+
+```json
+{ "mcpServers": { "netvis": { "command": "/path/to/netvis_mcp" } } }
+```
+
 ## Relation to `--report`
 
 `netvis --report <model>` predates `query` and is kept as-is for compatibility;

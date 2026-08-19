@@ -45,6 +45,8 @@
 // display is unavailable, exactly like ReportJson and Bench.
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -74,10 +76,20 @@ struct HeadlessModel {
 // (message suitable for stderr) on a map/parse failure.
 Result<HeadlessModel> load_model_headless(const std::string& path);
 
+// How run_query obtains a model for a path. The default provider performs a
+// fresh load_model_headless per call — the right shape for the stateless CLI,
+// where instant open makes re-loading free. A long-lived host (the MCP server)
+// injects a caching provider instead, so a session of queries against the same
+// file parses it once. Providers return shared ownership because a cache and an
+// in-flight query may both hold the model.
+using ModelProvider =
+    std::function<Result<std::shared_ptr<HeadlessModel>>(const std::string& path)>;
+
 // One parsed query invocation. `args` are the raw tokens after `query`.
-// run_query resolves the verb, loads the model, and builds the JSON response.
-// PURE aside from file I/O; never throws; no window.
+// run_query resolves the verb, obtains the model(s) through `provider`, and
+// builds the JSON response. PURE aside from file I/O; never throws; no window.
 Result<std::string> run_query(const std::vector<std::string>& args);
+Result<std::string> run_query(const std::vector<std::string>& args, const ModelProvider& provider);
 
 // Process entry for `netvis query ...`: prints run_query's JSON (plus newline)
 // to stdout, or the error to stderr. Returns the process exit code (0 ok,

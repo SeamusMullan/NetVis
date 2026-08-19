@@ -189,6 +189,9 @@ list(APPEND NETVIS_CORE_SRC
 
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
 target_include_directories(netvis_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+# Version string for headless surfaces (the MCP serverInfo). Same value CPack
+# stamps on installers, so a served version always matches the artifact's.
+target_compile_definitions(netvis_core PUBLIC NETVIS_VERSION_STRING="${NETVIS_VERSION}")
 target_link_libraries(netvis_core
   PUBLIC nlohmann_json::nlohmann_json netvis_sanitize
   PRIVATE netvis_warnings)
@@ -362,6 +365,20 @@ add_executable(netvis_query ${CMAKE_SOURCE_DIR}/src/query_main.cpp)
 target_link_libraries(netvis_query PRIVATE netvis_core)
 target_include_directories(netvis_query PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(netvis_query PRIVATE netvis_warnings)
+
+# =============================================================================
+#  netvis_mcp — MCP server over the query engine. Links only netvis_core.
+#
+#  MCP clients spawn their servers over stdio and own the process for the
+#  session, so this is the binary an agent's server configuration points at.
+#  The GUI binary (`netvis mcp`) and netvis_query (`netvis_query mcp`) start
+#  the identical loop from engine/McpServer.h, so all three entries are
+#  interchangeable and cannot drift. Deliberately NOT gated on NETVIS_BUILD_APP.
+# =============================================================================
+add_executable(netvis_mcp ${CMAKE_SOURCE_DIR}/src/mcp_main.cpp)
+target_link_libraries(netvis_mcp PRIVATE netvis_core)
+target_include_directories(netvis_mcp PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(netvis_mcp PRIVATE netvis_warnings)
 
 # =============================================================================
 #  netvis_tests — links only netvis_core (spec §9, headless ctest).
