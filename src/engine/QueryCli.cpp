@@ -135,6 +135,11 @@ json tensor_ref_json(const ir::Model& m, const ir::TensorRef& t) {
   json j;
   j["name"] = std::string(m.str(t.name));
   j["dtype"] = ir::dtype_name(t.dtype);
+  // The format-native type name ("u4", "q4_k", ...) when the parser recorded
+  // one. Sub-byte and block-quantized types map to a generic IR dtype, so this
+  // label is the honest answer to "what is this tensor really" (on real int4
+  // exports the IR dtype alone prints as unknown).
+  j["dtype_label"] = std::string(m.str(t.dtype_label));
   j["shape"] = shape_json(t.shape);
   j["elements"] = t.elem_count();
   j["bytes"] = t.byte_len;

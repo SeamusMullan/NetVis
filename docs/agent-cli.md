@@ -82,6 +82,24 @@ Did quantization change the graph, or only the weights?
 netvis query diff model_fp32.onnx model_int8.onnx --match name
 ```
 
+## Headless binary
+
+The `core-only` preset builds a standalone **`netvis_query`** binary alongside
+`netvis_bench` — netvis_core only, no GLFW/OpenGL/ImGui — so the CLI runs on CI
+runners, remote debug boxes and agent sandboxes with no display stack. It
+accepts the verb bare (`netvis_query nodes model.onnx`) or behind the GUI
+binary's `query` word, so scripts can swap one binary name for the other.
+
+```sh
+cmake --preset core-only && cmake --build --preset core-only
+./build/core/netvis_query summary model.onnx
+```
+
+Tensor listings also carry `dtype_label`, the format-native type name
+(`"i4"`, `"q4_k"`, ...) recorded by the parser. Sub-byte and block-quantized
+types map to a generic IR dtype, so when the two differ the label is the honest
+answer to "what is this tensor really".
+
 ## Relation to `--report`
 
 `netvis --report <model>` predates `query` and is kept as-is for compatibility;

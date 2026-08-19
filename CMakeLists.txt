@@ -349,6 +349,21 @@ target_include_directories(netvis_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(netvis_bench PRIVATE netvis_warnings)
 
 # =============================================================================
+#  netvis_query — headless agent query CLI. Links only netvis_core.
+#
+#  Same rationale as netvis_bench: the query CLI's audience is automated
+#  tooling on headless machines (CI runners, remote debug boxes, agent
+#  sandboxes) where building the GLFW/OpenGL/ImGui chain is impossible or
+#  pointless. The GUI binary keeps its `netvis query ...` dispatch for local
+#  convenience; both call engine/QueryCli.h's run_query, so they cannot drift.
+#  Deliberately NOT gated on NETVIS_BUILD_APP.
+# =============================================================================
+add_executable(netvis_query ${CMAKE_SOURCE_DIR}/src/query_main.cpp)
+target_link_libraries(netvis_query PRIVATE netvis_core)
+target_include_directories(netvis_query PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(netvis_query PRIVATE netvis_warnings)
+
+# =============================================================================
 #  netvis_tests — links only netvis_core (spec §9, headless ctest).
 # =============================================================================
 if(NETVIS_BUILD_TESTS)
