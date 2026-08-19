@@ -12,30 +12,15 @@
 
 #include <nlohmann/json.hpp>
 
-#include "core/MappedFile.h"
 #include "engine/CostModel.h"
 #include "engine/GraphAdjacency.h"
-#include "engine/ModelPath.h"
-#include "engine/ShapeInferenceExt.h"
-#include "parsers/Parser.h"
+#include "engine/QueryCli.h"
 
 namespace netvis {
 
 namespace {
 
 using json = nlohmann::ordered_json;
-
-// Lowercased extension without the leading dot ("" if none). Mirrors the
-// tiebreaker ModelSession derives; used only to route detection.
-std::string ext_of(const std::string& path) {
-  auto dot = path.find_last_of('.');
-  auto slash = path.find_last_of("/\\");
-  if (dot == std::string::npos) return {};
-  if (slash != std::string::npos && dot < slash) return {};  // dot in a dir name
-  std::string e = path.substr(dot + 1);
-  for (char& c : e) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return e;
-}
 
 // Count distinct producer->consumer IR edges over one graph (deduped, self-loops
 // dropped) — the same edge derivation the navigation/adjacency uses.
@@ -116,30 +101,12 @@ std::string build_report_json(const ir::Model& model) {
 }
 
 Result<std::string> report_file(const std::string& path) {
-  // Resolve a .mlpackage bundle to its inner model file (a plain path passes
-  // through unchanged), exactly as ModelSession::open_async does, so external
-  // weights resolve from the right directory if a parser needs them.
-  ResolvedModelPath resolved = resolve_model_path(path);
-
-  auto mapped = MappedFile::open(resolved.map_path);
-  if (!mapped) return mapped.error();
-  MappedFile file = mapped.take();
-
-  const std::string ext = ext_of(resolved.map_path);
-  ProgressSink progress;
-  Result<ir::Model> parsed = parse_model(file, ext, progress);
-  if (!parsed) return parsed.error();
-  ir::Model model = parsed.take();
-
-  // ONNX ships incomplete value_info; run the same best-effort shape inference
-  // the ShapeInferJob runs so cost (FLOPs/activation bytes) is meaningful. Other
-  // formats carry resolved shapes from the parser, so this is ONNX-only (a no-op
-  // elsewhere would be harmless, but matching ModelSession keeps behavior 1:1).
-  if (model.has_graph && model.str(model.format_name) == "ONNX") {
-    infer_shapes_ext(model, 0, file.data(), file.size(), &progress);
-  }
-
-  return build_report_json(model);
+  // One shared headless pipeline (resolve -> mmap -> parse -> ONNX shape
+  // inference) serves both this report and every `netvis query` verb, so the
+  // two CLIs can never disagree about how a model is loaded.
+  Result<HeadlessModel> hm = load_model_headless(path);
+  if (!hm) return hm.error();
+  return build_report_json(hm->model);
 }
 
 }  // namespace netvis
