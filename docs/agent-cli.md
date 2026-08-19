@@ -155,10 +155,20 @@ own single-plugin marketplace, so
 /plugin install netvis@netvis
 ```
 
-registers the server for every session. The plugin launches an in-checkout
-build when one exists (`build/core` or `build/release`) and falls back to a
-`netvis_mcp` on PATH, so build once and it just works; `/mcp` shows the
-connection status.
+registers the server for every session. The plugin resolves `netvis_mcp` from
+PATH — the same bare-name pattern npx-style servers use, which gets each
+platform's executable resolution (including Windows `.exe` handling) for free,
+with no wrapper script in the middle. The per-OS installers ship the binary
+(the Windows installer offers the PATH entry); from source it is one build and
+one copy:
+
+```sh
+cmake --preset core-only && cmake --build --preset core-only
+# Linux/macOS                          # Windows (PowerShell)
+cp build/core/netvis_mcp ~/.local/bin  # copy build\core\netvis_mcp.exe into a PATH dir
+```
+
+`/mcp` shows the connection status.
 
 When the server is not running, it costs nothing: MCP state lives only inside
 the server object, the tool table is built lazily on first use, and none of

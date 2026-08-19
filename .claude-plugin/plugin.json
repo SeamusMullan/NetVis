@@ -10,7 +10,7 @@
   "license": "PolyForm-Noncommercial-1.0.0",
   "mcpServers": {
     "netvis": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/tools/netvis-mcp-launcher.sh"
+      "command": "netvis_mcp"
     }
   }
 }
