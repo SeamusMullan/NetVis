@@ -155,12 +155,22 @@ own single-plugin marketplace, so
 /plugin install netvis@netvis
 ```
 
-registers the server for every session. The plugin resolves `netvis_mcp` from
-PATH — the same bare-name pattern npx-style servers use, which gets each
-platform's executable resolution (including Windows `.exe` handling) for free,
-with no wrapper script in the middle. The per-OS installers ship the binary
-(the Windows installer offers the PATH entry); from source it is one build and
-one copy:
+registers the server for every session — including on a machine that has
+never built or installed NetVis. The plugin launches a small Node bootstrap
+(`tools/netvis-mcp-bootstrap.mjs`, stdlib only) that prefers a binary you
+already have: an explicit `NETVIS_MCP` path, a build inside the checkout,
+then `netvis_mcp` on PATH. When none exists it downloads the standalone
+binary for the current platform from the latest GitHub Release, verifies it
+against the release's `SHA256SUMS`, caches it in the plugin data directory,
+and launches it. The cache survives plugin updates and is removed on
+uninstall; later sessions start straight from it with no network touch.
+`NETVIS_MCP_VERSION=X.Y.Z` pins the downloaded version, `NETVIS_MCP_UPDATE=1`
+re-downloads, and `NETVIS_MCP_REPO=owner/name` points a fork at its own
+releases.
+
+The per-OS installers still ship the binary (the Windows installer offers the
+PATH entry), and a PATH install always wins over a download; from source it is
+one build and one copy:
 
 ```sh
 cmake --preset core-only && cmake --build --preset core-only
