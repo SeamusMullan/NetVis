@@ -21,7 +21,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # ubuntu-22.04, not -latest: the binaries link against the builder's
+          # glibc, so building on the oldest supported LTS keeps the published
+          # netvis_mcp runnable on 22.04-era distros. Built on 24.04 it demands
+          # GLIBC_2.38/GLIBCXX_3.4.32 and dies on anything older.
+          - os: ubuntu-22.04
             gen: ZIP
             ext: zip
             label: Linux-x86_64
