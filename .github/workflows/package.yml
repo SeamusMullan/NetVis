@@ -1,7 +1,9 @@
 # Reusable build+package workflow: builds NetVis Release on all three OSes and
-# produces the platform installer (NSIS .exe on Windows, .pkg on macOS, .zip on
-# Linux). Called by ci.yml (on a vX.Y.Z tag) and release.yml (manual override).
-# Uploads each artifact so the caller can attach them to a GitHub Release.
+# produces the platform installer (NSIS .exe on Windows, .dmg on macOS, .zip on
+# Linux), the standalone netvis_mcp binary per platform, and one SHA256SUMS
+# covering everything. Called by ci.yml (on a vX.Y.Z tag) and
+# release-override.yml (manual override). Uploads each artifact so the caller
+# can attach them to a GitHub Release.
 name: package
 
 on:
@@ -23,14 +25,17 @@ jobs:
             gen: ZIP
             ext: zip
             label: Linux-x86_64
+            exe: ""
           - os: macos-latest
             gen: DragNDrop
             ext: dmg
             label: macOS-arm64
+            exe: ""
           - os: windows-latest
             gen: NSIS
             ext: exe
             label: Windows-x64
+            exe: ".exe"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +95,24 @@ jobs:
           cp "${src[0]}" "dist/$dest"
           echo "Packaged: $dest"; ls -la dist
 
+      # The standalone MCP server binary, published bare (no archive) so a
+      # downloader (the Claude Code plugin bootstrap, a script, plain curl)
+      # needs zero extraction tooling. The installers stay the way to get the
+      # full app; this asset exists for headless and agent installs.
+      - name: Collect the MCP server binary
+        shell: bash
+        working-directory: build
+        run: |
+          set -euo pipefail
+          bin="netvis_mcp${{ matrix.exe }}"
+          if [ ! -f "$bin" ]; then
+            echo "::error::$bin missing from the build tree"
+            exit 1
+          fi
+          dest="netvis_mcp-${{ inputs.version }}-${{ matrix.label }}${{ matrix.exe }}"
+          cp "$bin" "dist/$dest"
+          echo "Packaged: $dest"; ls -la dist
+
       # Validate the artifact so a broken/empty package FAILS the job instead of
       # being silently published. Guards against past bugs: an empty macOS .pkg
       # (missing bundle payload) and a mis-versioned filename.
@@ -99,13 +122,16 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(NetVis-*)
-          if [ ${#files[@]} -eq 0 ]; then echo "no artifact produced"; exit 1; fi
+          files=(NetVis-* netvis_mcp-*)
+          if [ ${#files[@]} -lt 2 ]; then
+            echo "::error::expected an installer and a bare binary, found: ${files[*]:-none}"
+            exit 1
+          fi
           for f in "${files[@]}"; do
             size=$(wc -c < "$f")
             echo "artifact $f = $size bytes"
-            # Every real installer is well over 100 KB; a tiny file means an
-            # empty payload (e.g. a bundle that never got installed).
+            # Every real installer or binary is well over 100 KB; a tiny file
+            # means an empty payload (e.g. a bundle that never got installed).
             if [ "$size" -lt 102400 ]; then
               echo "::error::artifact $f is only $size bytes — likely empty/broken"
               exit 1
@@ -122,4 +148,37 @@ jobs:
         with:
           name: netvis-${{ runner.os }}
           path: build/dist/*
+          if-no-files-found: error
+
+  # One SHA256SUMS covering every published file, generated in a follow-up job
+  # so the sums from all three OS jobs land in a single file. Downloaders of
+  # the bare binary verify against this before first run. The artifact name
+  # keeps the netvis- prefix so the callers' release jobs sweep it up exactly
+  # like the installers.
+  checksums:
+    name: checksums
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: netvis-*
+          merge-multiple: true
+      # Explicit globs, not *: if either pattern matches nothing, sha256sum
+      # fails on the literal string, so a missing asset class breaks the build
+      # here instead of shipping an incomplete SHA256SUMS.
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          sha256sum NetVis-* netvis_mcp-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: netvis-checksums
+          path: dist/SHA256SUMS
           if-no-files-found: error
