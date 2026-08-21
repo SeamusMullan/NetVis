@@ -134,9 +134,9 @@ void draw_status_bar(App& app) {
   ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
   ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
                         ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
-  if (ImGui::SmallButton("Created By Seamus Mullan")) app.view().show_about = true;
+  if (ImGui::SmallButton("About NetVis")) app.view().show_about = true;
   ImGui::PopStyleColor(2);
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip("About NetVis");
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open About Window");
   ImGui::SameLine();
   ImGui::TextDisabled("|");
   ImGui::SameLine();
