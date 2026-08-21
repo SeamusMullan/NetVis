@@ -28,9 +28,6 @@ namespace netvis {
 
 namespace {
 
-// Height reserved for the status bar (also used to offset the toast stack).
-float status_bar_height() { return ImGui::GetFrameHeight(); }
-
 // Lowercased extension (no dot) of a mapped path, matching ModelSession's own
 // detection tiebreaker input. Local copy so the status bar can recompute the
 // detected format + reason WITHOUT touching the frozen ModelSession header.
@@ -93,12 +90,21 @@ void append_timing(std::string& out, const char* label, double ms) {
 
 }  // namespace
 
+// Height reserved for the status bar. App::frame() subtracts this from the main
+// viewport's work area BEFORE building the dockspace, so the strip below is ours
+// alone (see draw_status_bar for why it cannot simply overlay the dockspace).
+float status_bar_height() { return ImGui::GetFrameHeight(); }
+
 // Draw the bottom status bar (spec §8.7). Called once per frame.
 void draw_status_bar(App& app) {
   ImGuiViewport* vp = ImGui::GetMainViewport();
   const float h = status_bar_height();
 
-  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y - h),
+  // The work area has ALREADY been shrunk by h (App::frame), so the strip we own
+  // starts exactly at its bottom edge. Overlaying the dockspace instead does not
+  // work: DockSpaceOverViewport claims the whole work area, and the dock node's
+  // windows paint over a bar that carries NoBringToFrontOnFocus.
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y),
                           ImGuiCond_Always);
   ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, h), ImGuiCond_Always);
   ImGui::SetNextWindowViewport(vp->ID);
@@ -109,10 +115,14 @@ void draw_status_bar(App& app) {
       ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 
+  // WindowMinSize defaults to 32x32 and is applied even to a fixed-size
+  // NoDecoration window, which silently inflated this 23px bar to 32px and hung
+  // 9px of it off the bottom of the screen. Relax it for this window only.
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(0.0f, 0.0f));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 2.0f));
   if (!ImGui::Begin("##status_bar", nullptr, flags)) {
     ImGui::End();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
     return;
   }
 
@@ -216,7 +226,7 @@ void draw_status_bar(App& app) {
   ImGui::TextDisabled("%s", right.c_str());
 
   ImGui::End();
-  ImGui::PopStyleVar();
+  ImGui::PopStyleVar(2);
 }
 
 // Draw the toast stack (spec §8.7): translucent boxes bottom-right, above the
@@ -228,10 +238,11 @@ void draw_toasts(App& app) {
 
   ImGuiViewport* vp = ImGui::GetMainViewport();
   const float margin = 12.0f;
-  const float bar_h = status_bar_height();
 
-  // Stack upward from just above the status bar.
-  float y = vp->WorkPos.y + vp->WorkSize.y - bar_h - margin;
+  // Stack upward from just above the status bar. The work area already excludes
+  // the bar (App::frame reserves it), so its bottom edge IS the top of the bar —
+  // subtracting status_bar_height() again would leave a bar-sized dead gap.
+  float y = vp->WorkPos.y + vp->WorkSize.y - margin;
 
   int idx = 0;
   for (auto it = toasts.rbegin(); it != toasts.rend(); ++it) {

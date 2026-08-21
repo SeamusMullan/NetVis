@@ -521,6 +521,7 @@ void draw_minimap(App& app);            // Minimap.cpp (drawn inside canvas)
 void draw_tensor_table(App& app);       // TensorTable.cpp (has_graph == false)
 void draw_status_bar(App& app);         // StatusBar.cpp
 void draw_toasts(App& app);             // StatusBar.cpp
+float status_bar_height();              // StatusBar.cpp (App::frame reserves it)
 void draw_command_palette(App& app);    // CommandPalette.cpp (#59)
 
 // Camera helpers shared by canvas / search / minimap (Camera.cpp).

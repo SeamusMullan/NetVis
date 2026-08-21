@@ -434,9 +434,17 @@ void App::frame() {
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
 
+  // Reserve the bottom strip for the status bar BEFORE the dockspace runs.
+  // DockSpaceOverViewport claims the ENTIRE work area, and a docked panel then
+  // paints over anything drawn into that region later in the frame — which is
+  // why the bar was invisible rather than merely misplaced. ImGui recomputes
+  // WorkPos/WorkSize from scratch every NewFrame, so this does not accumulate.
+  ImGuiViewport* main_vp = ImGui::GetMainViewport();
+  main_vp->WorkSize.y -= status_bar_height();
+
   // A full-viewport dockspace so every panel is dockable (spec §8). We capture
   // its id so we can seed a sensible default arrangement on first run.
-  ImGuiID dock_id = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+  ImGuiID dock_id = ImGui::DockSpaceOverViewport(0, main_vp);
 
   // One-time default layout (spec §8): graph canvas in the center, properties on
   // the right, weight inspector docked below properties (bottom-right), tensor
