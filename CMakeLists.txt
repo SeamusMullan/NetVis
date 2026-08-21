@@ -3,9 +3,10 @@
 cmake_minimum_required(VERSION 3.24)
 
 # Version drives CPack/installer metadata. CI passes -DNETVIS_VERSION=X.Y.Z
-# extracted from the release tag; the fallback keeps local builds working.
+# extracted from the release tag; the fallback tracks the current release so a
+# local build reports a real version in About / the MCP handshake.
 if(NOT DEFINED NETVIS_VERSION)
-  set(NETVIS_VERSION "0.0.0")
+  set(NETVIS_VERSION "0.9.5")
 endif()
 project(netvis VERSION ${NETVIS_VERSION} LANGUAGES C CXX)
 
