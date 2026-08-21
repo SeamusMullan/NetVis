@@ -56,10 +56,26 @@ jobs:
             libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxi-dev
 
-      # NSIS provides makensis for the Windows installer generator.
+      # NSIS provides makensis for the Windows installer generator. choco EXITS 0
+      # when the community feed 503s ("Chocolatey installed 0/0 packages"), so a
+      # bare `choco install` goes green and the run instead dies five minutes
+      # later in cpack with a misleading "Cannot find NSIS compiler makensis".
+      # Retry the flaky feed, then assert makensis really is there so a failed
+      # install fails HERE, at the step that owns it.
       - name: Install NSIS
         if: runner.os == 'Windows'
-        run: choco install nsis --no-progress -y
+        shell: pwsh
+        run: |
+          $nsis = "${env:ProgramFiles(x86)}\NSIS"
+          foreach ($i in 1..3) {
+            if (Test-Path "$nsis\makensis.exe") { break }
+            if ($i -gt 1) { Start-Sleep -Seconds 15 }
+            choco install nsis --no-progress -y
+          }
+          if (-not (Test-Path "$nsis\makensis.exe")) {
+            throw "NSIS install failed: no makensis.exe under $nsis"
+          }
+          "$nsis" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       - name: Configure MSVC (Windows)
         if: runner.os == 'Windows'
