@@ -116,6 +116,21 @@ void draw_status_bar(App& app) {
     return;
   }
 
+  // Leftmost, before any model-dependent content, so it is the one thing in this
+  // bar that is there in every state (no file, loading, failed, loaded) — the
+  // right-hand side is a right-aligned string that a long path can already push
+  // to the window edge, which is no place for a credit that must always be read.
+  // Borderless so the bar still reads as a status strip rather than a toolbar.
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                        ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+  if (ImGui::SmallButton("Created By Seamus Mullan")) app.view().show_about = true;
+  ImGui::PopStyleColor(2);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("About NetVis");
+  ImGui::SameLine();
+  ImGui::TextDisabled("|");
+  ImGui::SameLine();
+
   ModelSession& session = app.session();
   const LoadStage stage = session.stage();
 

@@ -28,6 +28,13 @@ void draw_empty_state(App& app);
 // and links to the docs). Called from inside the main menu bar's BeginMenu.
 void draw_help_menu(App& app);
 
+// Draw the About window when ViewState::show_about is set: the logo, the app
+// name and version, how to reach the author, and what this binary was built
+// with. Lives here rather than in its own file because the Help menu and the
+// empty state already own the "who/what is this" surfaces and the click-to-copy
+// link contract they all share.
+void draw_about_window(App& app);
+
 // Draw the shortcut-reference window when it is open. Kept separate from the
 // menu so the same reference can be reached from the empty state and from the
 // command palette, not only from a menu a keyboard-first user may never open.

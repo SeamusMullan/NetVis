@@ -595,6 +595,7 @@ void App::frame() {
   draw_preferences_panel(*this);   // #102
   draw_empty_state(*this);         // #105
   draw_shortcuts_window(*this);    // #105
+  draw_about_window(*this);        // self-guards on ViewState::show_about
   draw_command_palette(*this);   // #59: Ctrl+P fuzzy action palette (drawn on top)
 
   handle_shortcuts();
@@ -674,9 +675,10 @@ void App::handle_shortcuts() {
   if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
     view().search_open = false;
     command_palette_open_ = false;
-    // Escape also closes the two v0.9.4 windows, matching every other overlay.
+    // Escape also closes the utility windows, matching every other overlay.
     view().show_preferences = false;
     view().show_shortcuts = false;
+    view().show_about = false;
   }
 }
 

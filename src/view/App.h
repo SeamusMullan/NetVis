@@ -268,6 +268,11 @@ struct ViewState {
   // #105: the shortcut reference. Also not persisted, same reasoning.
   bool show_shortcuts = false;
 
+  // The About window (credit, version, build provenance, contact). Reached from
+  // the credit in the status bar and from Help > About. Not persisted, same
+  // reasoning as the two above.
+  bool show_about = false;
+
   // #104 accessibility. Both PERSISTED (they are exactly the kind of setting a
   // user sets once and expects to survive a restart — unlike the two above).
   //

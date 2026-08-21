@@ -287,6 +287,18 @@ if(NETVIS_BUILD_APP)
     PRIVATE netvis_core imgui glfw tinyfiledialogs stb OpenGL::GL netvis_warnings)
   target_include_directories(netvis PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+  # Build provenance for the About window. Stamped in as strings because none of
+  # it is discoverable at runtime — the toolchain that produced the binary is
+  # known only to the configure step that invoked it. $<CONFIG> rather than
+  # CMAKE_BUILD_TYPE so multi-config generators (MSVC, Xcode) stamp the config
+  # actually built instead of an empty string.
+  target_compile_definitions(netvis PRIVATE
+    NETVIS_BUILD_CMAKE_VERSION="${CMAKE_VERSION}"
+    NETVIS_BUILD_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+    NETVIS_BUILD_CXX_STANDARD="${CMAKE_CXX_STANDARD}"
+    NETVIS_BUILD_SYSTEM="${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}"
+    NETVIS_BUILD_CONFIG="$<CONFIG>")
+
   if(WIN32 AND MSVC)
     # GUI subsystem but keep the standard C `main` entry point (no WinMain).
     target_link_options(netvis PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
