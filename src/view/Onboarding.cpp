@@ -387,7 +387,7 @@ void draw_about_window(App& app) {
   ImGui::TextUnformatted("NetVis");
   ImGui::TextDisabled("Version %s", kVersion);
   ImGui::Spacing();
-  ImGui::TextUnformatted("Created By Seamus Mullan");
+  ImGui::Text("Created By %s", kAuthor);
   ImGui::TextDisabled("Neural-network model viewer.");
   ImGui::EndGroup();
 
