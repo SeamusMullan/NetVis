@@ -8,6 +8,16 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED NETVIS_VERSION)
   set(NETVIS_VERSION "0.9.5")
 endif()
+# v0.9.5 shipped Windows binaries stamped "0" instead of "0.9.5" while Linux and
+# macOS were correct, from the same -DNETVIS_VERSION=0.9.5. project(VERSION)
+# accepts a bare "0" happily, so the mis-stamp reached a published release in
+# silence. Refuse anything that is not X.Y.Z, and echo the value so a bad one is
+# visible in the configure log rather than only in the finished binary.
+if(NOT NETVIS_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+  message(FATAL_ERROR
+    "NETVIS_VERSION must be X.Y.Z, got '${NETVIS_VERSION}'")
+endif()
+message(STATUS "NetVis version: ${NETVIS_VERSION}")
 project(netvis VERSION ${NETVIS_VERSION} LANGUAGES C CXX)
 
 # --- Global standards --------------------------------------------------------

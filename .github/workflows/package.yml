@@ -91,6 +91,25 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      # Ask the built binary what version it thinks it is. v0.9.5 published
+      # Windows artifacts stamped "0" while Linux/macOS were right, and nothing
+      # in the pipeline noticed — a green build is not evidence the version
+      # survived the trip from the tag to the compiler. bash on all three OSes
+      # (git-bash on Windows) so there is one code path to reason about.
+      - name: Verify the stamped version
+        shell: bash
+        working-directory: build
+        run: |
+          set -euo pipefail
+          req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+          got=$(printf '%s\n' "$req" | "./netvis_mcp${{ matrix.exe }}" | head -1)
+          echo "$got"
+          if ! grep -q '"version":"${{ inputs.version }}"' <<<"$got"; then
+            echo "::error::netvis_mcp reports the wrong version (expected ${{ inputs.version }})"
+            exit 1
+          fi
+          echo "version OK: ${{ inputs.version }}"
+
       - name: Package
         working-directory: build
         run: cpack -G ${{ matrix.gen }} --verbose
