@@ -1,6 +1,6 @@
 # NetVis
 
-A speed-first native desktop viewer for neural-network model files — a from-scratch
+A speed-first native desktop viewer for neural-network model files - a from-scratch
 alternative to Netron, designed so that opening and navigating a multi-gigabyte
 model is effectively instant.
 
