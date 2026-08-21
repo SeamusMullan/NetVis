@@ -85,7 +85,7 @@ jobs:
         run: >
           cmake -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DNETVIS_VERSION=${{ inputs.version }}
+          -DNETVIS_VERSION="${{ inputs.version }}"
           -DNETVIS_BUILD_TESTS=OFF
 
       - name: Build
