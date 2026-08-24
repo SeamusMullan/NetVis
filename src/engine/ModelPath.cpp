@@ -24,6 +24,10 @@ namespace fs = std::filesystem;
 constexpr const char* kDataDir = "Data";
 constexpr const char* kConventionalInner = "Data/com.apple.CoreML/model.mlmodel";
 
+// TensorFlow SavedModel (#107): the bundle is a directory whose protobuf is
+// always at this spec-mandated name, with the checkpoint in a sibling variables/.
+constexpr const char* kSavedModelPb = "saved_model.pb";
+
 // True if `child`, lexically normalized, stays within `root` (no `..` escape).
 // Both are treated as already-absolute-ish lexical paths; we compare normalized
 // prefixes so a crafted Manifest path can never point outside the bundle.
@@ -110,9 +114,16 @@ ResolvedModelPath resolve_model_path(const std::string& path) {
   const fs::path p(path);
   if (!fs::is_directory(p, ec)) return out;  // plain file: pass through
 
+  const fs::path root = p;
+
+  // TensorFlow SavedModel directory -> its saved_model.pb (#107).
+  if (fs::is_regular_file(root / kSavedModelPb, ec)) {
+    out.map_path = (root / kSavedModelPb).string();
+    return out;
+  }
+
   // Only treat a directory as a bundle when it has a Data/ dir (a .mlpackage
   // shape) — avoids grabbing an arbitrary directory the user dropped in.
-  const fs::path root = p;
   if (!fs::is_directory(root / kDataDir, ec)) return out;
 
   // 1) Authoritative: Manifest.json -> rootModelIdentifier -> path.

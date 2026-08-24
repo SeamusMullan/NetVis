@@ -17,6 +17,9 @@ struct ResolvedModelPath {
   std::string map_path;      // the single file to mmap (inner model for a bundle)
 };
 
+// If `path` is a TensorFlow SavedModel directory (it holds a `saved_model.pb`):
+// resolve to that file, so `variables/` stays a sibling of the mapped file.
+//
 // If `path` is a `.mlpackage` directory: read Manifest.json, resolve
 // rootModelIdentifier -> itemInfoEntries[uuid].path -> <root>/Data/<path>. Falls
 // back to the conventional Data/com.apple.CoreML/model.mlmodel when the manifest

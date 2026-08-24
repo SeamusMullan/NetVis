@@ -28,6 +28,7 @@ const char* format_name(Format f) {
     case Format::Npz:           return "NumPy npz";
     case Format::Keras:         return "Keras";
     case Format::CoreML:        return "CoreML";
+    case Format::TensorFlow:    return "TensorFlow";
     case Format::Unknown:       return "Unknown";
   }
   return "Unknown";
@@ -231,6 +232,72 @@ bool looks_like_openvino_xml(const uint8_t* d, uint64_t size) {
   return rest.rfind("10", 0) == 0 || rest.rfind("11", 0) == 0;
 }
 
+
+// ---- TensorFlow (#107) -----------------------------------------------------
+// Two protobuf containers, both extensionless-friendly:
+//   frozen .pb     -> GraphDef,   field 1 = node (length-delimited NodeDef)
+//   saved_model.pb -> SavedModel, field 1 = saved_model_schema_version (varint)
+// The SavedModel top level is structurally IDENTICAL to an ONNX ModelProto
+// (small field-1 varint, then a length-delimited field 2), so both sniffs peek
+// one level deeper and both run BEFORE looks_like_onnx_proto.
+
+// True if `sr` starts with a plausible NodeDef: field 1 (name) and field 2 (op)
+// as non-empty length-delimited strings that fit inside the range.
+bool looks_like_node_def(const uint8_t* d, uint64_t size) {
+  uint64_t off = 0;
+  int seen = 0;
+  for (int i = 0; i < 2; ++i) {
+    uint64_t tag = 0;
+    if (!read_varint(d, size, off, tag)) return false;
+    const uint32_t field = static_cast<uint32_t>(tag >> 3);
+    const uint32_t wire = static_cast<uint32_t>(tag & 0x7);
+    if (field != static_cast<uint32_t>(i + 1) || wire != 2) return false;
+    uint64_t len = 0;
+    if (!read_varint(d, size, off, len)) return false;
+    if (len == 0 || off + len > size) return false;
+    off += len;
+    ++seen;
+  }
+  return seen == 2;
+}
+
+// GraphDef: the first top-level field is `node` (1, length-delimited) and its
+// content is a NodeDef. ONNX's field 1 is a varint, so this cannot collide.
+bool looks_like_graph_def(const uint8_t* d, uint64_t size) {
+  uint64_t off = 0;
+  uint64_t tag = 0;
+  if (!read_varint(d, size, off, tag)) return false;
+  if ((tag >> 3) != 1 || (tag & 0x7) != 2) return false;
+  uint64_t len = 0;
+  if (!read_varint(d, size, off, len)) return false;
+  if (len == 0 || off + len > size) return false;
+  return looks_like_node_def(d + off, len);
+}
+
+// SavedModel: field 1 saved_model_schema_version (a small varint), then field 2
+// meta_graphs whose MetaGraphDef starts with field 1 (meta_info_def) or field 2
+// (graph_def) — both length-delimited. ONNX's field 2 is producer_name, a plain
+// UTF-8 string, which would have to begin with byte 0x0A/0x12 to reach here.
+bool looks_like_saved_model(const uint8_t* d, uint64_t size) {
+  uint64_t off = 0;
+  uint64_t tag = 0;
+  if (!read_varint(d, size, off, tag)) return false;
+  if ((tag >> 3) != 1 || (tag & 0x7) != 0) return false;
+  uint64_t schema = 0;
+  if (!read_varint(d, size, off, schema)) return false;
+  if (schema == 0 || schema > 16) return false;  // real files use 1
+  if (!read_varint(d, size, off, tag)) return false;
+  if ((tag >> 3) != 2 || (tag & 0x7) != 2) return false;
+  uint64_t len = 0;
+  if (!read_varint(d, size, off, len)) return false;
+  if (len == 0 || off + len > size) return false;
+  // First tag inside the MetaGraphDef.
+  uint64_t inner = off;
+  if (!read_varint(d, off + len, inner, tag)) return false;
+  const uint32_t field = static_cast<uint32_t>(tag >> 3);
+  return (field == 1 || field == 2) && (tag & 0x7) == 2;
+}
+
 }  // namespace
 
 Format detect_format(const MappedFile& file, const std::string& ext_hint,
@@ -327,6 +394,14 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::PyTorchLegacy;
   }
 
+  // TensorFlow (#107): a frozen GraphDef, or a SavedModel bundle's saved_model.pb.
+  // Both run BEFORE the ONNX structural sniff — a SavedModel would otherwise be
+  // claimed as ONNX (see looks_like_saved_model).
+  if (looks_like_graph_def(d, size) || looks_like_saved_model(d, size)) {
+    reason = DetectReason::Structure;
+    return Format::TensorFlow;
+  }
+
   // CoreML .mlmodel is a bare `Model` protobuf whose first field
   // (specificationVersion, a field-1 varint) structurally mimics ONNX's
   // ir_version, so a bare .mlmodel also satisfies looks_like_onnx_proto. The
@@ -359,6 +434,7 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     if (ext_hint == "keras" || ext_hint == "h5" || ext_hint == "hdf5")
       return Format::Keras;
     if (ext_hint == "mlmodel") return Format::CoreML;
+    if (ext_hint == "pb") return Format::TensorFlow;
     if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
       return Format::PyTorchZip;
     }
@@ -390,6 +466,7 @@ Result<ir::Model> parse_model(const MappedFile& file, const std::string& ext_hin
     case Format::Npz:           return npz::parse(file, progress);
     case Format::Keras:         return keras::parse(file, progress);
     case Format::CoreML:        return coreml::parse(file, progress);
+    case Format::TensorFlow:    return tensorflow::parse(file, progress);
     case Format::Unknown:
       // v0.7.0 (#10): a file no built-in format claimed may still be handled by an
       // enabled WASM parser plugin (structurally absent when disabled, §0.4). Only

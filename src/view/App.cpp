@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 #include "imgui.h"
@@ -703,10 +704,11 @@ std::string basename_of(const std::string& path) {
 }  // namespace
 
 void App::open_file_dialog() {
-  const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors",
-                           "*.gguf", "*.pt",     "*.pth", "*.bin"};
+  const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors", "*.gguf",
+                           "*.pt",   "*.pth",    "*.bin",         "*.pb"};
   char* picked =
-      tinyfd_openFileDialog("Open model", "", 7, filters, "Model files", 0);
+      tinyfd_openFileDialog("Open model", "", static_cast<int>(std::size(filters)),
+                            filters, "Model files", 0);
   if (picked != nullptr) open_file(picked);
 }
 
