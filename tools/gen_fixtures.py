@@ -16,6 +16,9 @@ Formats emitted:
   model.gguf        - GGUF v3, 2 tensors (F32 + Q4_0), 2 KV pairs, aligned data.
   model.pt          - PyTorch zip: hand-written protocol-2 pickle + storage blob.
   model.tflite      - Minimal-but-valid TFLite flatbuffer (ADD op, 2 tensors).
+  model_frozen.pb   - Frozen TensorFlow GraphDef (Const payload, ":1" slot ref).
+  saved_model/      - TensorFlow SavedModel dir (stub + FunctionDef body +
+                      a stand-in variables/ checkpoint).
 """
 
 import os
@@ -1753,6 +1756,173 @@ def build_wasm_start_loop():
 
 
 # ---------------------------------------------------------------------------
+# TensorFlow (#107): frozen GraphDef .pb + a SavedModel directory bundle
+# ---------------------------------------------------------------------------
+# Field numbers per tensorflow/core/framework/{graph,node_def,attr_value,
+# tensor,tensor_shape,function,op_def}.proto and protobuf/saved_model.proto.
+
+def tf_shape(dims):
+    """TensorShapeProto: dim(2) repeated Dim{size(1)}. -1 == unknown dim."""
+    b = bytearray()
+    for d in dims:
+        b += pb_len(2, pb_varint(1, d))
+    return bytes(b)
+
+
+def tf_attr_shape(dims):
+    """AttrValue with shape(7)."""
+    return pb_len(7, tf_shape(dims))
+
+
+def tf_attr_type(dt):
+    """AttrValue with type(6)."""
+    return pb_varint(6, dt)
+
+
+def tf_attr_func(name):
+    """AttrValue with func(9) = NameAttrList{name(1)}."""
+    return pb_len(9, pb_string(1, name))
+
+
+def tf_attr_output_shapes(shapes):
+    """AttrValue with list(1){shape(7) repeated} — the _output_shapes hint."""
+    lst = b"".join(pb_len(7, tf_shape(s)) for s in shapes)
+    return pb_len(1, lst)
+
+
+def tf_attr_tensor(dt, dims, floats):
+    """AttrValue with tensor(8) = TensorProto{dtype(1), tensor_shape(2),
+    tensor_content(4)}. tensor_content is the PAYLOAD: the parser records its
+    offset+length and never decodes it."""
+    t = bytearray()
+    t += pb_varint(1, dt)
+    t += pb_len(2, tf_shape(dims))
+    t += pb_len(4, b"".join(struct.pack("<f", f) for f in floats))
+    return pb_len(8, bytes(t))
+
+
+def tf_node(name, op, inputs=(), attrs=()):
+    """NodeDef: name(1), op(2), input(3) repeated, attr(5) map<string,AttrValue>."""
+    b = bytearray()
+    b += pb_string(1, name)
+    b += pb_string(2, op)
+    for i in inputs:
+        b += pb_string(3, i)
+    for key, val in attrs:
+        b += pb_len(5, pb_string(1, key) + pb_len(2, val))
+    return bytes(b)
+
+
+DT_FLOAT = 1
+
+
+def tf_graph_def(nodes, functions=(), producer=None):
+    """GraphDef: node(1) repeated, versions(2){producer(1)}, library(4)."""
+    b = bytearray()
+    for n in nodes:
+        b += pb_len(1, n)
+    if producer is not None:
+        b += pb_len(2, pb_varint(1, producer))
+    if functions:
+        lib = b"".join(pb_len(1, f) for f in functions)
+        b += pb_len(4, lib)
+    return bytes(b)
+
+
+def tf_function_def(name, args, nodes, rets):
+    """FunctionDef: signature(1)=OpDef{name(1), input_arg(2)=ArgDef{name(1)}},
+    node_def(3) repeated, ret(4) map<string,string>."""
+    sig = bytearray()
+    sig += pb_string(1, name)
+    for a in args:
+        sig += pb_len(2, pb_string(1, a))
+    b = bytearray()
+    b += pb_len(1, bytes(sig))
+    for n in nodes:
+        b += pb_len(3, n)
+    for k, v in rets:
+        b += pb_len(4, pb_string(1, k) + pb_string(2, v))
+    return bytes(b)
+
+
+def build_tf_frozen():
+    """Frozen GraphDef: Placeholder -> MatMul(Const W) -> BiasAdd(Const b) -> Relu.
+
+    Exercises: a Const payload recorded as offset+len, an unknown batch dim (-1)
+    kept honest, _output_shapes, and a multi-output node (Split, referenced as
+    "split:1") so the derived output arity is covered."""
+    x = tf_node("x", "Placeholder",
+                attrs=[("dtype", tf_attr_type(DT_FLOAT)),
+                       ("shape", tf_attr_shape([-1, 4]))])
+    w = tf_node("W", "Const",
+                attrs=[("dtype", tf_attr_type(DT_FLOAT)),
+                       ("value", tf_attr_tensor(DT_FLOAT, [4, 2],
+                                                [1.0, 2.0, 3.0, 4.0,
+                                                 5.0, 6.0, 7.0, 8.0]))])
+    mm = tf_node("matmul", "MatMul", ["x", "W"],
+                 attrs=[("T", tf_attr_type(DT_FLOAT)),
+                        ("_output_shapes", tf_attr_output_shapes([[-1, 2]]))])
+    b = tf_node("bias", "Const",
+                attrs=[("dtype", tf_attr_type(DT_FLOAT)),
+                       ("value", tf_attr_tensor(DT_FLOAT, [2], [0.5, -0.5]))])
+    add = tf_node("biasadd", "BiasAdd", ["matmul", "bias"],
+                  attrs=[("T", tf_attr_type(DT_FLOAT))])
+    split = tf_node("split", "Split", ["biasadd"],
+                    attrs=[("num_split", pb_varint(3, 2))])
+    # Consumes the SECOND output of `split`, so the parser must materialize
+    # slots 0..1 for that node from the ":1" reference alone.
+    relu = tf_node("relu", "Relu", ["split:1", "^biasadd"],
+                   attrs=[("T", tf_attr_type(DT_FLOAT))])
+    return tf_graph_def([x, w, mm, b, add, split, relu], producer=1286)
+
+
+def build_tf_saved_model():
+    """SavedModel: schema_version(1) + meta_graphs(2) whose MetaGraphDef holds
+    meta_info_def(1){tags(4), tensorflow_version(5)} and graph_def(2).
+
+    The top-level graph is the TF2 shape — a StatefulPartitionedCall stub whose
+    `f` attribute names a library FunctionDef that holds the real body."""
+    body = [
+        tf_node("mul/y", "Const",
+                attrs=[("dtype", tf_attr_type(DT_FLOAT)),
+                       ("value", tf_attr_tensor(DT_FLOAT, [2], [3.0, 3.0]))]),
+        tf_node("mul", "Mul", ["inp", "mul/y:0"],
+                attrs=[("T", tf_attr_type(DT_FLOAT))]),
+    ]
+    fn = tf_function_def("__inference_serve_17", ["inp"], body,
+                         [("identity", "mul:z:0")])
+    stub = [
+        tf_node("serving_default_inp", "Placeholder",
+                attrs=[("dtype", tf_attr_type(DT_FLOAT)),
+                       ("shape", tf_attr_shape([-1, 2]))]),
+        tf_node("StatefulPartitionedCall", "StatefulPartitionedCall",
+                ["serving_default_inp"],
+                attrs=[("f", tf_attr_func("__inference_serve_17"))]),
+    ]
+    gd = tf_graph_def(stub, functions=[fn], producer=1286)
+
+    meta_info = pb_string(4, "serve") + pb_string(5, "2.15.0")
+    mg = pb_len(1, meta_info) + pb_len(2, gd)
+    return pb_varint(1, 1) + pb_len(2, mg)
+
+
+def build_tf_savedmodel_dir(out_dir):
+    """A real SavedModel DIRECTORY so ModelPath resolution and the honest
+    'checkpoint not decoded' note are both exercised."""
+    root = os.path.join(out_dir, "saved_model")
+    var = os.path.join(root, "variables")
+    os.makedirs(var, exist_ok=True)
+    with open(os.path.join(root, "saved_model.pb"), "wb") as f:
+        f.write(build_tf_saved_model())
+    # Stand-in checkpoint files: NetVis records that they exist and decodes
+    # neither (the .index is a compressed sstable; out of scope, see #107).
+    for nm in ("variables.index", "variables.data-00000-of-00001"):
+        with open(os.path.join(var, nm), "wb") as f:
+            f.write(b"\x00" * 16)
+    return root
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1798,6 +1968,9 @@ def main():
     write("model.bin", build_openvino_bin())
     # OpenVINO quant IR (#85): nf4 Const, NO sibling .bin -> dtype_label + note.
     write("model_quant.xml", build_openvino_quant_xml())
+    # TensorFlow (#107): frozen GraphDef + a SavedModel directory bundle.
+    write("model_frozen.pb", build_tf_frozen())
+    build_tf_savedmodel_dir(out_dir)
     write("model.mlmodel", build_coreml_mlmodel())
     # CoreML .mlpackage (mlProgram/MIL) DIRECTORY bundle (#85).
     build_mlpackage(out_dir)

@@ -31,6 +31,8 @@ enum class Format : uint8_t {
   Npz,            // NumPy .npz — zip of .npy arrays
   Keras,          // .h5 / .keras (HDF5, or keras-v3 zip)
   CoreML,         // .mlmodel — CoreML Model protobuf
+  // v0.9.5 Pillar 5 (#107).
+  TensorFlow,     // frozen .pb (GraphDef) + SavedModel (saved_model.pb)
 };
 
 const char* format_name(Format f);
@@ -78,5 +80,8 @@ namespace openvino { Result<ir::Model> parse(const MappedFile&, ProgressSink&); 
 namespace npz { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
 namespace keras { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
 namespace coreml { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
+// v0.9.5 Pillar 5 parsers (#107). One entry point covers both TF containers: a
+// frozen GraphDef and a SavedModel (whose meta_graphs[0].graph_def it unwraps).
+namespace tensorflow { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
 
 }  // namespace netvis

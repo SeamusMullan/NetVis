@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -891,11 +892,11 @@ void draw_diff_panel(App& app) {
   const bool at_cap = dl.comparison_count() >= kMaxComparisons;
   ImGui::BeginDisabled(at_cap);
   if (ImGui::Button("Add comparison...")) {
-    const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors",
-                             "*.gguf", "*.pt",     "*.pth",
-                             "*.bin"};
+    const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors", "*.gguf",
+                             "*.pt",   "*.pth",    "*.bin",         "*.pb"};
     char* picked =
-        tinyfd_openFileDialog("Open comparison model", "", 7, filters,
+        tinyfd_openFileDialog("Open comparison model", "",
+                              static_cast<int>(std::size(filters)), filters,
                               "Model files", 0);
     if (picked != nullptr) dl.add_comparison(s, picked);
   }
