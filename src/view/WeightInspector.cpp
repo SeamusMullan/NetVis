@@ -39,16 +39,8 @@
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
 #include "view/App.h"
+#include "view/FileDialog.h"
 #include "view/PanelHelpers.h"
-
-// tinyfiledialogs (C, spec §8.7). Declared here rather than pulling the C header
-// so this TU has no extra include dependency; the symbol links from the
-// tinyfiledialogs static lib.
-extern "C" char const* tinyfd_saveFileDialog(char const* aTitle,
-                                             char const* aDefaultPathAndFile,
-                                             int aNumOfFilterPatterns,
-                                             char const* const* aFilterPatterns,
-                                             char const* aSingleFilterDescription);
 
 namespace netvis {
 
@@ -136,23 +128,58 @@ std::string coord_string(const ir::TensorRef& t, uint64_t flat) {
   return out;
 }
 
-// Run a save dialog + export, toasting the result. `raw` selects raw bin vs npy.
-void do_export(App& app, const ir::TensorRef& t, bool raw) {
-  const char* pat_npy[] = {"*.npy"};
-  const char* pat_bin[] = {"*.bin"};
-  const char* def = raw ? "tensor.bin" : "tensor.npy";
-  const char* path =
-      tinyfd_saveFileDialog("Export tensor", def, 1, raw ? pat_bin : pat_npy,
-                            raw ? "raw binary" : "NumPy array");
-  if (!path) return;  // user cancelled
+// The tensor + model the user asked to export, held while the (out-of-process,
+// non-blocking) save chooser is up. The pick lands a few frames later, by which
+// time the panel may be showing a different tensor — or a different model — so
+// the request carries everything the write needs plus the model path to verify
+// against.
+struct PendingExport {
+  ir::TensorRef tensor;
+  std::string model_path;
+};
+PendingExport& pending_export() {
+  static PendingExport p;
+  return p;
+}
+DeferredFileDialog& export_dialog() {
+  static DeferredFileDialog d;
+  return d;
+}
 
+// Open the save chooser for tensor `t`. `raw` selects raw bin vs npy and rides
+// along as the dialog tag.
+void do_export(App& app, const ir::TensorRef& t, bool raw) {
+  if (!file_dialog_available()) {
+    app.add_toast("No file chooser found - install zenity or kdialog", true);
+    return;
+  }
+  if (export_dialog().busy()) return;
+  pending_export() = PendingExport{t, app.session().path()};
+  export_dialog().start(FileDialog::Mode::Save, "Export tensor",
+                        raw ? "tensor.bin" : "tensor.npy",
+                        {raw ? "*.bin" : "*.npy"},
+                        raw ? "raw binary" : "NumPy array", raw ? 1 : 0);
+}
+
+// Finish a pick from do_export()'s chooser. Called once per frame.
+void poll_export(App& app) {
+  std::string path;
+  int tag = 0;
+  if (!export_dialog().ready(&path, &tag)) return;
+  const PendingExport& req = pending_export();
+  if (req.model_path != app.session().path()) {
+    app.add_toast("Export cancelled - the model changed", true);
+    return;
+  }
+  const bool raw = tag != 0;
+  const ir::TensorRef& t = req.tensor;
   const std::string model_dir = app.session().model_dir();
   Result<bool> r = raw ? export_raw(t, app.session().file(), model_dir, path,
                                     app.session().model())
                        : export_npy(t, app.session().file(), model_dir, path,
                                     app.session().model());
   if (r.ok() && *r) {
-    app.add_toast(std::string("Exported ") + path, false);
+    app.add_toast("Exported " + path, false);
   } else {
     std::string msg = "Export failed";
     if (!r.ok()) msg += ": " + r.error().message;
@@ -408,6 +435,9 @@ void draw_comparison_section(App& app, PendingDecode& d, const TensorStats& s) {
 
 // Draw the Weight Inspector panel (spec §8.3). Called once per frame.
 void draw_weight_inspector(App& app) {
+  // Ahead of Begin(): a tensor export must still land if the user collapsed the
+  // panel while the save chooser was open.
+  poll_export(app);
   if (!ImGui::Begin("Weight Inspector")) {
     ImGui::End();
     return;

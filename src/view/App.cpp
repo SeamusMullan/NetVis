@@ -102,21 +102,6 @@
 #include "view/SessionStore.h"      // #103: tabs + camera persistence
 #include "view/ViewHistory.h"       // #106: capture_view / apply_view
 
-// tinyfiledialogs ships only a .c/.h that is NOT on our include path; its two
-// entry points are plain C, so we declare them ourselves (spec §8.7). At link
-// time the tinyfiledialogs translation unit provides the definitions.
-extern "C" {
-char* tinyfd_openFileDialog(const char* aTitle, const char* aDefaultPathAndFile,
-                            int aNumOfFilterPatterns,
-                            const char* const* aFilterPatterns,
-                            const char* aSingleFilterDescription,
-                            int aAllowMultipleSelects);
-char* tinyfd_saveFileDialog(const char* aTitle, const char* aDefaultPathAndFile,
-                            int aNumOfFilterPatterns,
-                            const char* const* aFilterPatterns,
-                            const char* aSingleFilterDescription);
-}
-
 namespace netvis {
 
 namespace {
@@ -355,6 +340,7 @@ int App::run() {
     // finished model rather than a frozen loading state.
     for (auto& t : tabs_) t->session->update();
     if (diff_loader_) diff_loader_->update();  // drain diff completions after.
+    poll_file_dialog();  // the chooser answers on its own thread; act on it here
     frame();
 
     // Render the assembled draw data to the default framebuffer.
@@ -704,12 +690,46 @@ std::string basename_of(const std::string& path) {
 }  // namespace
 
 void App::open_file_dialog() {
-  const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors", "*.gguf",
-                           "*.pt",   "*.pth",    "*.bin",         "*.pb"};
-  char* picked =
-      tinyfd_openFileDialog("Open model", "", static_cast<int>(std::size(filters)),
-                            filters, "Model files", 0);
-  if (picked != nullptr) open_file(picked);
+  start_file_dialog(DialogKind::OpenModel, FileDialog::Mode::Open, "Open model",
+                    "",
+                    {"*.onnx", "*.tflite", "*.safetensors", "*.gguf", "*.pt",
+                     "*.pth", "*.bin", "*.pb"},
+                    "Model files");
+}
+
+// Opens the system chooser and records what to do with the answer. The chooser
+// itself is a child process polled from the main loop, so the app keeps drawing
+// while it is up.
+void App::start_file_dialog(DialogKind kind, FileDialog::Mode mode,
+                            const std::string& title,
+                            const std::string& default_path,
+                            const std::vector<std::string>& patterns,
+                            const std::string& description) {
+  if (dialog_kind_ != DialogKind::None) return;  // one chooser at a time
+  if (!file_dialog_available()) {
+    add_toast("No file chooser found - install zenity or kdialog", true);
+    return;
+  }
+  dialog_ = FileDialog(mode, title, default_path, patterns, description);
+  if (!dialog_.in_flight()) return;
+  dialog_kind_ = kind;
+}
+
+void App::poll_file_dialog() {
+  if (dialog_kind_ == DialogKind::None) return;
+  std::string path;
+  if (!dialog_.poll(&path)) return;
+  const DialogKind kind = dialog_kind_;
+  dialog_kind_ = DialogKind::None;
+  if (path.empty()) return;  // cancelled
+  switch (kind) {
+    case DialogKind::OpenModel: open_file(path); break;
+    case DialogKind::ExportPng: export_view_png(path); break;
+    case DialogKind::ExportSvg: export_view_svg(path); break;
+    case DialogKind::SaveViewState: save_view_state(path); break;
+    case DialogKind::LoadViewState: load_view_state(path); break;
+    case DialogKind::None: break;
+  }
 }
 
 void App::open_file(const std::string& path) {
@@ -1160,32 +1180,25 @@ ImU32 App::category_color(OpCategory c, bool dark) {
 // PNG export (spec §8.7): read back the rendered window and write a PNG.
 // ---------------------------------------------------------------------------
 void App::export_view_dialog() {
-  const char* filters[] = {"*.png"};
-  char* out =
-      tinyfd_saveFileDialog("Export view", "netvis.png", 1, filters, "PNG image");
-  if (out != nullptr) export_view_png(out);
+  start_file_dialog(DialogKind::ExportPng, FileDialog::Mode::Save, "Export view",
+                    "netvis.png", {"*.png"}, "PNG image");
 }
 
 void App::export_view_svg_dialog() {
-  const char* filters[] = {"*.svg"};
-  char* out = tinyfd_saveFileDialog("Export SVG", "netvis.svg", 1, filters,
-                                    "SVG vector");
-  if (out != nullptr) export_view_svg(out);
+  start_file_dialog(DialogKind::ExportSvg, FileDialog::Mode::Save, "Export SVG",
+                    "netvis.svg", {"*.svg"}, "SVG vector");
 }
 
 // --- #56 shareable view-state file (.netvis-view JSON) ----------------------
 void App::save_view_state_dialog() {
-  const char* filters[] = {"*.netvis-view"};
-  char* out = tinyfd_saveFileDialog("Save view state", "view.netvis-view", 1,
-                                    filters, "NetVis view");
-  if (out != nullptr) save_view_state(out);
+  start_file_dialog(DialogKind::SaveViewState, FileDialog::Mode::Save,
+                    "Save view state", "view.netvis-view", {"*.netvis-view"},
+                    "NetVis view");
 }
 
 void App::load_view_state_dialog() {
-  const char* filters[] = {"*.netvis-view"};
-  char* picked = tinyfd_openFileDialog("Load view state", "", 1, filters,
-                                       "NetVis view", 0);
-  if (picked != nullptr) load_view_state(picked);
+  start_file_dialog(DialogKind::LoadViewState, FileDialog::Mode::Open,
+                    "Load view state", "", {"*.netvis-view"}, "NetVis view");
 }
 
 void App::save_view_state(const std::string& path) {
