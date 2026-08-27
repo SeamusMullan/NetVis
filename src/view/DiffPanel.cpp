@@ -204,6 +204,41 @@ TensorDeltaSlot& tensor_delta_state() {
   return st;
 }
 
+// #37 export, held while the (out-of-process, non-blocking) save chooser is up.
+// File scope rather than function-local statics inside draw_diff_panel() so the
+// poll can run AHEAD of that function's early returns: the panel bails out when
+// it is closed, when Begin() reports it collapsed, and when either model is
+// absent, and a poll nested past those points silently drops a finished export
+// if the user closed or collapsed the panel while the chooser was open. The
+// Weight Inspector already polls ahead of its Begin() for the same reason.
+DeferredFileDialog& report_dialog() {
+  static DeferredFileDialog d;
+  return d;
+}
+
+// The report text, rendered at CLICK time while the two models and the diff are
+// known live. Only the finished text waits for the chooser, so a tab switch or a
+// reload cannot make the write emit another model's data.
+std::string& pending_report() {
+  static std::string r;
+  return r;
+}
+
+// Drain a finished export chooser and write the report. Called once per frame,
+// before draw_diff_panel() can return early.
+void poll_report_export(App& app) {
+  std::string path;
+  if (!report_dialog().ready(&path, nullptr)) return;
+  std::ofstream f(path);
+  if (f) {
+    f << pending_report();
+    app.add_toast("Exported " + path, false);
+  } else {
+    app.add_toast("Could not write report", true);
+  }
+  pending_report().clear();
+}
+
 // #37: serialize the diff to a change report. `tsv` selects TSV vs markdown.
 // Lists each changed/added/removed node (status, op, name) + the summary counts.
 // Pure over the two models + the diff result; no payload reads. `a_gi` is the
@@ -840,6 +875,10 @@ DiffTint diff_tint_for_display(App& app, int32_t display_id) {
 }
 
 void draw_diff_panel(App& app) {
+  // Ahead of every early return below: a finished export must still be written
+  // if the user closed or collapsed the panel while the save chooser was up.
+  poll_report_export(app);
+
   ViewState& vs = app.view();
   if (!vs.diff_panel_open) return;
 
@@ -891,9 +930,19 @@ void draw_diff_panel(App& app) {
                     "Model files");
     }
   }
+  // ready() CONSUMES the pick — it answers true exactly once — so the cap has to
+  // be tested inside the branch, not as a second `&&` condition. Written the
+  // other way the path is swallowed before at_cap is ever read, and the file the
+  // user chose vanishes with no toast and no error. The blocking chooser could
+  // not reach that state (nothing could load while the frame loop was stalled);
+  // polling per frame means the cap can fill while the dialog is open.
   std::string picked_comparison;
-  if (add_dlg.ready(&picked_comparison, nullptr) && !at_cap) {
-    dl.add_comparison(s, picked_comparison);
+  if (add_dlg.ready(&picked_comparison, nullptr)) {
+    if (at_cap) {
+      app.add_toast("Comparison limit reached - remove one first", true);
+    } else {
+      dl.add_comparison(s, picked_comparison);
+    }
   }
   ImGui::EndDisabled();
   if (at_cap) {
@@ -1074,33 +1123,21 @@ void draw_diff_panel(App& app) {
   // #37: export the change report (markdown / TSV) for the ACTIVE slot.
   if (a_model != nullptr && b_model != nullptr) {
     ImGui::SeparatorText("Export");
-    // The report is built at CLICK time, while a_model/b_model/diff are known
-    // live. Only the text survives until the chooser closes, so a tab switch or
-    // a reload while the dialog is up cannot make this write stale data.
-    static DeferredFileDialog report_dlg;
-    static std::string pending_report;
+    // The completion side lives in poll_report_export(), called at the top of
+    // this function so a closed or collapsed panel cannot strand the write.
     auto do_export = [&](bool tsv) {
       if (!file_dialog_available()) {
         app.add_toast("No file chooser found - install zenity or kdialog", true);
         return;
       }
-      if (report_dlg.busy()) return;
-      pending_report = build_change_report(*a_model, a_gi, *b_model, *diff, tsv);
-      report_dlg.start(FileDialog::Mode::Save, "Export change report",
-                       tsv ? "diff.tsv" : "diff.md",
-                       {tsv ? "*.tsv" : "*.md"}, tsv ? "TSV" : "Markdown");
+      if (report_dialog().busy()) return;
+      pending_report() =
+          build_change_report(*a_model, a_gi, *b_model, *diff, tsv);
+      report_dialog().start(FileDialog::Mode::Save, "Export change report",
+                            tsv ? "diff.tsv" : "diff.md",
+                            {tsv ? "*.tsv" : "*.md"},
+                            tsv ? "TSV" : "Markdown");
     };
-    std::string report_path;
-    if (report_dlg.ready(&report_path, nullptr)) {
-      std::ofstream f(report_path);
-      if (f) {
-        f << pending_report;
-        app.add_toast("Exported " + report_path, false);
-      } else {
-        app.add_toast("Could not write report", true);
-      }
-      pending_report.clear();
-    }
     if (ImGui::Button("Export .md")) do_export(false);
     ImGui::SameLine();
     if (ImGui::Button("Export .tsv")) do_export(true);
