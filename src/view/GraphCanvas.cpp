@@ -36,6 +36,7 @@
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
 #include "view/PanelHelpers.h"
+#include "view/TextContrast.h"  // #150: per-node label colour from the fill
 
 namespace netvis {
 
@@ -628,12 +629,29 @@ void draw_graph_canvas(App& app) {
                               : IM_COL32(90, 100, 120, 170);
   const ImU32 col_edge_hi = IM_COL32(120, 200, 255, 255);
   const ImU32 col_accent = IM_COL32(90, 170, 255, 255);
-  const ImU32 col_text = dark ? IM_COL32(235, 238, 242, 255)
-                             : IM_COL32(24, 28, 36, 255);
+  // #150: there is deliberately NO theme-wide `col_text` any more. The node's
+  // op_type is drawn on the category-coloured header strip, so a single
+  // near-white/near-black pair was wrong for one end of the palette in each theme
+  // (white on Okabe-Ito Yellow is 1.4:1). That label colour is now derived
+  // per-node from the fill it lands on — see readable_label_color() below.
+  // col_text_muted survives because the SECOND line is drawn on the node BODY,
+  // which is a fixed theme colour: it measures 6.9:1 on dark and 5.5:1 on light,
+  // and still 6.9:1 / 5.4:1 once nav-dimming composites the body over the canvas.
   const ImU32 col_text_muted = dark ? IM_COL32(160, 168, 180, 255)
                                     : IM_COL32(90, 100, 116, 255);
   const ImU32 col_border = dark ? IM_COL32(20, 22, 26, 220)
                                : IM_COL32(120, 128, 140, 220);
+
+  // #150: what a nav-dimmed node actually shows through to. Dimming multiplies
+  // the header AND body alpha by kDimAlpha, so the effective fill under a label
+  // is the canvas background, not the palette colour — a label colour picked
+  // from the unblended header can be the WRONG one once that blend happens.
+  // Read from the style rather than hard-coded so it tracks apply_theme(); the
+  // window colour underneath is forced opaque because a translucent chain has no
+  // bottom and the compositor's real backdrop is not knowable here.
+  const ImU32 col_canvas_bg =
+      composite_over(ImGui::GetColorU32(ImGuiCol_ChildBg),
+                     ImGui::GetColorU32(ImGuiCol_WindowBg) | IM_COL32_A_MASK);
 
   const Fonts& fonts = app.fonts();
 
@@ -937,6 +955,27 @@ void draw_graph_canvas(App& app) {
         body = dark ? IM_COL32(48, 54, 62, 255) : IM_COL32(232, 238, 246, 255);
       if (dimmed) body = with_alpha_mul(body, kDimAlpha);
 
+      // #150: the op_type sits INSIDE the header strip, so its colour is derived
+      // from that strip, after every override that can change it (diff tint, cost
+      // heatmap, nav dim) has already been applied above. Computed here rather
+      // than hoisted out of the loop precisely because it is per-node: two
+      // adjacent nodes legitimately get opposite label colours.
+      //
+      // The strip is drawn ON TOP of the body rect, so a dimmed (translucent)
+      // header composites over the body, which itself composites over the canvas.
+      // Passing the body-over-canvas colour as the backdrop is what makes the
+      // ratio the maths reports the ratio the user actually sees.
+      //
+      // KNOWN GAP: text_px() floors the font at base*0.5, so between kZoomMid
+      // and ~0.35 the glyphs (7px) are marginally taller than the header strip
+      // (20*zoom) and a descender can cross onto the body, where this colour is
+      // the wrong one. Closing it means changing the header height or the font
+      // floor — a layout decision, not a contrast one — and at that zoom the
+      // op_type is 7px tall regardless, so it is left as-is rather than smuggled
+      // into a colour fix.
+      const ImU32 col_label =
+          readable_label_color(header, composite_over(body, col_canvas_bg));
+
       if (zoom < kZoomMid) {
         // Flat rect, no text.
         dl->AddRectFilled(smin, smax, body, 3.0f);
@@ -968,7 +1007,7 @@ void draw_graph_canvas(App& app) {
           if (fonts.bold != nullptr)
             dl->AddText(fonts.bold, text_px(16.0f),
                         ImVec2(smin.x + 6.0f * zoom, smin.y + 2.0f * zoom),
-                        col_text, lab.primary.data(),
+                        col_label, lab.primary.data(),
                         lab.primary.data() + lab.primary.size());
           if (fonts.small != nullptr && !lab.secondary.empty())
             dl->AddText(fonts.small, text_px(12.0f),
@@ -979,7 +1018,7 @@ void draw_graph_canvas(App& app) {
           if (fonts.body != nullptr)
             dl->AddText(fonts.body, text_px(14.0f),
                         ImVec2(smin.x + 6.0f * zoom, smin.y + 2.0f * zoom),
-                        col_text, lab.primary.data(),
+                        col_label, lab.primary.data(),
                         lab.primary.data() + lab.primary.size());
         }
         dl->PopClipRect();
