@@ -101,6 +101,7 @@
 #include "view/PreferencesPanel.h"  // #102: the unified Settings window
 #include "view/SessionStore.h"      // #103: tabs + camera persistence
 #include "view/ViewHistory.h"       // #106: capture_view / apply_view
+#include "view/ViewPrefs.h"         // #151: view_prefs.json + the preference set
 
 namespace netvis {
 
@@ -745,19 +746,80 @@ void App::open_file(const std::string& path) {
   add_recent(path);
 }
 
+// --- ViewState <-> ViewPrefs (#151) ----------------------------------------
+// The only part of preference handling that needs ImGui (ViewState is an ImGui
+// type), so it stays in this TU while the file format lives in netvis_core's
+// view/ViewPrefs.cpp. Defined HERE rather than beside save_prefs/load_prefs
+// further down because new_tab()/close_tab() below are the other callers.
+namespace {
+
+// ViewState -> ViewPrefs. `plugins` is filled by the caller: it is App-owned,
+// not part of any tab's view.
+ViewPrefs prefs_from_view(const ViewState& vs) {
+  ViewPrefs p;
+  p.dark_theme = vs.dark_theme;
+  p.show_minimap = vs.show_minimap;
+  p.show_layer_bands = vs.show_layer_bands;
+  p.edge_tooltips = vs.edge_tooltips;
+  p.cost_heatmap = vs.cost_heatmap;
+  p.heatmap_log_scale = vs.heatmap_log_scale;
+  p.heatmap_metric = vs.heatmap_metric;
+  p.heatmap_gradient = vs.heatmap_gradient;
+  p.edge_routing = vs.edge_routing;
+  p.accessible_palette = vs.accessible_palette;
+  p.ui_scale = vs.ui_scale;
+  p.restore_session = vs.restore_session;
+  p.custom_ridge = vs.custom_ridge;
+  p.machine_profiles = vs.machine_profiles;
+  return p;
+}
+
+// ViewPrefs -> ViewState. Touches ONLY the preference fields, so it is safe to
+// run against a tab that already has a camera, a selection and a live model —
+// which is exactly what #151 needs when a second tab is born mid-session.
+void apply_prefs_to_view(const ViewPrefs& p, ViewState& vs) {
+  vs.dark_theme = p.dark_theme;
+  vs.show_minimap = p.show_minimap;
+  vs.show_layer_bands = p.show_layer_bands;
+  vs.edge_tooltips = p.edge_tooltips;
+  vs.cost_heatmap = p.cost_heatmap;
+  vs.heatmap_log_scale = p.heatmap_log_scale;
+  vs.heatmap_metric = p.heatmap_metric;
+  vs.heatmap_gradient = p.heatmap_gradient;
+  vs.edge_routing = p.edge_routing;
+  vs.accessible_palette = p.accessible_palette;
+  vs.ui_scale = p.ui_scale;
+  vs.restore_session = p.restore_session;
+  vs.custom_ridge = p.custom_ridge;
+  vs.machine_profiles = p.machine_profiles;
+}
+
+}  // namespace
+
 // --- Tabs (#62) ------------------------------------------------------------
 void App::switch_tab(size_t i) {
   if (i < tabs_.size()) { active_tab_ = i; want_tab_sync_ = true; }
 }
 
 void App::new_tab() {
+  // #151: carry the user's PREFERENCES into the new tab. The comment that used to
+  // sit at the foot of this function claimed a new tab "inherits the current
+  // theme/toggles" — it never did. Tab holds a default-constructed ViewState, and
+  // open_file() opens every model past the first in a new tab, so a user on the
+  // light theme with the minimap off got the shipped defaults back the moment they
+  // opened a second model. load_prefs() could not help: it runs once at startup,
+  // into whichever tab existed then.
+  //
+  // Captured BY VALUE before push_back, because `carry` is read after the vector
+  // has grown and after active_tab_ has moved off the tab it came from.
+  const ViewPrefs carry = prefs_from_view(view());
   tabs_.push_back(std::make_unique<Tab>());
   active_tab_ = tabs_.size() - 1;
   want_tab_sync_ = true;
   install_size_fn(*tabs_.back());
-  // A new tab inherits the current theme/toggles so the view is consistent; the
-  // persisted prefs already live in the active view we are leaving, and per-tab
-  // divergence (e.g. a different heatmap metric) is intentional and harmless.
+  apply_prefs_to_view(carry, view());
+  // Per-MODEL state (camera, selection, filters, nav, collapse) is deliberately
+  // NOT carried: it is indexed against a graph the new tab does not have.
 }
 
 void App::close_tab(size_t i) {
@@ -783,6 +845,10 @@ void App::close_tab(size_t i) {
       break;
     }
   }
+  // #151: the replacement tab below is default-constructed too, so closing the
+  // last tab would reset the theme and the toggles just as opening one did. Read
+  // the preferences off the tab being closed BEFORE erase() frees it.
+  const ViewPrefs carry = prefs_from_view(tabs_[i]->view);
   // ~Tab shuts the pool down (joins workers) before the ModelSession dies.
   tabs_.erase(tabs_.begin() + static_cast<long>(i));
   want_tab_sync_ = true;
@@ -792,6 +858,7 @@ void App::close_tab(size_t i) {
     tabs_.push_back(std::make_unique<Tab>());
     install_size_fn(*tabs_.back());
     active_tab_ = 0;
+    apply_prefs_to_view(carry, view());
     return;
   }
   // Keep active_tab_ pointing at a sensible neighbor.
@@ -1414,153 +1481,33 @@ void App::add_recent(const std::string& path) {
 
 // ---------------------------------------------------------------------------
 // View preferences (view_prefs.json next to the layout cache) — v0.3.2 QoL.
-// Persists the heatmap gradient/scale, theme, and a couple of toggles so they
-// survive across sessions. Best-effort: a missing/corrupt file just keeps the
-// in-memory defaults, exactly like recent.json.
+// The FILE format and its guarded reads live in view/ViewPrefs.cpp (netvis_core,
+// so netvis_tests can exercise them). These two are just the plumbing between
+// that file and the active tab's ViewState + the App-owned plugin set.
 // ---------------------------------------------------------------------------
-namespace {
-nlohmann::json rgba_to_json(const Rgba8& c) {
-  return nlohmann::json::array({c.r, c.g, c.b});
-}
-Rgba8 rgba_from_json(const nlohmann::json& j, Rgba8 fallback) {
-  if (!j.is_array() || j.size() < 3) return fallback;
-  auto byte = [](const nlohmann::json& e, uint8_t f) -> uint8_t {
-    if (!e.is_number_integer() && !e.is_number_unsigned()) return f;
-    int64_t v = e.get<int64_t>();
-    if (v < 0) v = 0;
-    if (v > 255) v = 255;
-    return static_cast<uint8_t>(v);
-  };
-  return Rgba8{byte(j[0], fallback.r), byte(j[1], fallback.g),
-               byte(j[2], fallback.b), 255};
-}
-GradientPreset preset_from_name(const std::string& s) {
-  for (int i = 0; i < kGradientPresetCount; ++i) {
-    auto p = static_cast<GradientPreset>(i);
-    if (s == gradient_preset_name(p)) return p;
-  }
-  return GradientPreset::Viridis;
-}
-}  // namespace
-
 void App::save_prefs() {
-  const HeatmapGradient& g = view().heatmap_gradient;
-  nlohmann::json j;
-  j["dark_theme"] = view().dark_theme;
-  j["show_minimap"] = view().show_minimap;
-  j["show_layer_bands"] = view().show_layer_bands;  // #20 (v0.8.1)
-  j["edge_tooltips"] = view().edge_tooltips;        // #18 (v0.8.1)
-  j["cost_heatmap"] = view().cost_heatmap;
-  j["heatmap_log_scale"] = view().heatmap_log_scale;
-  j["heatmap_metric"] = heatmap_metric_name(view().heatmap_metric);
-  j["gradient_preset"] = gradient_preset_name(g.preset);
-  j["gradient_reverse"] = g.reverse;
-  j["gradient_low"] = rgba_to_json(g.low);
-  j["gradient_mid"] = rgba_to_json(g.mid);
-  j["gradient_high"] = rgba_to_json(g.high);
-  // #11: per-plugin enable overrides (empty object if the user changed nothing).
-  j["plugins"] = plugin_enabled_.to_json();
-  // #4/#30 (v0.8.3): custom roofline ridge + named machine profiles.
-  j["edge_routing"] = view().edge_routing;  // #22 (v0.9.0)
-  // v0.9.4: the settings a user sets once and expects to survive a restart. The
-  // two WINDOW toggles (show_preferences/show_shortcuts) are deliberately NOT
-  // here — a settings window that reopens itself every launch is a nuisance, not
-  // a restored preference.
-  j["accessible_palette"] = view().accessible_palette;  // #104
-  j["ui_scale"] = view().ui_scale;                      // #104
-  j["restore_session"] = view().restore_session;        // #103
-  if (view().custom_ridge > 0.0) j["custom_ridge"] = view().custom_ridge;
-  if (!view().machine_profiles.empty()) {
-    nlohmann::json profs = nlohmann::json::array();
-    for (const auto& [name, ridge] : view().machine_profiles)
-      profs.push_back({{"name", name}, {"ridge", ridge}});
-    j["machine_profiles"] = profs;
-  }
-  std::ofstream f(layout_cache_dir() + "/view_prefs.json");
-  // `replace` for the same reason as save_recent: machine-profile names are
-  // free text the user can paste into, so strict UTF-8 could throw out of a
-  // routine preference save.
-  if (f) f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+  ViewPrefs p = prefs_from_view(view());
+  p.plugins = plugin_enabled_;
+  // #151: a preference belongs to the USER, not to whichever tab happened to be
+  // active when it was set. Every path that changes one lands here, so this is
+  // the one place the other tabs can be brought along. Without it a tab opened
+  // BEFORE the change keeps the old value, and the next save from that tab
+  // writes the stale value back over view_prefs.json — a setting quietly
+  // reverting itself, which is the complaint this issue opened with.
+  for (auto& t : tabs_) apply_prefs_to_view(p, t->view);
+  save_view_prefs(p);
 }
 
 void App::load_prefs() {
-  const std::string p = layout_cache_dir() + "/view_prefs.json";
-  std::ifstream f(p);
-  if (!f) return;
-  try {
-    nlohmann::json j;
-    f >> j;
-    if (!j.is_object()) return;
-    if (j.contains("dark_theme") && j["dark_theme"].is_boolean())
-      view().dark_theme = j["dark_theme"].get<bool>();
-    if (j.contains("show_minimap") && j["show_minimap"].is_boolean())
-      view().show_minimap = j["show_minimap"].get<bool>();
-    if (j.contains("show_layer_bands") && j["show_layer_bands"].is_boolean())
-      view().show_layer_bands = j["show_layer_bands"].get<bool>();  // #20
-    if (j.contains("edge_tooltips") && j["edge_tooltips"].is_boolean())
-      view().edge_tooltips = j["edge_tooltips"].get<bool>();        // #18
-    if (j.contains("cost_heatmap") && j["cost_heatmap"].is_boolean())
-      view().cost_heatmap = j["cost_heatmap"].get<bool>();
-    if (j.contains("heatmap_log_scale") && j["heatmap_log_scale"].is_boolean())
-      view().heatmap_log_scale = j["heatmap_log_scale"].get<bool>();
-    if (j.contains("heatmap_metric") && j["heatmap_metric"].is_string())
-      view().heatmap_metric =
-          heatmap_metric_from_name(j["heatmap_metric"].get<std::string>().c_str());
-
-    HeatmapGradient& g = view().heatmap_gradient;
-    if (j.contains("gradient_preset") && j["gradient_preset"].is_string()) {
-      GradientPreset preset = preset_from_name(j["gradient_preset"].get<std::string>());
-      gradient_set_preset(g, preset);  // fills stops for a built-in preset
-    }
-    if (j.contains("gradient_reverse") && j["gradient_reverse"].is_boolean())
-      g.reverse = j["gradient_reverse"].get<bool>();
-    // Only a Custom gradient carries its own stops; for a built-in preset the
-    // preset's stops (just filled by gradient_set_preset) are authoritative, so a
-    // "Viridis" tag always shows Viridis colors and a future change to the preset
-    // constants isn't pinned to a stale persisted copy.
-    if (g.preset == GradientPreset::Custom) {
-      if (j.contains("gradient_low"))
-        g.low = rgba_from_json(j["gradient_low"], g.low);
-      if (j.contains("gradient_mid"))
-        g.mid = rgba_from_json(j["gradient_mid"], g.mid);
-      if (j.contains("gradient_high"))
-        g.high = rgba_from_json(j["gradient_high"], g.high);
-    }
-    // #11: per-plugin enable overrides (guarded; never prunes, ignores non-bool).
-    if (j.contains("plugins") && j["plugins"].is_object())
-      plugin_enabled_.load_json(j["plugins"]);
-    // #4/#30: custom ridge + named machine profiles.
-    if (j.contains("edge_routing") && j["edge_routing"].is_number_integer()) {
-      int er = j["edge_routing"].get<int>();
-      if (er >= 0 && er <= 2) view().edge_routing = er;
-    }
-    if (j.contains("accessible_palette") && j["accessible_palette"].is_boolean())
-      view().accessible_palette = j["accessible_palette"].get<bool>();
-    if (j.contains("restore_session") && j["restore_session"].is_boolean())
-      view().restore_session = j["restore_session"].get<bool>();
-    // CLAMPED on load, not merely on edit. A persisted 0, a negative, or a NaN
-    // would render an unusable window — and the setting that caused it lives
-    // inside that window, so the user could not reach it to undo the damage.
-    // Written as !(in range) so NaN is rejected too, where a naive comparison
-    // would let it through.
-    if (j.contains("ui_scale") && j["ui_scale"].is_number()) {
-      const float sc = j["ui_scale"].get<float>();
-      view().ui_scale = !(sc >= 0.75f && sc <= 2.0f) ? 1.0f : sc;
-    }
-    if (j.contains("custom_ridge") && j["custom_ridge"].is_number())
-      view().custom_ridge = j["custom_ridge"].get<double>();
-    if (j.contains("machine_profiles") && j["machine_profiles"].is_array()) {
-      view().machine_profiles.clear();
-      for (const auto& e : j["machine_profiles"]) {
-        if (e.is_object() && e.contains("name") && e["name"].is_string() &&
-            e.contains("ridge") && e["ridge"].is_number())
-          view().machine_profiles.emplace_back(e["name"].get<std::string>(),
-                                               e["ridge"].get<double>());
-      }
-    }
-  } catch (...) {
-    // Corrupt prefs -> keep defaults.
-  }
+  // The base is the LIVE view, so every key absent from an older prefs file
+  // degrades to the default declared in App.h rather than to a second copy of
+  // that default kept in ViewPrefs — the two cannot drift apart if only one of
+  // them is ever consulted at runtime.
+  ViewPrefs base = prefs_from_view(view());
+  base.plugins = plugin_enabled_;
+  const ViewPrefs p = load_view_prefs(base);
+  apply_prefs_to_view(p, view());
+  plugin_enabled_ = p.plugins;
 }
 
 void App::reload_plugins() {
