@@ -21,7 +21,8 @@
 //   1. Build DAG over display nodes (edge A->B if an IR node in A produces a
 //      value consumed by an IR node in B).
 //   2. Cycle break via DFS back-edge detection (reversed edges flagged).
-//   3. Longest-path layering.
+//   3. Longest-path layering, then (3b) a reverse-topological pull-down that
+//      sinks constants to the layer just above the node that uses them (#153).
 //   4. Barycenter crossing reduction (down+up sweeps, early stop).
 //   5. Coordinate assignment (y per layer top-down, x by order + median align).
 //   6. Cubic-bezier edge routing.
@@ -35,6 +36,7 @@
 #include <vector>
 
 #include "engine/CollapseTree.h"
+#include "engine/OpCategory.h"
 
 namespace netvis {
 
@@ -132,6 +134,13 @@ struct DEdge {
 };
 
 }  // namespace
+
+// See LayoutEngine.h: the single definition of "constant/initializer source",
+// shared with the view's hide-constants toggle (#153).
+bool node_is_const_source(const ir::Model& m, const ir::Node& n) {
+  if (n.inputs.count == 0) return true;
+  return categorize_op(m.str(n.op_type)) == OpCategory::Tensor;
+}
 
 // ---------------------------------------------------------------------------
 // compute_layout
@@ -301,44 +310,99 @@ LayoutResult compute_layout(const ir::Model& model, uint32_t graph_index,
   // Compute via a topological pass using Kahn on the acyclic (post-reversal)
   // graph. O(V+E).
   std::vector<int32_t> layer(V, 0);
+  // #153: the Kahn order is KEPT (it used to be a scratch local named `ready`).
+  // The constant pull-down below has to visit nodes in reverse topological
+  // order, and Kahn already produces exactly that order for free — recomputing
+  // it would be a second O(V+E) sweep for nothing.
+  std::vector<uint32_t> topo;
   {
     std::vector<uint32_t> pending = indeg;  // Kahn drains this to zero
-    std::vector<uint32_t> ready;
+    topo.reserve(V);
     for (uint32_t v = 0; v < V; ++v)
-      if (pending[v] == 0) ready.push_back(v);
-    std::sort(ready.begin(), ready.end());
+      if (pending[v] == 0) topo.push_back(v);
+    std::sort(topo.begin(), topo.end());
     size_t head = 0;
     // Process deterministically: maintain sorted-ish by popping in order.
-    while (head < ready.size()) {
-      uint32_t u = ready[head++];
+    while (head < topo.size()) {
+      uint32_t u = topo[head++];
       for (uint32_t w : eff_out[u]) {
         if (layer[w] < layer[u] + 1) layer[w] = layer[u] + 1;
-        if (--pending[w] == 0) ready.push_back(w);
+        if (--pending[w] == 0) topo.push_back(w);
       }
     }
-    // Cycle remnants (shouldn't happen after reversal): leave layer as-is.
+    // Cycle remnants (shouldn't happen after reversal): leave layer as-is. They
+    // are simply absent from `topo`, so every pass keyed off it skips them.
   }
 
-  // -- 3b) Pull "constant-like" source nodes DOWN next to their consumers.
-  // Longest-path layering pins every source (in-degree 0) to layer 0. In real
-  // models most sources are constants/initializers/weights that feed a node deep
-  // in the graph, so they all pile onto the top row and their edges spray across
-  // the entire canvas (the classic hairball). Instead, place each source just
-  // above its NEAREST consumer: layer = min(consumer layer) - 1. This keeps a
-  // constant adjacent to where it is used and collapses those long edges.
-  // Only sources are moved (they have no predecessors, so lowering them can
-  // never violate an edge from above); non-sources keep their longest-path rank.
+  // -- 3b) Pull constants DOWN to the layer just above the node that uses them.
+  //
+  // Longest-path layering pins every source (in-degree 0) to layer 0, so in a
+  // real model the constants/initializers/weights all pile onto the top row and
+  // their edges spray across the whole canvas (the classic hairball). This pass
+  // pushes each of them as far down as the layering allows: just above its
+  // NEAREST consumer.
+  //
+  // #153: this used to move ONLY in-degree-0 sources, one hop. That is not
+  // enough for a Netron-shaped graph, because in a real export a constant is
+  // rarely a single node — it is a small CONE of them (Constant -> Cast -> Cast
+  // -> ... -> the op that finally uses the value). Only the ROOT of that cone is
+  // a source, so the rest of the cone kept its longest-path rank and stayed
+  // welded to the top of the drawing, which is exactly the "all the constants
+  // are at the start" complaint. The movable set is therefore the union of
+  //   (a) every in-degree-0 source (unchanged behaviour), and
+  //   (b) every CONST-LIKE node: node_is_const_source() — the same predicate the
+  //       view's hide-constants toggle uses, so the two can never disagree — AND
+  //       every display predecessor is itself const-like.
+  // (b) is deliberately conservative on both halves. Seeding only from
+  // node_is_const_source keeps a Cast that sits on the real activation path out
+  // of the set (its predecessor is a compute node), and requiring ALL
+  // predecessors to be const-like stops the cone leaking into a node that also
+  // consumes a live value.
+  //
+  // MULTI-CONSUMER RULE: a constant used by several ops is placed above its
+  // EARLIEST (topmost) consumer; it is NOT duplicated here. Duplication happens
+  // further down and only for in-degree-0 sources, where a clone needs no
+  // incoming edge — cloning a cone INTERIOR node would strand the clone with no
+  // producer above it. The trade-off is that the far consumers of a shared cone
+  // still get one long edge each.
+  //
+  // Both halves run as ONE reverse-topological relaxation, which is what makes
+  // the cone case work at all: a node must see its successors' FINAL layers, and
+  // in a cone those successors are themselves being moved.
+  //
+  //   layer[v] := max(layer[v], min over successors w of (layer[w] - 1))
+  //
+  // The floor is the node's own longest-path layer, which is exactly
+  // max(pred layer)+1 by definition of longest-path layering — so no in-adjacency
+  // is needed here, and because v is visited before any of its predecessors,
+  // layer[v] still holds that value when it is read. That floor is also the proof
+  // the result stays a valid (acyclic) layering: layers only ever increase, and
+  // every node still lands strictly below all of its predecessors and strictly
+  // above all of its successors. The maximum layer is unchanged, so no empty
+  // layers appear. O(V+E), one pass, no per-node allocation.
   {
+    // const_like: seed from the shared predicate, then clear any node that has a
+    // non-const-like predecessor. Forward topological order guarantees a node's
+    // own flag is final before it is used to judge its successors.
+    std::vector<uint8_t> const_like(V, 0);
     for (uint32_t v = 0; v < V; ++v) {
-      if (indeg[v] != 0) continue;    // only sources
+      const DisplayNode& d = disp[v];
+      // A collapsed group is a compound of many ops, never a constant.
+      if (d.is_group || d.ir_node >= nIR) continue;
+      const_like[v] = node_is_const_source(model, g.nodes[d.ir_node]) ? 1 : 0;
+    }
+    for (uint32_t v : topo)
+      if (!const_like[v])
+        for (uint32_t w : eff_out[v]) const_like[w] = 0;
+
+    for (size_t i = topo.size(); i-- > 0;) {
+      const uint32_t v = topo[i];
+      if (indeg[v] != 0 && !const_like[v]) continue;  // pinned by longest path
       const CsrSpan outs = eff_out[v];
-      if (outs.empty()) continue;     // isolated node: leave at 0
-      int32_t min_consumer = std::numeric_limits<int32_t>::max();
-      for (uint32_t w : outs)
-        min_consumer = std::min(min_consumer, layer[w]);
-      // Sit one layer above the nearest consumer (never below 0).
-      if (min_consumer != std::numeric_limits<int32_t>::max())
-        layer[v] = std::max(0, min_consumer - 1);
+      if (outs.empty()) continue;  // no consumer to sit above: leave it be
+      int32_t hi = std::numeric_limits<int32_t>::max();
+      for (uint32_t w : outs) hi = std::min(hi, layer[w] - 1);
+      layer[v] = std::max(layer[v], hi);
     }
   }
 

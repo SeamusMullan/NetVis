@@ -37,8 +37,14 @@ namespace {
 //       improve — which at the 100k rung is every graph, since exactly one sweep
 //       runs and it does not improve. Without this bump a stale .nvl would hide
 //       the fix entirely.
+//   v6 (#153): the constant pull-down was generalized from "in-degree-0 sources,
+//       one hop" to a reverse-topological relaxation over whole CONSTANT CONES
+//       (Constant -> Cast -> ... -> the op that uses the value), so the cone
+//       interior no longer stays pinned to the top of the drawing. Layers — and
+//       therefore positions — change for any graph that has such a cone, which
+//       is most real exports. Without this bump a stale .nvl would hide it.
 constexpr uint32_t kMagic = 0x4C56454Eu;  // "NEVL" little-endian
-constexpr uint32_t kVersion = 5;
+constexpr uint32_t kVersion = 6;
 
 // On-disk header. POD, written/read verbatim. All fields little-endian on the
 // platforms we target (x86-64 / arm64); the cache is machine-local so we do not
