@@ -64,14 +64,43 @@ change NetVis has shipped, instead of a number nobody can explain.
 
 ### `bench/baseline.json` does not exist yet
 
-As of the #97 harness landing, this file is intentionally absent: the
-harness that would produce real numbers didn't exist until this same
-change, so there is nothing genuine to commit yet. Any baseline written
+As of the #97 harness landing, this file was intentionally absent: the
+harness that would produce real numbers didn't exist until that same
+change, so there was nothing genuine to commit. Any baseline written
 before the harness has actually been built and run would be fabricated
-data. The CI perf-gate job (`.github/workflows/ci.yml`) detects the missing
+data. The CI perf-gate job (`.github/workflows/ci.yml`) detects a missing
 file and runs in report-only mode (uploads the bench JSON as an artifact,
-does not fail the build) until a maintainer generates the first real
-baseline with `--update` above and commits it as its own reviewed change.
+does not fail the build) until a maintainer generates a real baseline with
+`--update` above and commits it as its own reviewed change. A baseline has
+since been committed; that report-only path stays in the workflow because
+the next schema bump puts the repo back in exactly this position.
+
+### The committed baseline is STALE as of the #154 schema bump
+
+`kBenchSchema` moved to `netvis.bench.v2` (`src/engine/Bench.h`) when the
+run started carrying its full host description. The committed
+`bench/baseline.json` is a `netvis.bench.v1` file, so `bench_gate.py`
+refuses to compare against it and exits 2 — deliberately, since a bump means
+a field's meaning may have changed. CI reports that as a warning and passes
+(see the `Compare against baseline` step), so **nothing is being gated on
+timing until a maintainer re-baselines**, and a real regression landing in
+that window will not be caught.
+
+Fixing it needs a CI-generated run, not a local one: the baseline must come
+from the machine class the gate compares against, and a workstation baseline
+reintroduces the core-count mismatch (#121, #148) this change exists to stop
+misreporting. Download `bench-current.json` from the `bench-result` artifact
+of a perf-gate run on `master`, then:
+
+```sh
+python3 tools/bench_gate.py --baseline bench/baseline.json \
+    --current bench-current.json --update
+```
+
+Commit that on its own, per the rule above. Do not generate it locally and
+do not hand-edit the old file's `schema` string — the tag exists to say which
+code wrote the numbers, and rewriting it makes the file claim a provenance it
+does not have.
 
 ## Threshold and noise floor
 

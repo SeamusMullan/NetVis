@@ -343,6 +343,22 @@ TEST_CASE("#97 build_bench_json: schema tag, frozen stage-name spelling, case/st
   json j = json::parse(text);  // throws (-> test failure) on malformed JSON
   CHECK(j.at("schema") == kBenchSchema);
 
+  // #154: the host-description block. Asserted as PRESENCE and TYPE, never as
+  // value — every one of these is whatever machine ran the test, and the test
+  // has to pass on a maintainer's workstation and on a 2-core runner alike.
+  // The check that matters is that no field silently disappears: the gate
+  // reads each one with a .get() default, so a dropped key degrades to
+  // "unknown" in the gate's report instead of failing anywhere visible.
+  CHECK(j.contains("hardware_concurrency"));
+  CHECK(j.at("arch").is_string());
+  CHECK(j.at("os").is_string());
+  // Emitted as null when the platform would not say (core/HostInfo.h), so the
+  // type is "string or null" — anything else means Bench.cpp fabricated a
+  // value for an unavailable probe.
+  CHECK((j.at("cpu_model").is_string() || j.at("cpu_model").is_null()));
+  CHECK((j.at("physical_cores").is_number() || j.at("physical_cores").is_null()));
+  CHECK((j.at("total_ram_bytes").is_number() || j.at("total_ram_bytes").is_null()));
+
   // Pin the frozen constants' literal spelling: a stage rename would still
   // round-trip below (the loop reads whatever name IS there), so that loop
   // alone can't catch a rename — this is the guard the header's "renaming is

@@ -18,16 +18,27 @@ slower" apart from "the gate itself could not run"):
     1 - a real regression was found: a matched stage exceeded the threshold, or
         a stage present in the baseline is MISSING from the current run.
     2 - the run could not be judged at all: missing/unreadable file, invalid
-        JSON, missing required keys, a schema tag mismatch, or a build-type
-        mismatch. Silence or a pass in these cases would be worse than a loud
-        failure, because the whole point of the gate is that a pass MEANS
-        something (see docs/v1.0-plan.md's gate policy, quoted in the DIGEST
-        for #97).
+        JSON, missing required keys, a schema tag mismatch, a hardware
+        mismatch, or a build-type mismatch. Silence or a pass in these cases
+        would be worse than a loud failure, because the whole point of the
+        gate is that a pass MEANS something (see docs/v1.0-plan.md's gate
+        policy, quoted in the DIGEST for #97).
+
+HOW CI CONSUMES THESE (#154). The workflow's "Compare against baseline" step
+maps exit 2 to a ::warning:: annotation and lets the job pass, while exit 1
+(and any other non-zero status) still fails it. That is the point of the two
+codes: `ubuntu-latest` hands out 2- and 4-core runners interchangeably, so a
+core-count mismatch against a CI-generated baseline is routine and says
+nothing about the branch under review -- failing on it made the gate red on
+every PR without measuring anything (#148), which trains people to ignore it.
+Exit 2 is therefore reported, never enforced; exit 1 is enforced. Anything
+that changes the meaning of these codes must be changed in
+.github/workflows/ci.yml at the same time.
 
 INTEGRATION NOTE on the JSON shape this script expects: engine/Bench.h (the
 frozen contract) documents build_bench_json() as emitting "kBenchSchema, the
-host's logical core count, and the build type" alongside the BenchCase array,
-but does not spell out the exact JSON key names — that lives in Bench.cpp,
+build type and a core/HostInfo description of the machine" alongside the
+BenchCase array, but does not spell out the exact JSON key names — that lives in Bench.cpp,
 authored by a different task in this same milestone. This script assumes the
 same naming convention ReportJson.cpp already uses for the sibling --report
 JSON (plain lower_snake_case field-per-struct-member: "schema", "cases",
@@ -134,6 +145,31 @@ def load_bench(path_str, role):
     return data
 
 
+def describe_host(data):
+    """One line naming the machine a run was recorded on (#154).
+
+    EVERY field is read with .get() and an explicit fallback, and never
+    subscripted: a schema-v1 baseline predates all of these keys, and a gate
+    that raises KeyError on an old file has turned "I cannot compare these"
+    into a crash, which is the one outcome CI cannot classify. A missing key
+    and an explicit JSON null are treated identically on purpose --
+    engine/Bench.cpp emits null for "the host would not say"
+    (core/HostInfo.h), so both mean exactly "unknown" here.
+    """
+    cpu = data.get("cpu_model") or "unknown CPU"
+    logical = data.get("hardware_concurrency") or 0
+    physical = data.get("physical_cores") or 0
+    arch = data.get("arch") or "unknown arch"
+    os_name = data.get("os") or "unknown OS"
+    ram_bytes = data.get("total_ram_bytes") or 0
+
+    cores = "{} physical / {} logical cores".format(
+        physical or "?", logical or "?"
+    )
+    ram = f"{ram_bytes / (1024.0 ** 3):.1f} GiB RAM" if ram_bytes else "unknown RAM"
+    return f"{cpu} ({cores}, {arch}/{os_name}, {ram})"
+
+
 def check_comparable(baseline, current):
     """Refuse to compare two runs that are not measuring the same thing.
 
@@ -177,6 +213,7 @@ def check_comparable(baseline, current):
             "compare locally, re-baseline locally with --update (and do not "
             "commit that).".format(base_cores, cur_cores)
         )
+
 
     if baseline["build"] != current["build"]:
         raise GateError(
@@ -440,6 +477,8 @@ def main():
     )
     args = parser.parse_args()
 
+    baseline = None
+    current = None
     try:
         if args.update:
             return do_update(args.current, args.baseline)
@@ -449,6 +488,18 @@ def main():
         check_comparable(baseline, current)
     except GateError as e:
         print(f"bench_gate: ERROR: {e}", file=sys.stderr)
+        # Name BOTH machines on the way out (#154). Every GateError raised past
+        # this point means "these two runs are not the same measurement", and
+        # the reader's next question is always "which two?" — a question the
+        # uploaded artifacts could not answer before a run carried its own
+        # hardware. Printed only once both files parsed: if one of them is the
+        # thing that is broken there is no host to describe, and the message
+        # above already names the file at fault.
+        if baseline is not None and current is not None:
+            print(f"bench_gate: baseline host: {describe_host(baseline)}",
+                  file=sys.stderr)
+            print(f"bench_gate: current  host: {describe_host(current)}",
+                  file=sys.stderr)
         return EXIT_ERROR
 
     rows, any_failure = compare(baseline, current, args.threshold)
@@ -459,6 +510,11 @@ def main():
     n_improved = sum(1 for r in rows if r["verdict"] == "IMPROVED (verify)")
 
     print(f"bench_gate: schema={current['schema']!r} build_type={current['build']!r}")
+    # Both hosts on a PASSING run too, not only on a refusal: "these numbers
+    # were comparable" is a claim about two machines, and it should be
+    # checkable from the log rather than taken on trust.
+    print(f"bench_gate: baseline host: {describe_host(baseline)}")
+    print(f"bench_gate: current  host: {describe_host(current)}")
     print(f"bench_gate: threshold={args.threshold*100:.0f}% noise_floor={NOISE_FLOOR_MS}ms "
           f"(stages where BOTH readings are under the floor are never flagged, "
           "regardless of their percentage delta)")
