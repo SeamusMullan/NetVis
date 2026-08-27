@@ -53,6 +53,9 @@ namespace netvis {
 
 namespace {
 
+using panel_detail::copyable_text;
+using panel_detail::copyable_text_colored;
+using panel_detail::copyable_text_fmt;
 using panel_detail::grouped_count;
 using panel_detail::human_bytes;
 using panel_detail::icontains;
@@ -99,7 +102,9 @@ void signed_row(const char* label, uint64_t a, uint64_t b, bool bytes) {
                          (bytes ? human_bytes(mag) : grouped_count(mag_i));
   ImGui::Text("%s", label);
   ImGui::SameLine(150.0f);
-  ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s", dv.c_str());
+  // #152: only the delta becomes a copy-box, and `label` is its ImGui id — it is
+  // already unique per call site, so no PushID is needed.
+  copyable_text_colored(label, ImGui::ColorConvertU32ToFloat4(col), dv);
 }
 
 // The same row for a genuinely real-valued statistic (#34 min/max/mean/std).
@@ -113,7 +118,9 @@ void float_row(const char* label, double a, double b) {
   else if (d < 0.0) col = kColRemoved;
   ImGui::Text("%s", label);
   ImGui::SameLine(150.0f);
-  ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%+.6g", d);
+  char dbuf[64];
+  std::snprintf(dbuf, sizeof(dbuf), "%+.6g", d);
+  copyable_text_colored(label, ImGui::ColorConvertU32ToFloat4(col), dbuf);
   ImGui::SameLine();
   ImGui::TextDisabled("(A %.6g  B %.6g)", a, b);
 }
@@ -339,7 +346,7 @@ void draw_comparison_ladder(App& app, bool lock_slots) {
     if (bn.empty()) {
       ImGui::TextDisabled("(none)");
     } else {
-      ImGui::Text("%.*s", static_cast<int>(bn.size()), bn.data());
+      copyable_text("file", bn);
       ImGui::SetItemTooltip("%s", path.c_str());
     }
 
@@ -464,7 +471,7 @@ void draw_tensor_delta_result(const TensorDeltaSlot& st) {
         "bytes for that tensor only).");
     return;
   }
-  ImGui::Text("%s", st.name.c_str());
+  copyable_text("tdname", st.name);
   if (st.in_flight) {
     ImGui::Text("decoding both sides %c", spinner_glyph());
     return;
@@ -1009,7 +1016,9 @@ void draw_diff_panel(App& app) {
       break;
   }
 
-  ImGui::Text("Comparison: %s", dl.path_of(ai).c_str());
+  ImGui::TextUnformatted("Comparison: ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("cmppath", dl.path_of(ai));
   const ModelDiffResult* diff = dl.diff_of(ai);
   if (diff == nullptr) {
     ImGui::TextDisabled("No diff result.");
@@ -1028,13 +1037,23 @@ void draw_diff_panel(App& app) {
   const bool primary_matches = slot_primary_matches(dl, ai, s);
 
   ImGui::SeparatorText("Summary");
-  ImGui::Text("same:    %u", diff->same);
-  ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColAdded), "added:   %u",
-                     diff->added);
-  ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColRemoved), "removed: %u",
-                     diff->removed);
-  ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChanged), "changed: %u",
-                     diff->changed);
+  // #152: label and count are two items so a paste is the bare number. The label
+  // keeps its own colour, so the row still reads exactly as it did; SameLine(0,0)
+  // adds no gap, preserving the space-padded alignment.
+  auto count_row = [](const char* id, const char* label, const ImVec4& col,
+                      uint32_t n) {
+    ImGui::TextColored(col, "%s", label);
+    ImGui::SameLine(0.0f, 0.0f);
+    copyable_text_colored(id, col, std::to_string(n));
+  };
+  count_row("d_same", "same:    ", ImGui::GetStyleColorVec4(ImGuiCol_Text),
+            diff->same);
+  count_row("d_added", "added:   ", ImGui::ColorConvertU32ToFloat4(kColAdded),
+            diff->added);
+  count_row("d_removed", "removed: ",
+            ImGui::ColorConvertU32ToFloat4(kColRemoved), diff->removed);
+  count_row("d_changed", "changed: ",
+            ImGui::ColorConvertU32ToFloat4(kColChanged), diff->changed);
 
   // A-side (node lists + cost delta + tensor diff + #37 export) is only valid
   // when the active session is the one this slot was pinned to. Otherwise stop

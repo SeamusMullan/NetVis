@@ -11,6 +11,8 @@
 #include <string>
 #include <string_view>
 
+#include "imgui.h"
+
 #include "core/SmallVec.h"
 #include "engine/CollapseTree.h"
 #include "engine/Layout.h"
@@ -59,6 +61,44 @@ BoxCenter box_center_for_display(const LayoutResult* layout, int32_t display_id)
 // `gi` is the graph index the node lives in; returns "{}" if indices are OOB.
 std::string node_to_json(const ir::Model& model, const ir::Graph& g,
                          const ir::Node& node);
+
+// --- Copyable panel text (#152) ----------------------------------------------
+//
+// Every string a panel shows used to be an ImGui::Text, and ImGui::Text draws
+// glyphs — it produces no selection and no clipboard. A user who wanted a tensor
+// name, a dtype, a file path or a stat out of NetVis had to retype it by eye,
+// which for a 90-character transformer weight name is where the bug reports came
+// from.
+//
+// ONE idiom, used at every converted call site: the string draws as ordinary text
+// until it is DOUBLE-CLICKED, at which point that single label is replaced in
+// place by a read-only ImGui::InputText (ReadOnly | AutoSelectAll) that is
+// keyboard-focused and fully selected, so Ctrl+C works immediately and a drag can
+// still take a substring.
+//
+// WHY NOT an always-live read-only InputText (the other common ImGui recipe): an
+// active InputText raises io.WantCaptureKeyboard, so every app hotkey (command
+// palette, search, tab switching) would die the moment a *label* took focus.
+// Gating the box behind a deliberate double-click means the keyboard is only
+// captured when the user actually asked to copy something.
+//
+// WHY NOT Selectable + SetClipboardText: it can only ever copy the whole string,
+// shows no selection to confirm what was taken, and eats the single click that
+// PropertiesPanel/DiffPanel already bind to jump-to-node.
+//
+// The box is drawn with FramePadding (0,0), no border and a transparent frame, so
+// it occupies EXACTLY the rect the text occupied; otherwise activating one label
+// would grow its row by 2*FramePadding.y and shove the whole panel below it down.
+// Only one label is expanded at a time (a single static id), and the id is
+// dropped if the panel that owns it stops drawing.
+//
+// Main-thread only, like everything else here. `id` must be unique within the
+// current ImGui ID stack (loops already PushID, so a plain literal is enough).
+void copyable_text(const char* id, std::string_view text);
+void copyable_text_disabled(const char* id, std::string_view text);
+void copyable_text_colored(const char* id, const ImVec4& color, std::string_view text);
+void copyable_text_fmt(const char* id, const char* fmt, ...) IM_FMTARGS(2);
+void copyable_text_disabled_fmt(const char* id, const char* fmt, ...) IM_FMTARGS(2);
 
 }  // namespace panel_detail
 }  // namespace netvis

@@ -37,6 +37,8 @@ namespace netvis {
 
 namespace {
 
+using panel_detail::copyable_text;
+using panel_detail::copyable_text_fmt;
 using panel_detail::display_index_for_node;
 using panel_detail::grouped_count;
 using panel_detail::human_bytes;
@@ -136,28 +138,33 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
       continue;  // #60: filtered out by name
     ++shown;
     ImGui::TableNextRow();
+    // #152: the ID scope now opens BEFORE column 0 because the attribute NAME is
+    // copyable too, and its copy-box needs an id unique to this row.
+    ImGui::PushID(static_cast<int>(ai));
     ImGui::TableSetColumnIndex(0);
     std::string_view aname = model.str(attr.name);
-    ImGui::TextUnformatted(aname.empty() ? "(unnamed)" : std::string(aname).c_str());
+    copyable_text("aname", aname.empty() ? std::string_view("(unnamed)") : aname);
 
     ImGui::TableSetColumnIndex(1);
-    ImGui::PushID(static_cast<int>(ai));
     const ir::AttrValue& v = attr.value;
     switch (v.kind) {
       case ir::AttrValue::Kind::None:
         ImGui::TextDisabled("-");
         break;
       case ir::AttrValue::Kind::Int:
-        ImGui::Text("%lld", static_cast<long long>(v.i));
+        copyable_text_fmt("v", "%lld", static_cast<long long>(v.i));
         break;
       case ir::AttrValue::Kind::Float:
-        ImGui::Text("%g", v.f);
+        copyable_text_fmt("v", "%g", v.f);
         break;
       case ir::AttrValue::Kind::String: {
-        std::string_view s = model.str(v.s);
-        ImGui::TextUnformatted(std::string(s).c_str());
+        copyable_text("v", model.str(v.s));
         break;
       }
+      // Ints/Floats/Strings stay ImGui::TextWrapped: ImGui's multiline
+      // InputText has no word wrap, so a #152 copy-box would turn a wrapped
+      // "[1, 1, 2, 2, ...]" into one horizontally-scrolling line. The #57 "Copy
+      // as JSON" button above this table already lifts every attribute out.
       case ir::AttrValue::Kind::Ints: {
         std::string s = "[";
         for (size_t i = 0; i < v.ints.size(); ++i) {
@@ -196,7 +203,7 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
         std::string line = ir::dtype_name(v.tensor.dtype);
         line += " ";
         line += shape_string(v.tensor.shape);
-        ImGui::TextUnformatted(line.c_str());
+        copyable_text("v", line);
         ImGui::SameLine();
         if (ImGui::SmallButton("Inspect")) app.inspect_tensor(v.tensor);
         break;
@@ -223,7 +230,9 @@ void draw_model_root(App& app, const ir::Model& model) {
   auto kv = [](const char* k, std::string_view val) {
     ImGui::TextDisabled("%s", k);
     ImGui::SameLine(160.0f);
-    ImGui::TextUnformatted(val.empty() ? "-" : std::string(val).c_str());
+    // #152: only the VALUE becomes a copy-box — the key is a dim label nobody
+    // pastes anywhere. `k` doubles as the ImGui id: unique and stable per row.
+    copyable_text(k, val.empty() ? std::string_view("-") : val);
   };
   kv("format", model.str(model.format_name));
   kv("producer", model.str(model.producer));
@@ -309,10 +318,19 @@ void draw_model_root(App& app, const ir::Model& model) {
   // has_graph == false models keep their tensors flat (spec §8.6).
   for (const ir::TensorRef& t : model.flat_tensors) total_params += t.elem_count();
 
-  ImGui::Text("graphs:  %zu", model.graphs.size());
-  ImGui::Text("nodes:   %s", grouped_count(static_cast<int64_t>(node_count)).c_str());
-  ImGui::Text("edges:   %s", grouped_count(static_cast<int64_t>(edge_count)).c_str());
-  ImGui::Text("params:  %s", grouped_count(total_params).c_str());
+  // #152: label and value are submitted as two items so the copy-box wraps the
+  // number ALONE — pasting "nodes:   12,345" into a spreadsheet helps nobody.
+  // SameLine(0,0) adds no spacing, so the column alignment baked into the
+  // trailing spaces of each label is exactly what it was.
+  auto stat = [](const char* id, const char* label, std::string_view val) {
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(0.0f, 0.0f);
+    copyable_text(id, val);
+  };
+  stat("graphs", "graphs:  ", std::to_string(model.graphs.size()));
+  stat("nodes", "nodes:   ", grouped_count(static_cast<int64_t>(node_count)));
+  stat("edges", "edges:   ", grouped_count(static_cast<int64_t>(edge_count)));
+  stat("params", "params:  ", grouped_count(total_params));
 
   // v0.3.0 analyzer: model-wide cost totals + quant-coverage + heatmap toggle.
   draw_cost_section(app);
@@ -358,9 +376,17 @@ void draw_properties_panel(App& app) {
     }
     const CollapseGroup& grp = groups[dn.group_index];
     ImGui::SeparatorText("Collapsed group");
-    ImGui::Text("label:    %s", grp.label.empty() ? "(group)" : grp.label.c_str());
-    ImGui::Text("instances: %u", grp.instances);
-    ImGui::Text("members:  %zu nodes", grp.member_nodes.size());
+    ImGui::TextUnformatted("label:    ");
+    ImGui::SameLine(0.0f, 0.0f);
+    copyable_text("grplabel",
+                  grp.label.empty() ? std::string_view("(group)")
+                                    : std::string_view(grp.label));
+    ImGui::TextUnformatted("instances: ");
+    ImGui::SameLine(0.0f, 0.0f);
+    copyable_text_fmt("grpinst", "%u", grp.instances);
+    ImGui::TextUnformatted("members:  ");
+    ImGui::SameLine(0.0f, 0.0f);
+    copyable_text_fmt("grpmem", "%zu nodes", grp.member_nodes.size());
     const char* btn = dn.expanded ? "Collapse" : "Expand";
     if (ImGui::Button(btn)) session.toggle_group(dn.group_index);
     draw_cost_section(app);  // per-instance + rolled-up (xN) group cost + totals
@@ -383,9 +409,17 @@ void draw_properties_panel(App& app) {
   OpCategory cat = plugin::resolve_category(*model, g, node);  // v0.6.0 #8
 
   ImGui::SeparatorText("Node");
-  ImGui::Text("op:       %s", op.empty() ? "?" : std::string(op).c_str());
-  ImGui::Text("name:     %s", name.empty() ? "(unnamed)" : std::string(name).c_str());
-  ImGui::Text("category: %s", category_name(cat));
+  // #152: op_type and (especially) the node name are the two strings users
+  // actually lift out of this panel to paste into a script or an issue.
+  ImGui::TextUnformatted("op:       ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("op", op.empty() ? std::string_view("?") : op);
+  ImGui::TextUnformatted("name:     ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("name", name.empty() ? std::string_view("(unnamed)") : name);
+  ImGui::TextUnformatted("category: ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("category", category_name(cat));
 
   // #32: per-node receptive field (conv/pool stacks). Cached per (generation,
   // graph, enrich) since it's a pure O(V+E) pass over shapes — recompute only when
@@ -410,9 +444,14 @@ void draw_properties_panel(App& app) {
       rf_enrich = enrich;
     }
     if (dn.ir_node < rf_cache.size() && rf_cache[dn.ir_node].known) {
-      ImGui::Text("recept. field: %llu",
-                  static_cast<unsigned long long>(rf_cache[dn.ir_node].rf));
-      if (ImGui::IsItemHovered())
+      ImGui::TextUnformatted("recept. field: ");
+      // #152: keep the LABEL hoverable too — the tooltip below is the only place
+      // that says what this number means, so halving its hover target is a loss.
+      const bool rf_label_hovered = ImGui::IsItemHovered();
+      ImGui::SameLine(0.0f, 0.0f);
+      copyable_text_fmt("rf", "%llu",
+                        static_cast<unsigned long long>(rf_cache[dn.ir_node].rf));
+      if (rf_label_hovered || ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "Receptive field along the first spatial axis: input pixels that "
             "influence one output pixel (conv/pool stack, shape-derived).");

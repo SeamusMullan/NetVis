@@ -3,6 +3,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 
 namespace netvis {
@@ -261,6 +262,135 @@ int32_t display_index_for_node(const CollapseTree& collapse, uint32_t ir_node) {
     }
   }
   return -1;
+}
+
+// --- Copyable panel text (#152) ----------------------------------------------
+// Rationale for the idiom lives on the declarations in PanelHelpers.h.
+namespace {
+
+// At most ONE label is expanded into a read-only box at a time, so a single
+// static id is all the state this needs (ImGui, and therefore every panel, is
+// main-thread only).
+ImGuiID g_copy_id = 0;
+// Frame the expanded label was last drawn on. Without it, closing the panel that
+// owns the open box would leave g_copy_id set forever, and the next panel that
+// happened to hash to the same ImGui id would open as a text box on its own.
+int g_copy_seen_frame = -1;
+bool g_copy_focus_pending = false;
+// InputText wants a writable char* even under ReadOnly; refill it every frame so
+// it always mirrors the caller's (possibly changing) string.
+std::string g_copy_buf;
+
+void copyable_impl(const char* id, std::string_view text, const ImVec4* color) {
+  const int frame = ImGui::GetFrameCount();
+  if (g_copy_id != 0 && frame - g_copy_seen_frame > 1) g_copy_id = 0;
+
+  // One buffer feeds both GetID and InputText's label so the two can never
+  // disagree; "##" keeps InputText from drawing the id as a visible label.
+  char label[192];
+  std::snprintf(label, sizeof(label), "##cp_%s", id);
+  const ImGuiID this_id = ImGui::GetID(label);
+
+  if (this_id == g_copy_id) {
+    g_copy_seen_frame = frame;
+    // assign(nullptr, 0) on a default-constructed string_view is UB; several
+    // callers pass ir::Model::str() results that can be exactly that.
+    if (text.empty())
+      g_copy_buf.clear();
+    else
+      g_copy_buf.assign(text);
+    // Zero padding, no border, transparent frame: the box lands on EXACTLY the
+    // rect the text had, so expanding a label never reflows the panel below it.
+    // The select-all highlight is the only thing that changes, which doubles as
+    // the "this is now selectable" feedback.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
+    if (color != nullptr) ImGui::PushStyleColor(ImGuiCol_Text, *color);
+    // +2px so the caret past the last glyph is not clipped. Anything larger and
+    // an auto-fit table column visibly widens while the box is open.
+    ImGui::SetNextItemWidth(ImGui::CalcTextSize(g_copy_buf.c_str()).x + 2.0f);
+    if (g_copy_focus_pending) {
+      ImGui::SetKeyboardFocusHere();
+      g_copy_focus_pending = false;
+    }
+    ImGui::InputText(label, g_copy_buf.data(), g_copy_buf.size() + 1,
+                     ImGuiInputTextFlags_ReadOnly |
+                         ImGuiInputTextFlags_AutoSelectAll);
+    // Clicking away / Escape collapses it back to plain text.
+    if (ImGui::IsItemDeactivated()) g_copy_id = 0;
+    if (color != nullptr) ImGui::PopStyleColor();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+    return;
+  }
+
+  if (color != nullptr) ImGui::PushStyleColor(ImGuiCol_Text, *color);
+  // An empty string_view's data() may be null, and TextUnformatted reads a null
+  // text_end as "call strlen" — which would then strlen(nullptr).
+  if (text.empty())
+    ImGui::TextUnformatted("");
+  else
+    ImGui::TextUnformatted(text.data(), text.data() + text.size());
+  if (color != nullptr) ImGui::PopStyleColor();
+  if (ImGui::IsItemHovered()) {
+    // The I-beam cursor is the whole discoverability story: a tooltip on every
+    // label in a panel this dense would be unreadable noise.
+    ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+      g_copy_id = this_id;
+      g_copy_seen_frame = frame;
+      g_copy_focus_pending = true;
+    }
+  }
+}
+
+// Shared vsnprintf tail for the _fmt entry points. The scratch string is static
+// (main-thread only) so a panel full of formatted labels does not allocate once
+// per label per frame.
+const std::string& format_scratch(const char* fmt, va_list args) {
+  static std::string scratch;
+  va_list copy;
+  va_copy(copy, args);
+  const int n = std::vsnprintf(nullptr, 0, fmt, copy);
+  va_end(copy);
+  scratch.clear();
+  if (n > 0) {
+    scratch.resize(static_cast<size_t>(n));
+    std::vsnprintf(scratch.data(), static_cast<size_t>(n) + 1, fmt, args);
+  }
+  return scratch;
+}
+
+}  // namespace
+
+void copyable_text(const char* id, std::string_view text) {
+  copyable_impl(id, text, nullptr);
+}
+
+void copyable_text_disabled(const char* id, std::string_view text) {
+  const ImVec4 col = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+  copyable_impl(id, text, &col);
+}
+
+void copyable_text_colored(const char* id, const ImVec4& color,
+                           std::string_view text) {
+  copyable_impl(id, text, &color);
+}
+
+void copyable_text_fmt(const char* id, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  copyable_impl(id, format_scratch(fmt, args), nullptr);
+  va_end(args);
+}
+
+void copyable_text_disabled_fmt(const char* id, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  const ImVec4 col = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+  copyable_impl(id, format_scratch(fmt, args), &col);
+  va_end(args);
 }
 
 }  // namespace panel_detail

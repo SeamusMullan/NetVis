@@ -46,6 +46,8 @@ namespace netvis {
 
 namespace {
 
+using panel_detail::copyable_text;
+using panel_detail::copyable_text_fmt;
 using panel_detail::human_bytes;
 using panel_detail::shape_string;
 
@@ -360,7 +362,9 @@ void draw_comparison_section(App& app, PendingDecode& d, const TensorStats& s) {
   }
 
   const TensorStats& cs = d.cmp_stats;
-  ImGui::Text("B = %s", d.cmp_label.c_str());
+  ImGui::TextUnformatted("B = ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("cmplabel", d.cmp_label);
 
   const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;
   if (ImGui::BeginTable("cmp_stats", 4, flags)) {
@@ -372,30 +376,38 @@ void draw_comparison_section(App& app, PendingDecode& d, const TensorStats& s) {
     // Deltas are B - A (matching the sign convention engine/TensorDiff.h and
     // the #31 cost-delta panel already use, so a user reading both agrees on
     // which side a positive number favors).
+    // #152: PushID(k) scopes the three copy-boxes to the row — without it every
+    // row would submit the same "a"/"b"/"d" ids and double-clicking one cell
+    // would open the same-named cell in every other row too.
     auto frow = [](const char* k, double a, double b) {
       ImGui::TableNextRow();
+      ImGui::PushID(k);
       ImGui::TableSetColumnIndex(0);
       ImGui::TextUnformatted(k);
       ImGui::TableSetColumnIndex(1);
-      ImGui::Text("%g", a);
+      copyable_text_fmt("a", "%g", a);
       ImGui::TableSetColumnIndex(2);
-      ImGui::Text("%g", b);
+      copyable_text_fmt("b", "%g", b);
       ImGui::TableSetColumnIndex(3);
-      ImGui::Text("%+g", b - a);
+      copyable_text_fmt("d", "%+g", b - a);
+      ImGui::PopID();
     };
     auto urow = [](const char* k, uint64_t a, uint64_t b) {
       ImGui::TableNextRow();
+      ImGui::PushID(k);
       ImGui::TableSetColumnIndex(0);
       ImGui::TextUnformatted(k);
       ImGui::TableSetColumnIndex(1);
-      ImGui::Text("%llu", static_cast<unsigned long long>(a));
+      copyable_text_fmt("a", "%llu", static_cast<unsigned long long>(a));
       ImGui::TableSetColumnIndex(2);
-      ImGui::Text("%llu", static_cast<unsigned long long>(b));
+      copyable_text_fmt("b", "%llu", static_cast<unsigned long long>(b));
       ImGui::TableSetColumnIndex(3);
       // Signed delta -- an unsigned subtraction on a shrink would wrap to
       // ~1.8e19 instead of reading negative (the same bug class engine/
       // TensorDiff.h's d_zero_count()/d_nan_inf_count() guard against).
-      ImGui::Text("%+lld", static_cast<long long>(b) - static_cast<long long>(a));
+      copyable_text_fmt("d", "%+lld",
+                        static_cast<long long>(b) - static_cast<long long>(a));
+      ImGui::PopID();
     };
     frow("min", s.min, cs.min);
     frow("max", s.max, cs.max);
@@ -426,7 +438,7 @@ void draw_comparison_section(App& app, PendingDecode& d, const TensorStats& s) {
   ImGui::TextUnformatted("A");
   draw_histogram(s);
   ImGui::NextColumn();
-  ImGui::TextUnformatted(d.cmp_label.c_str());
+  copyable_text("cmphist", d.cmp_label);
   draw_histogram(cs);
   ImGui::Columns(1);
 }
@@ -456,8 +468,10 @@ void draw_weight_inspector(App& app) {
   std::string_view name = model ? model->str(t.name) : std::string_view{};
 
   // Header: identity is known even before the decode finishes.
-  ImGui::TextUnformatted(name.empty() ? "(unnamed tensor)"
-                                      : std::string(name).c_str());
+  // #152: a transformer weight name runs to 90 characters; retyping one by eye
+  // was the whole reason this panel needed copyable text.
+  copyable_text("tname",
+                name.empty() ? std::string_view("(unnamed tensor)") : name);
   // Prefer the exact dtype label when the type has no ir::DType (#85: OpenVINO
   // i4/u4/nf4/u1, CoreML MIL sub-byte/fp8), so a quant tensor reads honestly
   // instead of "?".
@@ -466,9 +480,18 @@ void draw_weight_inspector(App& app) {
     std::string_view lbl = model->str(t.dtype_label);
     if (!lbl.empty()) dtype_disp = std::string(lbl);
   }
-  ImGui::Text("dtype: %s   shape: %s", dtype_disp.c_str(),
-              shape_string(t.shape).c_str());
-  ImGui::Text("size:  %s", human_bytes(t.byte_len).c_str());
+  // Labels stay plain and the values become copy-boxes, so a paste is the dtype
+  // or the shape on its own rather than "dtype: f32   shape: [4, 4]".
+  ImGui::TextUnformatted("dtype: ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("dtype", dtype_disp);
+  ImGui::SameLine(0.0f, 0.0f);
+  ImGui::TextUnformatted("   shape: ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("shape", shape_string(t.shape));
+  ImGui::TextUnformatted("size:  ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("size", human_bytes(t.byte_len));
   ImGui::Separator();
 
   // In-flight: show a spinner while the worker streams the payload.
@@ -529,7 +552,9 @@ void draw_weight_inspector(App& app) {
       ImGui::TableSetColumnIndex(0);
       ImGui::TextUnformatted(k);
       ImGui::TableSetColumnIndex(1);
-      ImGui::TextUnformatted(v.c_str());
+      // #152: `k` is the ImGui id — unique per row, and the copy-box is sized to
+      // the text, so the auto-fit "value" column does not jump when it opens.
+      copyable_text(k, v);
     };
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%g", s.min);
@@ -553,10 +578,18 @@ void draw_weight_inspector(App& app) {
   // extreme whose index is UINT64_MAX (no finite element was scanned).
   if (s.min_index != UINT64_MAX || s.max_index != UINT64_MAX) {
     ImGui::SeparatorText("Extremes");
-    if (s.min_index != UINT64_MAX)
-      ImGui::Text("min %g at %s", s.min, coord_string(t, s.min_index).c_str());
-    if (s.max_index != UINT64_MAX)
-      ImGui::Text("max %g at %s", s.max, coord_string(t, s.max_index).c_str());
+    // Only the COORDINATE is copyable: the extreme value itself is already a
+    // copy-box one section up in the statistics table.
+    if (s.min_index != UINT64_MAX) {
+      ImGui::Text("min %g at ", s.min);
+      ImGui::SameLine(0.0f, 0.0f);
+      copyable_text("min_at", coord_string(t, s.min_index));
+    }
+    if (s.max_index != UINT64_MAX) {
+      ImGui::Text("max %g at ", s.max);
+      ImGui::SameLine(0.0f, 0.0f);
+      copyable_text("max_at", coord_string(t, s.max_index));
+    }
   }
 
   // #48: whole-tensor + per-channel outlier warnings (red for the alarming ones).
