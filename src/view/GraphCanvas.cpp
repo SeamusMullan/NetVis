@@ -56,12 +56,11 @@ struct ReadabilityCache {
   std::vector<uint16_t> const_badge;      // indexed by display id
 };
 
-// True if IR node `n` is a constant/initializer *source* (a leaf producing a
-// constant with no compute inputs).
-bool node_is_const_source(const ir::Model& m, const ir::Node& n) {
-  if (n.inputs.count == 0) return true;
-  return categorize_op(m.str(n.op_type)) == OpCategory::Tensor;
-}
+// #153: node_is_const_source USED to be defined here. The layered layout now
+// sinks constants to the layer above their consumer and needs the same notion of
+// "constant", and two copies of the predicate would let the canvas hide a box the
+// layout had not treated as a constant. It lives in engine/LayoutEngine.h now;
+// this file just calls it.
 
 // Recompute the readability cache if the session key changed. Returns it.
 const ReadabilityCache& readability_cache(App& app) {

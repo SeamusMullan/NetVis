@@ -5,8 +5,13 @@
 // next to a single user (killing the top-row hairball), and edges spanning many
 // layers still lay out. Also re-asserts determinism now that the internal
 // layout-node model (real + clones + dummies) drives coordinate assignment.
+//
+// v0.9.x (#153) appends the constant-CONE cases at the bottom of this file: the
+// duplication above only ever helped a constant that was a single in-degree-0
+// node, and a real export's constants arrive as short chains.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -209,4 +214,262 @@ TEST_CASE("long-span edge from a NON-source inserts dummy waypoints") {
 
   CHECK(r.bounds_max.x >= r.bounds_min.x);
   CHECK(r.bounds_max.y >= r.bounds_min.y);
+}
+
+// ---------------------------------------------------------------------------
+// #153 — constants belong on the layer BEFORE the node that uses them.
+//
+// The one-hop version of that rule (move every in-degree-0 source to
+// min(consumer layer) - 1) shipped long before this issue, and it is not what a
+// real export needs: a constant there is usually a small CONE of nodes
+// (Constant -> Cast -> Cast -> ... -> the op that uses the value), and only the
+// cone's ROOT is a source. Everything above the root kept its longest-path rank
+// and stayed pinned to the top of the drawing — the "all the constants are at
+// the start" complaint. These cases pin the cone behaviour, the multi-consumer
+// rule that was chosen for it, and the two things it must not break: a Cast that
+// sits on the real activation path must NOT be dragged down with the constants,
+// and the layering must stay acyclic.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Builder for the fixtures below. A linear chain op_0 -> ... -> op_(N-1) (op_0
+// reads a graph input, so it has no display predecessor but is NOT a constant),
+// plus one constant cone `Constant -> Cast -> Cast` whose tail feeds every op in
+// `consumers`. Returns the model; `out_cone` receives the cone's IR node indices
+// root-first.
+ir::Model make_const_cone_model(int N, const std::vector<int>& consumers,
+                                std::vector<uint32_t>* out_cone) {
+  ir::Model m;
+  m.has_graph = true;
+  m.format_name = m.intern("TEST");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  auto add_val = [&](const std::string& nm, int32_t prod) {
+    ir::ValueInfo v;
+    v.name = m.intern(nm);
+    v.producer = prod;
+    g.values.push_back(v);
+    return static_cast<uint32_t>(g.values.size() - 1);
+  };
+  // Node indices are assigned in the order the nodes are pushed: the chain
+  // first (0..N-1), then the three cone nodes (N, N+1, N+2).
+  const uint32_t k_root = static_cast<uint32_t>(N);
+  const uint32_t k_mid = k_root + 1;
+  const uint32_t k_tail = k_mid + 1;
+
+  const uint32_t in_val = add_val("input", -1);  // graph input: no producer
+  std::vector<uint32_t> oval(N);
+  for (int i = 0; i < N; ++i)
+    oval[i] = add_val("o" + std::to_string(i), i);
+  const uint32_t kv0 = add_val("k0", static_cast<int32_t>(k_root));
+  const uint32_t kv1 = add_val("k1", static_cast<int32_t>(k_mid));
+  const uint32_t kv2 = add_val("k2", static_cast<int32_t>(k_tail));
+
+  auto add_node = [&](const char* op, const std::string& name,
+                      const std::vector<uint32_t>& ins, uint32_t out) {
+    ir::Node n;
+    n.op_type = m.intern(op);
+    n.name = m.intern(name);
+    n.inputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    for (uint32_t iv : ins) g.edge_refs.push_back(iv);
+    n.inputs.count = static_cast<uint32_t>(ins.size());
+    n.outputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    g.edge_refs.push_back(out);
+    n.outputs.count = 1;
+    g.nodes.push_back(n);
+  };
+
+  for (int i = 0; i < N; ++i) {
+    std::vector<uint32_t> ins;
+    ins.push_back(i == 0 ? in_val : oval[i - 1]);
+    if (std::find(consumers.begin(), consumers.end(), i) != consumers.end())
+      ins.push_back(kv2);  // this op also reads the constant cone's output
+    add_node("Add", "op_" + std::to_string(i), ins, oval[i]);
+  }
+  // The cone. Constant has no inputs; Cast categorizes to OpCategory::Tensor,
+  // so both halves of the const-like predicate are exercised.
+  add_node("Constant", "k_root", {}, kv0);
+  add_node("Cast", "k_mid", {kv0}, kv1);
+  add_node("Cast", "k_tail", {kv1}, kv2);
+
+  g.graph_inputs.push_back(in_val);
+  g.graph_outputs.push_back(oval[N - 1]);
+  if (out_cone) *out_cone = {k_root, k_mid, k_tail};
+  return m;
+}
+
+// Display id of a leaf display node wrapping IR node `ir_node`, or UINT32_MAX.
+uint32_t display_of(const CollapseTree& collapse, uint32_t ir_node) {
+  const std::vector<DisplayNode>& d = collapse.display_nodes();
+  for (size_t i = 0; i < d.size(); ++i)
+    if (!d[i].is_group && d[i].ir_node == ir_node)
+      return static_cast<uint32_t>(i);
+  return UINT32_MAX;
+}
+
+// Layer of the FIRST box carrying `did`. Only used on nodes that are never
+// cloned (cone interiors have a predecessor, so duplication skips them).
+int32_t layer_of(const LayoutResult& r, uint32_t did) {
+  for (const NodeBox& b : r.boxes)
+    if (b.display_id == did) return b.layer;
+  return -1;
+}
+
+}  // namespace
+
+TEST_CASE("#153 a constant CONE sinks to the layer above its consumer") {
+  // op_15 is the only consumer of the cone. Longest-path layering puts the cone
+  // on layers 0/1/2 while op_15 is on layer 15, so before the fix the cone tail
+  // fired a 13-layer edge across the whole drawing. Each cone node must now sit
+  // exactly one layer above the next, with the tail one layer above op_15.
+  const int N = 16;
+  std::vector<uint32_t> cone;
+  ir::Model m = make_const_cone_model(N, {N - 1}, &cone);
+  CollapseTree collapse;
+  collapse.build(m, 0);
+  LayoutResult r = compute_layout(m, 0, collapse, headless_size, {}, nullptr);
+
+  const uint32_t d_consumer = display_of(collapse, static_cast<uint32_t>(N - 1));
+  const uint32_t d_root = display_of(collapse, cone[0]);
+  const uint32_t d_mid = display_of(collapse, cone[1]);
+  const uint32_t d_tail = display_of(collapse, cone[2]);
+  REQUIRE(d_consumer != UINT32_MAX);
+  REQUIRE(d_tail != UINT32_MAX);
+
+  const int32_t l_consumer = layer_of(r, d_consumer);
+  REQUIRE(l_consumer > 3);  // the chain really is deep
+  CHECK(layer_of(r, d_tail) == l_consumer - 1);
+  CHECK(layer_of(r, d_mid) == l_consumer - 2);
+  CHECK(layer_of(r, d_root) == l_consumer - 3);
+
+  // And the user-visible consequence: no edge sprays across the canvas.
+  float max_span = 0.0f;
+  for (const EdgeCurve& e : r.edges) {
+    float s = e.p3.y - e.p0.y;
+    if (s < 0) s = -s;
+    max_span = std::max(max_span, s);
+  }
+  // One layer gap = node height (40) + rank_sep (60) = 100. Before the fix the
+  // cone-tail edge alone spanned ~13 of those.
+  CHECK(max_span < 100.0f * 3.0f);
+}
+
+TEST_CASE("#153 a shared constant cone sits above its EARLIEST consumer") {
+  // THE MULTI-CONSUMER DECISION, pinned. A cone feeding op_4 and op_12 cannot be
+  // adjacent to both. It is placed above the EARLIEST consumer rather than
+  // duplicated per consumer: duplication is only safe for in-degree-0 sources
+  // (a clone needs no producer above it), and a clone of a cone INTERIOR node
+  // would be stranded with no incoming edge. The cost is that op_12 keeps one
+  // long edge, which this case also states out loud.
+  const int N = 16;
+  std::vector<uint32_t> cone;
+  ir::Model m = make_const_cone_model(N, {4, 12}, &cone);
+  CollapseTree collapse;
+  collapse.build(m, 0);
+  LayoutResult r = compute_layout(m, 0, collapse, headless_size, {}, nullptr);
+
+  const int32_t l_early = layer_of(r, display_of(collapse, 4u));
+  const int32_t l_late = layer_of(r, display_of(collapse, 12u));
+  const int32_t l_tail = layer_of(r, display_of(collapse, cone[2]));
+  REQUIRE(l_early > 0);
+  REQUIRE(l_late > l_early);
+  CHECK(l_tail == l_early - 1);   // adjacent to the earliest consumer
+  CHECK(l_tail < l_late - 1);     // and therefore NOT adjacent to the later one
+
+  // The cone is shared, so exactly one box carries each cone node's display id
+  // (no clones were made for the interior).
+  int tail_boxes = 0;
+  for (const NodeBox& b : r.boxes)
+    if (b.display_id == display_of(collapse, cone[2])) ++tail_boxes;
+  CHECK(tail_boxes == 1);
+}
+
+TEST_CASE("#153 a Cast on the activation path is NOT sunk with the constants") {
+  // The const-like seed is node_is_const_source(), which is true for ANY op in
+  // OpCategory::Tensor — Cast included. That predicate alone would sink a Cast
+  // that sits on the real data path, dragging live compute to the bottom of the
+  // drawing. The cone rule therefore also demands that every display predecessor
+  // be const-like. Here op_4 -> cast -> op_10: the Cast's predecessor is a
+  // compute node, so the Cast must keep its longest-path layer (5) and must not
+  // slide down to 9, one above op_10.
+  const int N = 16;
+  ir::Model m;
+  m.has_graph = true;
+  m.format_name = m.intern("TEST");
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+
+  auto add_val = [&](const std::string& nm, int32_t prod) {
+    ir::ValueInfo v;
+    v.name = m.intern(nm);
+    v.producer = prod;
+    g.values.push_back(v);
+    return static_cast<uint32_t>(g.values.size() - 1);
+  };
+  const uint32_t cast_node = static_cast<uint32_t>(N);
+  const uint32_t in_val = add_val("input", -1);
+  std::vector<uint32_t> oval(N);
+  for (int i = 0; i < N; ++i) oval[i] = add_val("o" + std::to_string(i), i);
+  const uint32_t cast_val = add_val("cast", static_cast<int32_t>(cast_node));
+
+  auto add_node = [&](const char* op, const std::string& name,
+                      const std::vector<uint32_t>& ins, uint32_t out) {
+    ir::Node n;
+    n.op_type = m.intern(op);
+    n.name = m.intern(name);
+    n.inputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    for (uint32_t iv : ins) g.edge_refs.push_back(iv);
+    n.inputs.count = static_cast<uint32_t>(ins.size());
+    n.outputs.begin = static_cast<uint32_t>(g.edge_refs.size());
+    g.edge_refs.push_back(out);
+    n.outputs.count = 1;
+    g.nodes.push_back(n);
+  };
+  for (int i = 0; i < N; ++i) {
+    std::vector<uint32_t> ins;
+    ins.push_back(i == 0 ? in_val : oval[i - 1]);
+    if (i == 10) ins.push_back(cast_val);
+    add_node("Add", "op_" + std::to_string(i), ins, oval[i]);
+  }
+  add_node("Cast", "live_cast", {oval[4]}, cast_val);
+
+  CollapseTree collapse;
+  collapse.build(m, 0);
+  LayoutResult r = compute_layout(m, 0, collapse, headless_size, {}, nullptr);
+
+  const int32_t l_src = layer_of(r, display_of(collapse, 4u));
+  const int32_t l_cast = layer_of(r, display_of(collapse, cast_node));
+  const int32_t l_dst = layer_of(r, display_of(collapse, 10u));
+  REQUIRE(l_dst > l_src + 2);
+  CHECK(l_cast == l_src + 1);   // stayed with its producer
+  CHECK(l_cast < l_dst - 1);    // was NOT sunk to sit above op_10
+}
+
+TEST_CASE("#153 sinking constants keeps the layering acyclic and deterministic") {
+  // The pull-down raises layers, so the invariant it could plausibly break is
+  // that every edge still runs strictly downward. Assert it geometrically (that
+  // is what the user sees) on a fixture with several cones at different depths,
+  // and re-pin determinism, since the pass is order-sensitive by construction.
+  std::vector<uint32_t> cone;
+  ir::Model m = make_const_cone_model(20, {3, 9, 14, 19}, &cone);
+  CollapseTree collapse;
+  collapse.build(m, 0);
+  LayoutResult a = compute_layout(m, 0, collapse, headless_size, {}, nullptr);
+  LayoutResult b = compute_layout(m, 0, collapse, headless_size, {}, nullptr);
+
+  REQUIRE(!a.edges.empty());
+  // p0 is always the upper endpoint and p3 the lower one (reversal is carried in
+  // the `reversed` flag, not by swapping the points), so a valid layering means
+  // p3.y is never above p0.y.
+  for (const EdgeCurve& e : a.edges)
+    CHECK(e.p3.y >= e.p0.y);
+
+  REQUIRE(a.boxes.size() == b.boxes.size());
+  for (size_t i = 0; i < a.boxes.size(); ++i) {
+    CHECK(a.boxes[i].display_id == b.boxes[i].display_id);
+    CHECK(a.boxes[i].layer == b.boxes[i].layer);
+    CHECK(a.boxes[i].pos.x == doctest::Approx(b.boxes[i].pos.x));
+    CHECK(a.boxes[i].pos.y == doctest::Approx(b.boxes[i].pos.y));
+  }
 }
