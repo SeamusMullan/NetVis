@@ -41,6 +41,7 @@ namespace netvis {
 
 namespace {
 
+using panel_detail::copyable_text;
 using panel_detail::grouped_count;
 using panel_detail::human_bytes;
 
@@ -353,7 +354,14 @@ void draw_cost_section(App& app) {
   auto kv = [](const char* label, const std::string& val) {
     ImGui::TextDisabled("%s", label);
     ImGui::SameLine(160.0f);
-    ImGui::TextUnformatted(val.c_str());
+    // #152: `label` is the copy-box id, prefixed because this section is drawn
+    // INSIDE the Properties window — an unprefixed "params" here would collide
+    // with the graph-stats "params" that PropertiesPanel submits. The four
+    // indented labels repeat between the per-instance and rolled-up blocks
+    // below, so those two blocks push their own ID scope as well.
+    char id[80];
+    std::snprintf(id, sizeof(id), "cost_%s", label);
+    copyable_text(id, val);
   };
   auto kv_u64 = [&kv](const char* label, uint64_t val) {
     kv(label, grouped_count(static_cast<int64_t>(val)));
@@ -386,9 +394,14 @@ void draw_cost_section(App& app) {
           per_inst.act_bytes = nc.act_bytes / instances;
           per_inst.flops_known = nc.flops_known;
 
-          ImGui::Text("Group: %s (x%u)", grp.label.c_str(), instances);
+          ImGui::TextUnformatted("Group: ");
+          ImGui::SameLine(0.0f, 0.0f);
+          copyable_text("grouplabel", grp.label);
+          ImGui::SameLine(0.0f, 0.0f);
+          ImGui::Text(" (x%u)", instances);
           ImGui::Separator();
           ImGui::TextUnformatted("Per instance:");
+          ImGui::PushID("per_instance");
           if (per_inst.flops_known) {
             kv_u64("  FLOPs", per_inst.flops);
           } else {
@@ -397,9 +410,11 @@ void draw_cost_section(App& app) {
           kv_u64("  params", per_inst.params);
           kv_bytes("  weights", per_inst.weight_bytes);
           kv_bytes("  activations", per_inst.act_bytes);
+          ImGui::PopID();
 
           ImGui::Separator();
           ImGui::TextUnformatted("Rolled up (all instances):");
+          ImGui::PushID("rolled_up");
           if (nc.flops_known) {
             kv_u64("  FLOPs", nc.flops);
           } else {
@@ -408,6 +423,7 @@ void draw_cost_section(App& app) {
           kv_u64("  params", nc.params);
           kv_bytes("  weights", nc.weight_bytes);
           kv_bytes("  activations", nc.act_bytes);
+          ImGui::PopID();
         }
       } else {
         // Leaf node: show its cost directly.
@@ -690,9 +706,16 @@ void draw_cost_section(App& app) {
   // --- Efficiency / roofline (approximate) ------------------------------------
   if (report->from_graph && report->nodes_flops_known > 0) {
     ImGui::SeparatorText("Efficiency (approximate)");
-    ImGui::Text("Arithmetic intensity: %.2f FLOP/byte",
-                report->overall_arithmetic_intensity());
-    if (ImGui::IsItemHovered())
+    ImGui::TextUnformatted("Arithmetic intensity: ");
+    const bool ai_label_hovered = ImGui::IsItemHovered();
+    ImGui::SameLine(0.0f, 0.0f);
+    char ai_buf[64];
+    std::snprintf(ai_buf, sizeof(ai_buf), "%.2f FLOP/byte",
+                  report->overall_arithmetic_intensity());
+    copyable_text("arith_intensity", ai_buf);
+    // #152: the tooltip must still fire over the LABEL as well — shrinking an
+    // honesty disclaimer's hover target to just the number would hide it.
+    if (ai_label_hovered || ImGui::IsItemHovered())
       ImGui::SetTooltip(
           "Total known FLOPs / bytes moved (weight + activation reads + writes).");
 
@@ -784,9 +807,11 @@ void draw_cost_section(App& app) {
     // only — datasheet peaks, not a measurement.
     ImGui::Separator();
     double model_lat = estimate_model_latency_s(*report, roof_preset);
-    ImGui::Text("Est. latency (model): %s",
-                format_latency_ms(model_lat).c_str());
-    if (ImGui::IsItemHovered())
+    ImGui::TextUnformatted("Est. latency (model): ");
+    const bool lat_label_hovered = ImGui::IsItemHovered();
+    ImGui::SameLine(0.0f, 0.0f);
+    copyable_text("lat_model", format_latency_ms(model_lat));
+    if (lat_label_hovered || ImGui::IsItemHovered())
       ImGui::SetTooltip(
           "ORDER-OF-MAGNITUDE estimate: max(known FLOPs / peak FLOP/s, bytes "
           "moved / bandwidth) at the selected machine balance. Derived from "
@@ -804,9 +829,11 @@ void draw_cost_section(App& app) {
                              ? estimate_latency_s(sel_nc.flops,
                                                   sel_nc.bytes_moved(), roof_preset)
                              : kLatencyUnknown;
-        ImGui::Text("Est. latency (selected): %s",
-                    format_latency_ms(sel_lat).c_str());
-        if (ImGui::IsItemHovered())
+        ImGui::TextUnformatted("Est. latency (selected): ");
+        const bool sel_label_hovered = ImGui::IsItemHovered();
+        ImGui::SameLine(0.0f, 0.0f);
+        copyable_text("lat_selected", format_latency_ms(sel_lat));
+        if (sel_label_hovered || ImGui::IsItemHovered())
           ImGui::SetTooltip(
               "ORDER-OF-MAGNITUDE estimate for the selected node/group at the "
               "selected machine balance. Datasheet peaks, not a measurement.");
@@ -935,8 +962,15 @@ void draw_cost_section(App& app) {
     ImGui::Separator();
     double eff_bits = report->effective_bits_per_param();
     double vs_fp32 = report->size_vs_fp32();
-    ImGui::Text("Effective bits/param: %.2f", eff_bits);
-    ImGui::Text("Size vs fp32: %.2fx", vs_fp32);
+    char qbuf[64];
+    ImGui::TextUnformatted("Effective bits/param: ");
+    ImGui::SameLine(0.0f, 0.0f);
+    std::snprintf(qbuf, sizeof(qbuf), "%.2f", eff_bits);
+    copyable_text("eff_bits", qbuf);
+    ImGui::TextUnformatted("Size vs fp32: ");
+    ImGui::SameLine(0.0f, 0.0f);
+    std::snprintf(qbuf, sizeof(qbuf), "%.2fx", vs_fp32);
+    copyable_text("size_vs_fp32", qbuf);
   }
 
   // --- Per-node cost table (graph mode only; collapsed so it doesn't dominate) -

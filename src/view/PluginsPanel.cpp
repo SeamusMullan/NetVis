@@ -2,6 +2,7 @@
 #include "view/PluginsPanel.h"
 
 #include <string>
+#include <string_view>
 
 #include "imgui.h"
 
@@ -11,10 +12,14 @@
 #include "engine/plugin/OpHandler.h"        // kOpHandlerAbiVersion
 #include "engine/plugin/declarative/Manifest.h"
 #include "view/App.h"
+#include "view/PanelHelpers.h"  // #152: copyable_text (plugin dir/path are paths)
 
 namespace netvis {
 
 namespace {
+using panel_detail::copyable_text;
+using panel_detail::copyable_text_disabled;
+
 // §C.4 DEFERRED TOGGLE (no UAF): applying a toggle calls reload_plugins(), which
 // replaces the loaded_manifests() vector we iterate by const&. So we NEVER mutate
 // inside the loop — we record the intended action in file-static state and apply it
@@ -44,7 +49,11 @@ void draw_plugins_panel(App& app) {
       "(JSON + expression DSL) are safe by construction and enabled by default. WASM "
       "plugins run sandboxed (memory/fuel-capped, no filesystem/network, cannot read "
       "tensor bytes) but are still arbitrary code, so they are disabled by default.");
-  ImGui::Text("Discovered from: %s", plugin::plugin_dir().c_str());
+  // #152: the plugin directory is a filesystem path — the single thing a user
+  // reading this panel wants to paste into a terminal.
+  ImGui::TextUnformatted("Discovered from: ");
+  ImGui::SameLine(0.0f, 0.0f);
+  copyable_text("plugindir", plugin::plugin_dir());
   ImGui::Text("Host op-handler API version: %u",
               static_cast<unsigned>(plugin::kOpHandlerAbiVersion));
   ImGui::Separator();
@@ -107,9 +116,18 @@ void draw_plugins_panel(App& app) {
       ImGui::TextColored(kAmber, "enabled (not registered)");
 
     if (open) {
-      if (!lm.author.empty()) ImGui::TextDisabled("author: %s", lm.author.c_str());
-      ImGui::TextDisabled("api_version: %u", static_cast<unsigned>(lm.api_version));
-      ImGui::TextDisabled("path: %s", lm.path.c_str());
+      if (!lm.author.empty()) {
+        ImGui::TextDisabled("author: ");
+        ImGui::SameLine(0.0f, 0.0f);
+        copyable_text_disabled("author", lm.author);
+      }
+      ImGui::TextDisabled("api_version: ");
+      ImGui::SameLine(0.0f, 0.0f);
+      panel_detail::copyable_text_disabled_fmt(
+          "apiver", "%u", static_cast<unsigned>(lm.api_version));
+      ImGui::TextDisabled("path: ");
+      ImGui::SameLine(0.0f, 0.0f);
+      copyable_text_disabled("path", lm.path);
 
       if (lm.ok && !lm.ops.empty()) {
         if (ImGui::BeginTable("ops", 3,
@@ -121,10 +139,17 @@ void draw_plugins_panel(App& app) {
           ImGui::TableHeadersRow();
           for (const plugin::LoadedOp& op : lm.ops) {
             ImGui::TableNextRow();
+            // #152: the op rows have no index to key on; the LoadedOp address is
+            // stable for the life of the loaded manifest and unique per row.
+            ImGui::PushID(&op);
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(op.op_name.empty() ? "(unnamed)" : op.op_name.c_str());
+            copyable_text("opname", op.op_name.empty()
+                                        ? std::string_view("(unnamed)")
+                                        : std::string_view(op.op_name));
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(op.category.empty() ? "-" : op.category.c_str());
+            copyable_text("opcat", op.category.empty()
+                                       ? std::string_view("-")
+                                       : std::string_view(op.category));
             ImGui::TableSetColumnIndex(2);
             if (!op.ok)
               ImGui::TextColored(kRed, "rejected: %s", op.error.c_str());
@@ -132,6 +157,7 @@ void draw_plugins_panel(App& app) {
               ImGui::TextColored(kAmber, "overrides built-in");
             else
               ImGui::TextColored(kGreen, "ok");
+            ImGui::PopID();
           }
           ImGui::EndTable();
         }
