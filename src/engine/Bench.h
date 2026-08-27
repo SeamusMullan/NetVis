@@ -39,7 +39,15 @@ namespace netvis {
 // this when a field's MEANING changes; the gate script keys its comparison on it
 // and must refuse a baseline written under a different schema rather than
 // silently compare incomparable numbers.
-inline constexpr const char* kBenchSchema = "netvis.bench.v1";
+//
+// v2 (#154): the run now carries a full host description (CPU model, physical
+// core count, arch, OS, total RAM) beside the logical core count it already
+// emitted, so "these two runs are not comparable" can name both machines
+// instead of quoting two bare core counts. A v1 baseline is not readable as a
+// v2 run and tools/bench_gate.py will decline to compare the two — that is the
+// bump doing its job, and it means the committed baseline must be regenerated
+// by CI (bench/README.md).
+inline constexpr const char* kBenchSchema = "netvis.bench.v2";
 
 // --- Synthetic model generation ---------------------------------------------
 //
@@ -154,8 +162,11 @@ bool wants_bench(int argc, char** argv);
 Result<std::vector<BenchCase>> run_bench(const BenchOptions& options);
 
 // Serialize to the gate's JSON format (nlohmann::ordered_json, like ReportJson).
-// Includes kBenchSchema, the host's logical core count, and the build type, so a
-// baseline carries enough context to be rejected when it is not comparable.
+// Includes kBenchSchema, the build type and a core/HostInfo description of the
+// machine, so a baseline carries enough context both to be REJECTED when it is
+// not comparable and to say what it was incomparable with — a core count on its
+// own tells a reader a comparison was refused but not which two machines were
+// involved (#154).
 std::string build_bench_json(const std::vector<BenchCase>& cases);
 
 // --- The render-cost proxy ---------------------------------------------------

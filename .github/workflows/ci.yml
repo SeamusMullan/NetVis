@@ -106,18 +106,31 @@ jobs:
       # loop #97 found cost 0.28 ms at 1k and 6.4 SECONDS at 100k). Measured at
       # roughly two seconds on this runner, which is not worth trading the only
       # rung that can catch that class of bug.
+      #
+      # Runs on WHATEVER hardware the runner turns out to be, with no skip
+      # condition (#154). `ubuntu-latest` hands out 2- and 4-core machines
+      # interchangeably, and a run that cannot be compared is still a run worth
+      # having: the JSON below is the only record of what this branch measured,
+      # and it is what a maintainer reads when choosing the next baseline.
+      # Skipping the benchmark on an unexpected machine would throw that away
+      # to avoid a comparison that the next step already declines to make.
       - name: Run benchmark (full ladder)
         run: ./build/perf/netvis_bench --bench > bench-current.json
+      # Unconditional, and BEFORE the comparison on purpose: the numbers must
+      # survive whatever verdict the gate reaches, including a failing one. An
+      # upload placed after a failing gate step would never run, so the one run
+      # a human most needs to inspect would be the one with no artifact.
       - name: Upload bench result
         uses: actions/upload-artifact@v4
         with:
           name: bench-result
           path: bench-current.json
           if-no-files-found: error
-      # bench/baseline.json does not exist until a maintainer generates the
-      # first REAL baseline from this harness (see bench/README.md — a
-      # baseline committed before the harness could ever run would be
-      # fabricated data). Until then, treat "no baseline" as report-only: warn
+      # bench/baseline.json exists only once a maintainer has generated a REAL
+      # baseline from this harness (see bench/README.md — a baseline written
+      # before the harness could ever run would be fabricated data). One is
+      # committed today, but this path is not dead: every kBenchSchema bump
+      # strands it again. When there is no usable baseline, report-only: warn
       # loudly so the gap is visible in every run's log, upload the JSON so
       # the numbers are there when it is time to pick a baseline, but do NOT
       # fail the build over a file nobody could have committed yet.
@@ -130,9 +143,51 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::warning::bench/baseline.json is not committed yet -- perf gate is running in report-only mode (see bench/README.md). It will start enforcing once a maintainer commits a real baseline."
           fi
+      # tools/bench_gate.py answers with THREE outcomes, and this step is what
+      # makes the third one mean anything (#154):
+      #
+      #   0 -> the code is within threshold. Pass.
+      #   1 -> a real regression, or a stage that vanished. FAIL — this is the
+      #        gate. It is the only reason the job exists.
+      #   2 -> "cannot judge": the two runs are not the same measurement
+      #        (different schema, build type, or machine class), so no verdict
+      #        about the code exists. Warn, and pass.
+      #
+      # Running the script bare made 2 fail exactly like 1. Runner allocation
+      # on ubuntu-latest is not stable — #148 landed on a 2-core machine
+      # against a 4-core baseline (#121) — so the gate went red on every pull
+      # request while measuring nothing, which is how a gate gets ignored.
+      #
+      # The `case` matches the literal 2 and nothing else: every other non-zero
+      # status, including a regression (1), an argument error, or a python
+      # crash (2 is a chosen exit code, 137 is not), falls to `*` and re-exits
+      # with it. A `continue-on-error: true` or a trailing `|| true` here would
+      # be far shorter and would silently swallow exit 1 as well, leaving a job
+      # that reports a green perf gate for a genuine regression.
+      #
+      # `|| status=$?` rather than `set +e`: the step's shell is `bash -e`, and
+      # a bare failing command would abort the step before the case is ever
+      # reached. The left side of `||` is exempt from -e, so the exit code
+      # reaches the dispatch below intact.
       - name: Compare against baseline
         if: steps.baseline.outputs.present == 'true'
-        run: python3 tools/bench_gate.py --baseline bench/baseline.json --current bench-current.json
+        run: |
+          status=0
+          python3 tools/bench_gate.py \
+            --baseline bench/baseline.json \
+            --current bench-current.json || status=$?
+          case "$status" in
+            0)
+              echo "perf gate: PASS"
+              ;;
+            2)
+              echo "::warning::perf gate could not judge this run (bench_gate exit 2): the baseline and this run are not the same measurement -- see the log above for both machines, and bench/README.md for re-baselining. No regression was detected and none was ruled out."
+              ;;
+            *)
+              echo "::error::perf gate FAILED (bench_gate exit $status): see the REGRESSION/MISSING rows above."
+              exit "$status"
+              ;;
+          esac
 
   # --- Derive the version from the tag (only on a vX.Y.Z tag) -----------------
   version:

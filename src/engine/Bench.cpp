@@ -28,12 +28,12 @@
 #include <initializer_list>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "core/HostInfo.h"
 #include "core/JobSystem.h"
 #include "core/MappedFile.h"
 #include "core/Rss.h"
@@ -882,9 +882,39 @@ Result<std::vector<BenchCase>> run_bench(const BenchOptions& options) {
 std::string build_bench_json(const std::vector<BenchCase>& cases) {
   json j;
   j["schema"] = kBenchSchema;
-  // Logical cores. Every stage here is single-threaded, so this is context for a
-  // human reading two baselines, not a divisor. 0 means the host would not say.
-  j["hardware_concurrency"] = std::thread::hardware_concurrency();
+  // WHO RAN THIS (#154). The gate refuses to compare runs from different
+  // machine classes, and until now the only evidence in the file was a bare
+  // core count -- so "baseline was recorded on a 4-core machine, this run is on
+  // 2" was true, unactionable, and impossible to check after the runner was
+  // gone. The whole host description travels with the numbers instead.
+  //
+  // None of these is a divisor. Every stage here is single-threaded, so no core
+  // count normalizes any timing; this is context for the human (and the gate)
+  // deciding whether two files may be compared at all.
+  const HostInfo host = host_info();
+  // Kept spelled "hardware_concurrency", not renamed to "logical_cores": this
+  // is the key tools/bench_gate.py keys its comparability check on, and the
+  // value is unchanged. Renaming it would strand that check on a .get() default
+  // of 0, which the script reads as "unknown, compare anyway" -- silently
+  // disabling the guard rather than loudly changing it.
+  j["hardware_concurrency"] = host.logical_cores;
+  // Empty string / 0 mean "this host would not say" (core/HostInfo.h), and are
+  // emitted as null so a reader cannot mistake an unavailable probe for a
+  // measured value -- the same honesty rule peak_rss_bytes follows below.
+  if (!host.cpu_model.empty())
+    j["cpu_model"] = host.cpu_model;
+  else
+    j["cpu_model"] = nullptr;
+  if (host.physical_cores != 0)
+    j["physical_cores"] = host.physical_cores;
+  else
+    j["physical_cores"] = nullptr;
+  j["arch"] = host.arch;
+  j["os"] = host.os;
+  if (host.total_ram_bytes != 0)
+    j["total_ram_bytes"] = host.total_ram_bytes;
+  else
+    j["total_ram_bytes"] = nullptr;
   // The gate MUST see this: a Debug build runs these hot loops several times
   // slower, and comparing a Debug run against a Release baseline would fail
   // every threshold for a reason that has nothing to do with the code.
