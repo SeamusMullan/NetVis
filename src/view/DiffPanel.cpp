@@ -46,22 +46,8 @@
 #include "engine/TensorDiff.h"  // #34: match_tensors / compute_tensor_stat_delta
 #include "ir/IR.h"
 #include "view/App.h"
+#include "view/FileDialog.h"
 #include "view/PanelHelpers.h"
-
-// tinyfiledialogs: declared here (same as App.cpp) so the panel can open the
-// comparison-model file dialog. Definition provided by the tinyfiledialogs TU.
-extern "C" {
-char* tinyfd_openFileDialog(const char* aTitle, const char* aDefaultPathAndFile,
-                            int aNumOfFilterPatterns,
-                            const char* const* aFilterPatterns,
-                            const char* aSingleFilterDescription,
-                            int aAllowMultipleSelects);
-char const* tinyfd_saveFileDialog(char const* aTitle,
-                                  char const* aDefaultPathAndFile,
-                                  int aNumOfFilterPatterns,
-                                  char const* const* aFilterPatterns,
-                                  char const* aSingleFilterDescription);
-}
 
 namespace netvis {
 
@@ -891,14 +877,23 @@ void draw_diff_panel(App& app) {
   // against the same primary baseline.
   const bool at_cap = dl.comparison_count() >= kMaxComparisons;
   ImGui::BeginDisabled(at_cap);
+  // The chooser is a child process polled per frame (see FileDialog.h), so the
+  // panel keeps drawing while it is open. `dl`/`s` are re-fetched every frame,
+  // so acting on the pick a few frames later is safe.
+  static DeferredFileDialog add_dlg;
   if (ImGui::Button("Add comparison...")) {
-    const char* filters[] = {"*.onnx", "*.tflite", "*.safetensors", "*.gguf",
-                             "*.pt",   "*.pth",    "*.bin",         "*.pb"};
-    char* picked =
-        tinyfd_openFileDialog("Open comparison model", "",
-                              static_cast<int>(std::size(filters)), filters,
-                              "Model files", 0);
-    if (picked != nullptr) dl.add_comparison(s, picked);
+    if (!file_dialog_available()) {
+      app.add_toast("No file chooser found - install zenity or kdialog", true);
+    } else {
+      add_dlg.start(FileDialog::Mode::Open, "Open comparison model", "",
+                    {"*.onnx", "*.tflite", "*.safetensors", "*.gguf", "*.pt",
+                     "*.pth", "*.bin", "*.pb"},
+                    "Model files");
+    }
+  }
+  std::string picked_comparison;
+  if (add_dlg.ready(&picked_comparison, nullptr) && !at_cap) {
+    dl.add_comparison(s, picked_comparison);
   }
   ImGui::EndDisabled();
   if (at_cap) {
@@ -1079,23 +1074,33 @@ void draw_diff_panel(App& app) {
   // #37: export the change report (markdown / TSV) for the ACTIVE slot.
   if (a_model != nullptr && b_model != nullptr) {
     ImGui::SeparatorText("Export");
+    // The report is built at CLICK time, while a_model/b_model/diff are known
+    // live. Only the text survives until the chooser closes, so a tab switch or
+    // a reload while the dialog is up cannot make this write stale data.
+    static DeferredFileDialog report_dlg;
+    static std::string pending_report;
     auto do_export = [&](bool tsv) {
-      const char* pat_md[] = {"*.md"};
-      const char* pat_tsv[] = {"*.tsv"};
-      const char* out = tinyfd_saveFileDialog(
-          "Export change report", tsv ? "diff.tsv" : "diff.md", 1,
-          tsv ? pat_tsv : pat_md, tsv ? "TSV" : "Markdown");
-      if (out == nullptr) return;
-      std::string report =
-          build_change_report(*a_model, a_gi, *b_model, *diff, tsv);
-      std::ofstream f(out);
+      if (!file_dialog_available()) {
+        app.add_toast("No file chooser found - install zenity or kdialog", true);
+        return;
+      }
+      if (report_dlg.busy()) return;
+      pending_report = build_change_report(*a_model, a_gi, *b_model, *diff, tsv);
+      report_dlg.start(FileDialog::Mode::Save, "Export change report",
+                       tsv ? "diff.tsv" : "diff.md",
+                       {tsv ? "*.tsv" : "*.md"}, tsv ? "TSV" : "Markdown");
+    };
+    std::string report_path;
+    if (report_dlg.ready(&report_path, nullptr)) {
+      std::ofstream f(report_path);
       if (f) {
-        f << report;
-        app.add_toast(std::string("Exported ") + out, false);
+        f << pending_report;
+        app.add_toast("Exported " + report_path, false);
       } else {
         app.add_toast("Could not write report", true);
       }
-    };
+      pending_report.clear();
+    }
     if (ImGui::Button("Export .md")) do_export(false);
     ImGui::SameLine();
     if (ImGui::Button("Export .tsv")) do_export(true);

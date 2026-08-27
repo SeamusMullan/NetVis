@@ -31,6 +31,7 @@
 // tests can link it), so including it costs nothing.
 #include "engine/ViewSnapshot.h"
 #include "view/CategoryStyle.h"   // #104: accessible palette + non-colour cue
+#include "view/FileDialog.h"   // non-blocking native chooser
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
 
@@ -495,6 +496,28 @@ class App {
   std::vector<Toast> toasts_;
   std::vector<std::string> recent_;
   plugin::PluginEnableSet plugin_enabled_;   // #11: persisted per-plugin enable state
+
+  // The native file chooser runs out-of-process and is polled per frame (see
+  // FileDialog.h) — a blocking chooser stopped glfwPollEvents and the WM greyed
+  // the window out as "not responding". One chooser at a time; `dialog_kind_`
+  // remembers which menu item asked so poll_file_dialog() can finish the job.
+  enum class DialogKind {
+    None,
+    OpenModel,
+    ExportPng,
+    ExportSvg,
+    SaveViewState,
+    LoadViewState,
+  };
+  DialogKind dialog_kind_ = DialogKind::None;
+  FileDialog dialog_;
+  void start_file_dialog(DialogKind kind, FileDialog::Mode mode,
+                         const std::string& title,
+                         const std::string& default_path,
+                         const std::vector<std::string>& patterns,
+                         const std::string& description);
+  // Drains a finished chooser and runs the action it was opened for.
+  void poll_file_dialog();
 
   // Install the font-metric SizeFn on a tab's session (used by layout to measure
   // node label extents). Factored out so new_tab()/init() share one definition.
