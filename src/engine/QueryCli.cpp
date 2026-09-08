@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/QueryCli.cpp — headless agent-facing query CLI.
 //
 // See QueryCli.h for the contract and docs/agent-cli.md for the per-verb JSON.

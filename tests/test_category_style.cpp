@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_category_style.cpp — the accessible category palette (#104).
 //
 // BUILD SITUATION — read this before assuming the file is dead weight.

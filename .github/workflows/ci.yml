@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Main CI: sanitizers (ASan+UBSan, TSan) and a headless build+test on every
 # push/PR. On a vX.Y.Z tag it additionally builds the per-OS installers and
 # publishes them to a GitHub Release.

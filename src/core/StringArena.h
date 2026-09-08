@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/StringArena.h — interned strings with 32-bit handles.
 //
 // DECISION (spec §3.2): all IR strings live in one arena and are referenced by

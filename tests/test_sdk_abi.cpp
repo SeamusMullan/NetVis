@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_sdk_abi.cpp — SDK-header <-> C++-contract drift guard (#10, Increment D).
 //
 // Includes the shipped SDK header in HOST-BRIDGE mode (imports excluded) alongside

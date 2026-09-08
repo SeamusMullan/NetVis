@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* plugins/examples/attn_pass/attn_pass.c — a minimal NetVis WASM PASS plugin.
  *
  * The directly-runnable example against the LIVE pass facet (shipped in v0.6.0):

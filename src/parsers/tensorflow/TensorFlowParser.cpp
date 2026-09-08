@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/tensorflow/TensorFlowParser.cpp — TensorFlow GraphDef / SavedModel -> ir::Model.
 //
 // DECISION (#107, spec §2.1): TensorFlow files are protobuf, exactly like ONNX,

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: Apache-2.0
 // Bootstrap launcher for the netvis MCP server (Claude Code plugin).
 //
 // The plugin manifest runs `node` on this script instead of naming the binary,

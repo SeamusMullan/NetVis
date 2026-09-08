@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_quant_preview.cpp — engine::preview_quant_block, the #49
 // bounded single-block dequant preview (engine/TensorStats.h).
 //

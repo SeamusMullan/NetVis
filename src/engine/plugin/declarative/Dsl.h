@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/declarative/Dsl.h — the declarative-plugin expression DSL
 // (v0.6.0 Increment 2, issue #9).
 //

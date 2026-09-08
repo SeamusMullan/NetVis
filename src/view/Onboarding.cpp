@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/Onboarding.cpp — first-run empty state, Help menu, shortcuts (#105).
 //
 // The three surfaces here are the only places in the app that speak to someone

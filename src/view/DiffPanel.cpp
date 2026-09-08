@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/DiffPanel.cpp — comparison / model-diff panel (v0.2.0 model diff).
 //
 // Pure ImGui + reading published DiffLoader results (view -> engine only; no

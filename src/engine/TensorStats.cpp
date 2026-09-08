@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/TensorStats.cpp — the ONE place a tensor payload is read.
 //
 // DECISION (spec §7.5, §2.1): structural parsing never touches payload bytes.

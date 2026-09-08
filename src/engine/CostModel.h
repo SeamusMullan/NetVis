@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/CostModel.h — static compute/memory cost analysis (v0.3.0 analyzer).
 //
 // DECISION (v0.3.0): NetVis moves from "see the model" to "understand its cost".

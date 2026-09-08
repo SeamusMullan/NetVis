@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_text_contrast.cpp — node label contrast (#150).
 //
 // WHY THIS FILE CAN RUN AT ALL: netvis_tests links netvis_core and nothing else,

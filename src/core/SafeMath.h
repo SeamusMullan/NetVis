@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/SafeMath.h — saturating/checked integer arithmetic, single source of truth.
 //
 // DECISION (v0.6.0 §2.0): the built-in FLOP path clamps at UINT64_MAX (never

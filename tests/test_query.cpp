@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_query.cpp — the agent-facing query CLI contract.
 //
 // run_query is the whole surface: verb dispatch, option parsing, model loading

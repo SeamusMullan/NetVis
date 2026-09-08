@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/GraphNav.cpp — graph-navigation view logic (v0.2.0 graph navigation).
 //
 // Implements ensure_nav() (adjacency + display-space mask rebuild keyed on the

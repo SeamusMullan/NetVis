@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_shape_ext.cpp — mmap-base-aware shape inference (spec §7.3).
 //
 // Builds ONNX-like ir::Models by hand and exercises infer_shapes_ext:

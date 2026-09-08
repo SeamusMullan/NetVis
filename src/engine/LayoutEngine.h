@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/LayoutEngine.h — computes a LayoutResult for a collapse view.
 //
 // DECISION (spec §7.2): pure function of (graph, collapse view, node sizes) ->

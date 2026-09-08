@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_session_store.cpp — #103 session/workspace persistence.
 //
 // LINKAGE NOTE (read before trusting these results): SessionStore.h is

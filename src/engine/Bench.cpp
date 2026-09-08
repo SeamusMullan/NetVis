@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/Bench.cpp — the benchmark + perf-regression harness (#97).
 //
 // Bench.h carries the rationale for the harness existing at all; this file is

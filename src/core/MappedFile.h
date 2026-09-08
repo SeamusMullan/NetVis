@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/MappedFile.h — memory-mapped read-only file.
 //
 // DECISION (spec §2.1, the whole product thesis): weights are NEVER eagerly

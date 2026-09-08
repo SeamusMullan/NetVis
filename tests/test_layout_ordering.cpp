@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_layout_ordering.cpp — #122: the barycenter early-stop must never
 // publish an ordering worse than the one it started from.
 //

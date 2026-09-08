@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/Camera.cpp — world<->screen transform + camera animation helpers.
 //
 // DECISION (spec §8.1): layout lives in world space; the canvas applies a single

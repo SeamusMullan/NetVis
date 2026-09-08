@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/gguf/GgufMetadata.h — #44: well-known GGUF KV grouping (view-facing).
 //
 // The GGUF parser already drops EVERY key/value pair into Model::metadata

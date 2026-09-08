@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_truncation.cpp — malformed/truncated input safety (spec §6).
 //
 // For each fixture that exists, truncate it at every 1/8th of its length, map

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmHost.h — capability-scoped host API + WasmPassPlugin
 // (v0.6.0 #10). This is the THESIS-ENFORCEMENT surface: the set of imports a WASM
 // pass plugin may call is finite and contains NO function that returns a decoded

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_bench.cpp — the benchmark harness contract (#97).
 //
 // engine/Bench.h freezes the numeric/structural contract this file tests:

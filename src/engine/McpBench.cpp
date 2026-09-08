@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/McpBench.cpp — footprint harness for the MCP server.
 //
 // See McpBench.h for what is measured and why. The synthetic models are ONNX

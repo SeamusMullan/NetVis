@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmParser.h — WASM ParserPlugin host side (Increment B, #10).
 //
 // A WASM parser turns a whole file into an ir::Model via append-only COMMANDS over

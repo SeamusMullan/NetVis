@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_graph_adjacency.cpp — CSR forward/reverse adjacency + bounded BFS.
 //
 // Builds a small DAG in code and asserts successor/predecessor sets, that lists

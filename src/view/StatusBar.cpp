@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/StatusBar.cpp — bottom status bar + toast stack (spec §8.7).
 //
 // draw_status_bar: a pinned, no-decoration strip along the bottom of the main

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_coreml.cpp — CoreML .mlmodel parser contract (spec §6, §10; #38).
 //
 // Parses the hand-encoded model.mlmodel fixture (a Model protobuf with one

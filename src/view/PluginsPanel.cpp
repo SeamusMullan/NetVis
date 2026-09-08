@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/PluginsPanel.cpp — the Plugins management panel (v0.6.0 #11).
 #include "view/PluginsPanel.h"
 

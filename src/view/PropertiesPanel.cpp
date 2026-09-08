@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/PropertiesPanel.cpp — the "Properties" inspector panel (spec §8.2).
 //
 // Shows details for whatever is selected: a leaf IR node (op_type, name,

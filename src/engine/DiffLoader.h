@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/DiffLoader.h — loads + diffs COMPARISON models against the primary.
 //
 // DECISION (v0.2.0 model diff): the view must never include a parser

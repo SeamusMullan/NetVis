@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/DiffPanel.h — comparison / model-diff panel (v0.2.0 model diff).
 //
 // Module-private to view/. The panel lets the user load a SECOND model as a

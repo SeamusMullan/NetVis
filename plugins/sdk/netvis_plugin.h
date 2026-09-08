@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* plugins/sdk/netvis_plugin.h — NetVis plugin SDK: the FROZEN WASM wire ABI.
  *
  * Single freestanding C11 header (<stdint.h> only). ONE source of truth for the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/HostInfo.h — what machine produced a measurement (#154).
 //
 // DECISION (#154): the perf gate refuses to compare two runs recorded on

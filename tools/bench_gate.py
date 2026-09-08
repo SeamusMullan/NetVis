@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """tools/bench_gate.py — CI perf-regression gate for the benchmark harness (#97).
 
 Compares a freshly captured `netvis --bench` JSON run ("current") against a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ModelDiff.cpp — structural diff between two models (v0.2.0 model diff).
 //
 // MATCHING STRATEGY (see header): the two models have INDEPENDENT StringArenas,

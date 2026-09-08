@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Reusable build+package workflow: builds NetVis Release on all three OSes and
 # produces the platform installer (NSIS .exe on Windows, .dmg on macOS, .zip on
 # Linux), the standalone netvis_mcp binary per platform, and one SHA256SUMS

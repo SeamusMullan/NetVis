@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/TextContrast.h — WCAG contrast maths for text drawn on top of a fill (#150).
 //
 // THE FAILURE (#150): GraphCanvas draws a node's op_type INSIDE the coloured

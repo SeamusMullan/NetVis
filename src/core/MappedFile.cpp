@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/MappedFile.cpp — POSIX mmap / Windows MapViewOfFile implementation.
 #include "core/MappedFile.h"
 

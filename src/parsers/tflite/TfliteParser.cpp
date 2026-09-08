@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/tflite/TfliteParser.cpp — TFLite flatbuffer parser.
 //
 // TFLite schema v3 (TFL3). We hand-roll flatbuffer traversal (NO flatbuffers

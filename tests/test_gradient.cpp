@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_gradient.cpp — heatmap gradient presets + sampling (v0.3.2 QoL).
 //
 // The gradient is a pure engine function (no ImGui), so its endpoints, midpoint,

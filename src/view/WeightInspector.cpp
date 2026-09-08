@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/WeightInspector.cpp — the "Weight Inspector" panel (spec §8.3).
 //
 // The one panel that shows decoded tensor values. It never reads bytes itself:

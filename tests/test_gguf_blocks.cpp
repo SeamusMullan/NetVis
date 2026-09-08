@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_gguf_blocks.cpp — ggml quant type table + single-block dequant
 // value tests (#49).
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/ViewPrefs.h — the user-PREFERENCE half of ViewState, and its file (#151).
 //
 // WHY THIS EXISTS (#151): ViewState is per-tab, and App::new_tab() default-

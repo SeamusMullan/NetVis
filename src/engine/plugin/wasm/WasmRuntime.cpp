@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmRuntime.cpp — wasm3-backed sandbox (v0.6.0 #10).
 // See WasmRuntime.h. Compiles to no-ops without NETVIS_ENABLE_WASM.
 #include "engine/plugin/wasm/WasmRuntime.h"

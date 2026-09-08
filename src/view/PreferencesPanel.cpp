@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/PreferencesPanel.cpp — the one Settings window (#102).
 //
 // Every widget here writes THROUGH to the live ViewState the rest of the app

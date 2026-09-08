@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/CostPanel.cpp — analyzer / cost-report view (v0.3.0 analyzer mode).
 //
 // DECISION (v0.3.0): NetVis v0.3.0 adds analyzer-mode overlays (FLOPs, params,

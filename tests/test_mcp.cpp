@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_mcp.cpp — the MCP server contract.
 //
 // McpServer::handle_line is the whole protocol surface: one JSON-RPC message

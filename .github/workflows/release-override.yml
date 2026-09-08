@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Manual release override: build the installers and publish a GitHub Release for
 # an explicitly-entered version, WITHOUT requiring a vX.Y.Z tag push. Use for
 # re-cutting a broken release or an out-of-band build. Run from the Actions tab.

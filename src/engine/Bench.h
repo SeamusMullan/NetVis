@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/Bench.h — the benchmark + perf-regression harness (#97).
 //
 // DECISION (v0.9.3, Pillar 2 of docs/v1.0-plan.md): NetVis claims instant

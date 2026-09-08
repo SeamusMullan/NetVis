@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_npy.cpp — NumPy .npy export round-trip (spec §7.5).
 //
 // Creates a temp file of known F32 values, maps it, builds a TensorRef over it,

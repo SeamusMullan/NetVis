@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/ShapeMath.h — pure shape arithmetic shared by built-in handlers
 // and plugin backends (v0.6.0 §2.0). Mirrors CostModel.cpp's elem_count_from_shape
 // / partial_shape_product so plugin FLOPs are bit-identical to the built-ins, and

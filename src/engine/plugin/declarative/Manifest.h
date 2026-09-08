@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/declarative/Manifest.h — declarative plugin loader (v0.6.0 #9).
 //
 // Loads a JSONC plugin manifest (one `plugin.json` per plugin dir), compiles each

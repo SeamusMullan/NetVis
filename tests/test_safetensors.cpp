@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_safetensors.cpp — SafeTensors parser contract (spec §6, §10).
 //
 // SafeTensors has no compute graph, so has_graph must be false and tensors land

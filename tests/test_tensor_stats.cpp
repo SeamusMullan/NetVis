@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_tensor_stats.cpp — compute_tensor_stats value tests (#46/#48/#51).
 //
 // Mirrors the test_npy.cpp harness: write a raw F32 payload to a temp file, map

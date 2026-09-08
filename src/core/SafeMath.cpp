@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/SafeMath.cpp — portable checked signed-int64 arithmetic (v0.6.0).
 // Header-declared; defined here so no compiler builtin is baked into the header
 // (MSVC has no __builtin_*_overflow). The DSL treats any `false` as honest-unknown.

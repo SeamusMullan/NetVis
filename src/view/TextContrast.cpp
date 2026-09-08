@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/TextContrast.cpp — WCAG contrast maths (#150). Rationale is in the header.
 #include "view/TextContrast.h"
 

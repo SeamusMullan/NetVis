@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_tensorflow.cpp — TensorFlow GraphDef / SavedModel parser (#107).
 //
 // Covers the three things that make this parser trustworthy: (1) a frozen

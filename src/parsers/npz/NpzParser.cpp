@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/npz/NpzParser.cpp — NumPy .npz (zip of .npy arrays) -> ir::Model.
 //
 // NumPy .npz is a ZIP archive of .npy entries. Each .npy has a header (magic,

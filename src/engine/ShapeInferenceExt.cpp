@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ShapeInferenceExt.cpp — mmap-base-aware ONNX shape/dtype propagation.
 //
 // This is the real implementation of shape inference. The frozen 3-arg

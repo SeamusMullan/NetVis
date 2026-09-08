@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # NetVis — speed-first neural network model viewer.
 # Single CMake codebase for Windows / Linux / macOS (spec §1, §9).
 cmake_minimum_required(VERSION 3.24)

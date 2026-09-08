@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/OpCategory.h — map an op_type string to a coloring category.
 //
 // DECISION (spec §8.1): node header strips are colored by op category. The

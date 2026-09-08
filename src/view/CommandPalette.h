@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/CommandPalette.h — Ctrl+P fuzzy command palette (#59).
 //
 // A single entry point drawn each frame from App::frame(). When

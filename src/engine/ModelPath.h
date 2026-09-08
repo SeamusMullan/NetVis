@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ModelPath.h — resolve a user-opened path to the single file to mmap.
 //
 // DECISION (#85): a CoreML `.mlpackage` is a DIRECTORY bundle, but the whole

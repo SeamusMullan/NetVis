@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ModelSession.cpp — implementation of the model-owning session that
 // drives the background job pipeline (spec §3, §4).
 //

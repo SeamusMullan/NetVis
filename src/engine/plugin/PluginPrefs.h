@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/PluginPrefs.h — per-plugin enable/disable state (#11, Increment C).
 //
 // Persisted in view_prefs.json under a "plugins" object keyed by the discovery

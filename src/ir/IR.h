@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ir/IR.h — the common intermediate representation all parsers target.
 //
 // DECISION (spec §3.2): cache-friendly struct-of-arrays. Nodes/values are POD

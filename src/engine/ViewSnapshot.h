@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ViewSnapshot.h — bounded undo/redo over view state (#106).
 //
 // SCOPE DECISION (v0.9.4, user's call): a snapshot captures EVERYTHING the user

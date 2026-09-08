@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/McpBench.h — footprint harness for the MCP server.
 //
 // DECISION: the server's performance claims follow the same rule as the

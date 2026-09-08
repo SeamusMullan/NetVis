@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/OpCategory.cpp — op_type string -> coloring category (spec §8.1).
 //
 // Pure logic, no GUI. The classification is case-insensitive on the last dot

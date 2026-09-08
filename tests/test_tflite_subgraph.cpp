@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_tflite_subgraph.cpp — TFLite control-flow subgraph linking.
 //
 // Verifies the f_operator field-number fix (builtin_options_type=field 3,

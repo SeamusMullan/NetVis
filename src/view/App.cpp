@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/App.cpp — application shell: window/GL/ImGui lifetime, main loop, menus,
 // theme, recent files, async tensor inspect, and PNG export.
 //

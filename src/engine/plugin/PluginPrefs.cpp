@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/PluginPrefs.cpp — see PluginPrefs.h.
 #include "engine/plugin/PluginPrefs.h"
 

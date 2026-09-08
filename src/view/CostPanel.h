@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/CostPanel.h — analyzer / cost-report view surface (v0.3.0 analyzer mode).
 //
 // Module-private to view/. Mirrors the GraphNav pattern: the heavy work

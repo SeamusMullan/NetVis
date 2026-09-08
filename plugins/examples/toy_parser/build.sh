@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build the toy_parser WASM plugin. Requires clang with a wasm32 target (LLVM 8+).
 # NetVis CI has no wasm toolchain, so examples are author-compiled; the test suite
 # uses hand-encoded fixtures (tools/gen_fixtures.py) instead.

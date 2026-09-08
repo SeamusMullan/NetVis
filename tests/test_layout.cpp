@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_layout.cpp — layered layout determinism (spec §2.7, §7.2).
 //
 // Builds a tiny ir::Model in code, runs CollapseTree::build + compute_layout

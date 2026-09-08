@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/pytorch/PickleVM.cpp — restricted pickle VM implementation.
 //
 // See PickleVM.h for the security rationale. This file interprets pickle

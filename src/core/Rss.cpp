@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/Rss.cpp — platform peak/current resident-set-size readers (#101).
 //
 // See Rss.h for the contract this file implements: 0 always means "the

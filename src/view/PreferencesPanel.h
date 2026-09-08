@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/PreferencesPanel.h — one Settings window (#102).
 //
 // DECISION (v0.9.4): preferences are currently seventeen scattered menu items

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/CollapseTree.h — repeated-block detection + collapse state.
 //
 // DECISION (spec §7.1): modern models are dominated by repeated blocks (e.g. 32

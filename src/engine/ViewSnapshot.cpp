@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ViewSnapshot.cpp — the bounded undo/redo ring (#106).
 //
 // Lives in netvis_core, not in the view, so netvis_tests links and exercises

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/QueryCli.h — headless agent-facing query CLI.
 //
 // DECISION: `netvis query <verb> <model> ...` answers one structural question

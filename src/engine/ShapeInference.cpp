@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ShapeInference.cpp — frozen 3-arg entry point (spec §7.3).
 //
 // The full best-effort ONNX shape/dtype propagation lives in

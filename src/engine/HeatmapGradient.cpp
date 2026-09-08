@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/HeatmapGradient.cpp — heatmap gradient presets + sampling.
 #include "engine/HeatmapGradient.h"
 

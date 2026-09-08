@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_plugin_examples.cpp — the shipped declarative plugin examples must
 // stay valid (v0.6.2). CI loads every plugins/examples/<dir>/plugin.json through
 // the REAL host loader and asserts it parses + every op compiles, so a broken

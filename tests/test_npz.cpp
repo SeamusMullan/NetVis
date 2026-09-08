@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_npz.cpp — NumPy .npz parser contract (spec §6, §10, issue #41).
 //
 // NumPy .npz has no compute graph, so has_graph must be false and tensors land

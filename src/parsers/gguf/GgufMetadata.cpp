@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/gguf/GgufMetadata.cpp — #44 well-known GGUF KV grouping (see header).
 #include "parsers/gguf/GgufMetadata.h"
 

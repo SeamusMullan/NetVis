@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/Rss.h — peak resident-set size of this process (#101 memory ceiling).
 //
 // DECISION (v0.9.3): the memory pillar needs a number the harness can assert on,

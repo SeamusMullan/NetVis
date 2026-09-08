@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/ViewHistory.h — capture/apply of a ViewSnapshot against the live view.
 //
 // The SNAPSHOT and the bounded history ring live in engine/ViewSnapshot.h, in

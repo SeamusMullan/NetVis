@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/gguf/GgufParser.cpp — GGUF (v2/v3) reader for llama.cpp-style models.
 //
 // File layout (all little-endian):

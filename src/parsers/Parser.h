@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/Parser.h — common parser interface + content-based format detection.
 //
 // DECISION (spec §3, §5): the view never touches parsers directly; it goes

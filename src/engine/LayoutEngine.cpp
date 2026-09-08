@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/LayoutEngine.cpp — from-scratch layered (Sugiyama) layout.
 //
 // PERF (spec §7.2): the whole pipeline is O(V+E) plus O(sweeps*E log E) for

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ModelPath.cpp — CoreML .mlpackage bundle -> inner model file resolution.
 //
 // See ModelPath.h. This is the ONLY place that turns a directory into a file to

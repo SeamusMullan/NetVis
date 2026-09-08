@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/TensorDiff.cpp — cross-model tensor matching + weight-stat deltas
 // (#34/#50). See the header for the PHASE 1 (free) / PHASE 2 (payload) split
 // this file implements.

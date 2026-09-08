@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ShapeInference.h — best-effort ONNX shape/dtype propagation.
 //
 // DECISION (spec §7.3): many ONNX files omit intermediate value_info. We

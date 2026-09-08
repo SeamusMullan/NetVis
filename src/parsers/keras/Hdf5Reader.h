@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/keras/Hdf5Reader.h — a MINIMAL, hostile-input-safe HDF5 reader.
 //
 // SCOPE (issue #42, spec §6): this is NOT a general HDF5 library. It implements

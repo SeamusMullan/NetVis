@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/TensorStats.h — lazy weight decode -> streaming stats + NPY export.
 //
 // DECISION (spec §7.5, §2.1): the ONLY place a tensor payload is read. Stats are

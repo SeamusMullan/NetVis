@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_openvino.cpp — OpenVINO IR (.xml + .bin) parser contract (#39).
 //
 // Parses the hand-written model.xml fixture (Parameter -> Convolution(Const) ->

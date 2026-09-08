@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/SpatialIndex.h — uniform-grid spatial index over a laid-out graph (#99).
 //
 // DECISION (v0.9.3, Pillar 2): the canvas culls by scanning EVERY box and EVERY

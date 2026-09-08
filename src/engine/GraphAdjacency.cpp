@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/GraphAdjacency.cpp — CSR forward/reverse adjacency over one IR graph.
 //
 // PERF/CORRECTNESS: one O(V+E) pass builds both directions. We mirror the edge

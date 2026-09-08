@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/ByteReader.h — bounds-checked cursor over a byte range.
 //
 // DECISION (spec §6): every parser reads through ByteReader so malformed input

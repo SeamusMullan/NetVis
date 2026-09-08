@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/App.h — application shell + shared view state (FROZEN view contract).
 //
 // DECISION (spec §8): the view is the only layer that touches ImGui. It talks to

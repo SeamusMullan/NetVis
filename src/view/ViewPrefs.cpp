@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/ViewPrefs.cpp — view_prefs.json I/O. See ViewPrefs.h for the contract
 // (what is a preference and what is not, and why this file is in netvis_core).
 //

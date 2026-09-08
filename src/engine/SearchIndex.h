@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/SearchIndex.h — background-built fuzzy search over model names.
 //
 // DECISION (spec §7.4): the index is a flat array of precomputed lowercase

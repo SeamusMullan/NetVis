@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 // Native file chooser (spec §8.7), non-blocking.
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/PanelHelpers.cpp — implementations of the module-private panel helpers.
 #include "view/PanelHelpers.h"
 

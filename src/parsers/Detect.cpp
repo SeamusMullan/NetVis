@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/Detect.cpp — content-based format detection and parse dispatch.
 //
 // DECISION (spec §5): detection is by CONTENT (magic bytes / structure), with

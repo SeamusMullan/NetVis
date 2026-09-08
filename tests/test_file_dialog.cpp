@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_file_dialog.cpp — the pure path helpers behind the native chooser.
 //
 // BUILD SITUATION: src/view/FileDialog.cpp is GUI/platform code (fork/exec on

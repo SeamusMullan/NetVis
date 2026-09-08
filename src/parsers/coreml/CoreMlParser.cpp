@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/coreml/CoreMlParser.cpp — CoreML .mlmodel (protobuf) -> ir::Model.
 //
 // DECISION (v0.5.0 plan §"#38 — CoreML .mlmodel"): a .mlmodel is a bare CoreML

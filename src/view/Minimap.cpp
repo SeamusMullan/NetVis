@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/Minimap.cpp — overview inset in the graph canvas (spec §8.5).
 //
 // DECISION (spec §8.5): the minimap is drawn with the SAME single ImDrawList as

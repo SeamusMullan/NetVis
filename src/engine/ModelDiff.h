@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ModelDiff.h — structural diff between two models (v0.2.0 model diff).
 //
 // DECISION: compare a primary model+graph against a comparison model+graph and

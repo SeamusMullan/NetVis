@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // mcp_main.cpp — entry point for the MCP server.
 //
 // Links netvis_core ONLY: no GLFW, no OpenGL, no ImGui, no window. MCP clients

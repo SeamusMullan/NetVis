@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_detect.cpp — content-based format detection matrix (spec §5, §10).
 //
 // Writes minimal magic-byte buffers to temp files, maps them with MappedFile,

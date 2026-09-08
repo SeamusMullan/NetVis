@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/openvino/XmlReader.cpp — implementation of the bounded XML-subset
 // reader. Tokenizes ITERATIVELY over a bounds-checked ByteReader with an explicit
 // open-element stack, so parsing a pathological document never recurses (no stack

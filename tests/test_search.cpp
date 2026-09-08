@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_search.cpp — fuzzy search ranking + index (spec §7.4).
 //
 // Asserts the fuzzy_score ordering contract directly (prefix > substring >

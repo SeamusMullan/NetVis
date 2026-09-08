@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/openvino/OpenVinoParser.cpp — OpenVINO IR (.xml + sibling .bin) parser.
 //
 // DECISION (v0.5.0 plan §"#39 — OpenVINO IR"): the topology is XML; we walk it

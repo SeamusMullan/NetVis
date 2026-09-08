@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/safetensors/SafeTensorsParser.cpp — SafeTensors (.safetensors) reader.
 //
 // File layout (all little-endian):

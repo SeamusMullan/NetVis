@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_declarative.cpp — declarative plugin backend: DSL + manifest loader
 // (v0.6.0 Increment 2, #9).
 //

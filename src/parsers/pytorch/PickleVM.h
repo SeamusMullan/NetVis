@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/pytorch/PickleVM.h — restricted (non-executing) pickle virtual machine.
 //
 // SECURITY (spec, non-negotiable): pickle is a stack VM whose GLOBAL/REDUCE

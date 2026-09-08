@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/SessionStore.cpp — persistence for #103. See SessionStore.h for the
 // full contract (what is stored, why collapse state is excluded, why restore
 // is opt-in); this file only implements what that header already promises.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/GraphCanvas.cpp — the interactive graph view (spec §8.1).
 //
 // DECISION (spec §8.1): the ENTIRE graph is drawn inside ONE ImGui child region

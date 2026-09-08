@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ReportJson.h — headless JSON model report (issue #58).
 //
 // DECISION: `netvis --report model.onnx` must analyze a model and print JSON

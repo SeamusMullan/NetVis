@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/GraphNav.h — graph-navigation view state + display-space masks (v0.2.0).
 //
 // Module-private to view/. Holds the navigation UI state (highlight, focus,

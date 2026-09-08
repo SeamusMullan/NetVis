@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/SearchIndex.cpp — build + query the fuzzy search index.
 //
 // DECISION (spec §7.4): the index is a flat, precomputed array. build() runs

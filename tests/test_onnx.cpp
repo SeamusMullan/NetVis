@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_onnx.cpp — ONNX parser contract (spec §6, §10).
 //
 // Parses the hand-encoded model.onnx fixture and asserts: 3 nodes with op_types

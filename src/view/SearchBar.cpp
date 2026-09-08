@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/SearchBar.cpp — the Ctrl+F fuzzy-search overlay (spec §8.4).
 //
 // A no-title, always-on-top window near top-center. The query is fed to

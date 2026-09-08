@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/HeatmapGradient.h — the cost-heatmap color gradient (v0.3.2 QoL).
 //
 // DECISION (v0.3.2): the analyzer heatmap colors nodes by a normalized magnitude

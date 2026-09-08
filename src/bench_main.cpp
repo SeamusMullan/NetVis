@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // bench_main.cpp — entry point for the headless benchmark CLI (#97).
 //
 // Links netvis_core ONLY: no GLFW, no OpenGL, no ImGui, no window. That is the

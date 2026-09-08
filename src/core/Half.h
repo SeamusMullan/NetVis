@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/Half.h — IEEE half (F16) and bfloat16 bit-pattern -> float.
 //
 // Lives in core/ because two layers need it and neither may include the other:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_gguf_metadata.cpp — #44 GGUF well-known KV grouping.
 //
 // summarize_gguf_metadata is PURE over an ir::Model (StringId -> str()), so

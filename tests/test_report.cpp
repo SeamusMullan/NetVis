@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_report.cpp — headless JSON report contract (issue #58).
 //
 // build_report_json is a PURE structural summary over an ir::Model (parse +

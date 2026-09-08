@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/DiffLoader.cpp — async load + diff of COMPARISON models (v0.2.0; N-way
 // since v0.9.1b / #36).
 //

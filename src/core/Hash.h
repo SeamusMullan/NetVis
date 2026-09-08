@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/Hash.h — FNV-1a hashing for structure fingerprints and cache keys.
 //
 // DECISION (spec §2.7, §7.1): the layout cache is keyed by a hash of the graph

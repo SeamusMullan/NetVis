@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_pytorch.cpp — PyTorch zip parser contract (spec §6.5, §10).
 //
 // The fixture's pickle has key "w" -> _rebuild_tensor_v2 (allowlisted; must

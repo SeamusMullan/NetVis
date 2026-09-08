@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_keras.cpp — Keras .h5 / .keras parser contract (spec §6, §10).
 //
 // Keras has no compute graph, so has_graph must be false and datasets land in

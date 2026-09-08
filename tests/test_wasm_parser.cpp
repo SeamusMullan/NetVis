@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_wasm_parser.cpp — WASM ParserPlugin + host parser API (#10, Increment B).
 //
 // Loads plugin_toyparser.wasm through the real WasmEngine and asserts: can_parse

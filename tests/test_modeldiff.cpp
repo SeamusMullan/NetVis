@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_modeldiff.cpp — structural diff between two models (v0.2.0).
 //
 // Builds model A and a model B derived from A: same nodes, but one node removed,

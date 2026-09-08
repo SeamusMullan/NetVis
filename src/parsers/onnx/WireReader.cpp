@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/onnx/WireReader.cpp — the WireReader is entirely header-inline (its
 // methods are small and hot, so we let them inline at call sites). This TU
 // exists to satisfy the module layout and to anchor a static_assert on the

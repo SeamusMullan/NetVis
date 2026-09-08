@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """NetVis test-fixture generator (spec §10).
 
 Emits tiny, hand-encoded model files exercising every parser path, using the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/LayoutCache.h — persistent per-file layout cache.
 //
 // DECISION (spec §2.7, §7.2.7): same file -> same layout, so we serialize node

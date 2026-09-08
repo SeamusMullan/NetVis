@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/Registry.cpp — registry spine + OpContext accessors +
 // BuiltinOpHandler (v0.6.0 Increment 1, issue #8).
 //

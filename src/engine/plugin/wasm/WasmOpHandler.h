@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmOpHandler.h — WASM OpHandler adapter (Increment A, #10).
 //
 // The fourth OpHandler implementor (alongside Builtin/Declarative). It answers

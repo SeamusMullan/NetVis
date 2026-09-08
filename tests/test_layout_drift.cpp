@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_layout_drift.cpp — v0.2.1 regression: ONNX graphs must not drift
 // consistently rightward with depth (the minimap-looks-like-a-diagonal-line bug).
 //

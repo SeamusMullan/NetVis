@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/CategoryStyle.cpp — op-category colour + non-colour cue (#104).
 //
 // The design argument lives in CategoryStyle.h; this file is the data plus the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/McpServer.cpp — Model Context Protocol server over the query engine.
 //
 // See McpServer.h for the design. Protocol surface: initialize, ping,

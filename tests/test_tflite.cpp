@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_tflite.cpp — TFLite flatbuffer parser contract (spec §6, §10).
 //
 // The fixture is a minimal-but-valid flatbuffer: TFL3 identifier, one SubGraph,

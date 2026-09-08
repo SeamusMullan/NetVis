@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_layout_readability.cpp — v0.2.0 layout readability (kVersion v3).
 //
 // Covers multi-consumer source DUPLICATION and long-edge DUMMY routing added to

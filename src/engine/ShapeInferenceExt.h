@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ShapeInferenceExt.h — mmap-base-aware shape inference (v0.2.0).
 //
 // DECISION: the frozen 3-arg infer_shapes (ShapeInference.h) cannot read

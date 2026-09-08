@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/declarative/Dsl.cpp — recursive-descent parser + checked evaluator
 // for the declarative expression DSL (v0.6.0 #9). See Dsl.h for the grammar.
 #include "engine/plugin/declarative/Dsl.h"

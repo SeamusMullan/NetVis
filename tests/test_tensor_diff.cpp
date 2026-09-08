@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_tensor_diff.cpp — cross-model tensor matching (#34/#50), PHASE 1
 // only (enumerate_tensors / resolve_tensor / find_tensor_by_name /
 // match_tensors). PHASE 2 (compute_tensor_stat_delta) reads payload through

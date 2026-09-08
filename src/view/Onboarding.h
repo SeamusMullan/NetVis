@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/Onboarding.h — first-run empty state and the Help menu (#105).
 //
 // DECISION (v0.9.4): with no model open, NetVis currently draws NOTHING — the

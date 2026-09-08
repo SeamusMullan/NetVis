@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/Result.h — Result<T, Error>-style error handling.
 //
 // DECISION: No exceptions cross module boundaries (spec §13). Parsers and jobs

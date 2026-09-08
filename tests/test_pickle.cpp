@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_pickle.cpp — pickle VM opcode coverage (spec §6.5, §10).
 //
 // NOTE: there is no public src/parsers/pytorch/PickleVM.h in the frozen tree, so

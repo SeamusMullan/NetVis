@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/LayoutCache.cpp — persistent per-file layout cache.
 //
 // DECISION (spec §2.7, §7.2.7): a layout is a pure function of (structure hash,

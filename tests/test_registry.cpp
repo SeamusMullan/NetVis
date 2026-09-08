@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_registry.cpp — plugin registry spine contract (v0.6.0 Increment 1, #8).
 //
 // The spine is a ZERO-behavior-change refactor: with no user plugins loaded, the

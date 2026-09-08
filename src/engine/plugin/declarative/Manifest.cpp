@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/declarative/Manifest.cpp — JSONC manifest loader + DeclarativeOpHandler
 // (v0.6.0 #9). See Manifest.h.
 #include "engine/plugin/declarative/Manifest.h"

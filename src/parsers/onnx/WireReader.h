@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/onnx/WireReader.h — minimal hand-rolled protobuf wire reader.
 //
 // DECISION: NetVis avoids libprotobuf/protoc entirely. ONNX files are just

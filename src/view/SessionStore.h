@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/SessionStore.h — reopen the last session's tabs + camera (#103).
 //
 // DECISION (v0.9.4): OPT-IN, and off by default. Silently reopening several

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // query_main.cpp — entry point for the headless query CLI.
 //
 // Links netvis_core ONLY: no GLFW, no OpenGL, no ImGui, no window. The GUI

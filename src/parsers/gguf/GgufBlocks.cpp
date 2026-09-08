@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/gguf/GgufBlocks.cpp — ggml type table + bounded single-block dequant.
 //
 // See GgufBlocks.h for the scope decision. Everything here is pure: a caller

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/JobSystem.h — fixed thread pool + main-thread completion queue.
 //
 // DECISION (spec §4): the main thread NEVER blocks. Parsing, layout, search

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmHost.cpp — capability host API + WasmPassPlugin run path
 // (v0.6.0 #10). The imports bound here are the ENTIRE vocabulary a WASM pass gets.
 // THESIS: none of them returns a tensor/weight buffer — a pass reads structure

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_hardening.cpp — regression tests for the hostile-input defects
 // found by the adversarial review. Each asserts that a malicious value produces
 // a graceful outcome (error / clamp / bounded work), never a crash, OOB read,

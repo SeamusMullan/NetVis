@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/ParserPlugin.h — FROZEN parser-extension ABI (v0.6.0, issue #7).
 //
 // A ParserPlugin turns one whole file into an ir::Model, run ONCE on a worker

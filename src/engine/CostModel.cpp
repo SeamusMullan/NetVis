@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/CostModel.cpp — static compute/memory cost analysis (v0.3.0 analyzer).
 //
 // DECISION (v0.3.0): compute_cost is a pure structure-reader upholding the

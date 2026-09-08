@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_collapse.cpp — CollapseTree global collapse/expand (#21).
 //
 // Builds tiny ir::Models in code (one with a detected repeated-block group, one

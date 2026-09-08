@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/Registry.h — FROZEN registry spine (v0.6.0, issue #7 / Increment 1).
 //
 // Immutable-snapshot, lock-free reads. Reads come from BOTH the worker thread

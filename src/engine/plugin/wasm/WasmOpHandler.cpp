@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmOpHandler.cpp — WASM OpHandler adapter host side (#10).
 // See WasmOpHandler.h. The "netvis_op" import set lets a sandboxed module READ the
 // current OpContext (counts/shapes/dtypes/attrs/initializer records) and PUSH a

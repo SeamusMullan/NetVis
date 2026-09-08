@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/McpServer.h — Model Context Protocol server over the query engine.
 //
 // DECISION: agents that speak MCP get the same ten answers the query CLI

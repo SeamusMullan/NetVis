@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* plugins/examples/toy_parser/toy_parser.c — a minimal NetVis WASM PARSER plugin.
  *
  * Demonstrates the zero-payload thesis for the parser facet (#10, Increment B):

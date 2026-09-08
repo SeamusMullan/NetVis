@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ReportJson.cpp — headless JSON model report (issue #58).
 //
 // See ReportJson.h for the schema. Everything here is pure structure over an

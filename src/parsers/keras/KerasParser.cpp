@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/keras/KerasParser.cpp — Keras .h5 / .keras -> ir::Model (tensor table).
 //
 // Two on-disk shapes under one Format::Keras:

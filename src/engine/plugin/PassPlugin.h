@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/PassPlugin.h — FROZEN analysis-pass ABI (v0.6.0, issue #7).
 //
 // A PassPlugin computes named metrics over an already-parsed model + its

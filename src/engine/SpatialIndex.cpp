@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/SpatialIndex.cpp — uniform-grid build + query (#99).
 //
 // The header argues WHY a grid; this file is the HOW, and every number in it is

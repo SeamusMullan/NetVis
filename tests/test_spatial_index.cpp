@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_spatial_index.cpp — uniform-grid culling index (#99).
 //
 // The load-bearing property is EXHAUSTIVENESS: a culling structure that misses

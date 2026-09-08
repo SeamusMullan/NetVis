@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_onnx_external.cpp — ONNX external-data resolution (issue #43).
 //
 // Parses model.onnx and exercises resolve_payload() on the small resolvable

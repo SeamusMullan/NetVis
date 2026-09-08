@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmParser.cpp — WASM ParserPlugin host side (Increment B, #10).
 // See WasmParser.h. The "netvis" parser import set: window-bounded reads (host-
 // marked) + append-only model-mutating commands. NO import returns a weight buffer;

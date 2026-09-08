@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_mlpackage.cpp — mlpackage bundle + mlProgram weight blob (#85).
 //
 // Tests the resolve_model_path contract: a `.mlpackage` directory resolves to

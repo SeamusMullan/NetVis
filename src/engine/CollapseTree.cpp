@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/CollapseTree.cpp — repeated-block detection + collapse state.
 //
 // PERF (spec §7.1): this runs BEFORE layout on purpose. Modern models are

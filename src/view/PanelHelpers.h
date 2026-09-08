@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/PanelHelpers.h — module-PRIVATE helpers shared by the ImGui panels.
 //
 // Nothing OUTSIDE view/ includes this. It exists so PropertiesPanel /

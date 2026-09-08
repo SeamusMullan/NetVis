@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/CommandPalette.cpp — Ctrl+P fuzzy command palette (#59). See header.
 #include "view/CommandPalette.h"
 

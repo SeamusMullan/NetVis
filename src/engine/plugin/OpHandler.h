@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/OpHandler.h — FROZEN op-level plugin ABI (v0.6.0, issue #7).
 //
 // An OpHandler answers "what is this op": color category, optional explicit color,

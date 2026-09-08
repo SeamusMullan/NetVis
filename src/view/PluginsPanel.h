@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/PluginsPanel.h — the Plugins management panel (v0.6.0 #11).
 //
 // Lists discovered plugins (name / author / api_version / status), the ops each

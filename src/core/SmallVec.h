@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/SmallVec.h — small-buffer-optimized vector.
 //
 // DECISION: Tensor shapes are almost always <=6 dims and ValueInfo/TensorRef are

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/keras/Hdf5Reader.cpp — implementation of the minimal HDF5 reader.
 //
 // See Hdf5Reader.h for scope + invariants. This walks the CLASSIC group form:

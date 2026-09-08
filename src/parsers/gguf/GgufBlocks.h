@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/gguf/GgufBlocks.h — exact ggml quantization types + bounded, view-only
 // single-block dequantization (#49).
 //

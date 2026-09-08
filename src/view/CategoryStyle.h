@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/CategoryStyle.h — accessible op-category styling (#104).
 //
 // DECISION (v0.9.4): NetVis has FIFTEEN op categories, and colour alone cannot

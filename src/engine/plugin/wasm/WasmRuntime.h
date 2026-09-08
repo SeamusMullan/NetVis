@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/plugin/wasm/WasmRuntime.h — runtime-agnostic WASM sandbox wrapper
 // (v0.6.0 Increment 3, #10).
 //

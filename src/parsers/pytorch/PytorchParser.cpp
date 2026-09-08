@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/pytorch/PytorchParser.cpp — PyTorch .pt/.pth/.bin loader.
 //
 // Two entry points (Parser.h):

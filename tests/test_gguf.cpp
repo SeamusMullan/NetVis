@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_gguf.cpp — GGUF v3 parser contract (spec §6.4, §10).
 //
 // GGUF is a tensor table (no graph). Asserts two tensors (one F32, one Q4_0

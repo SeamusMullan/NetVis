@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/ModelSession.h — owns the loaded model + all derived engine state.
 //
 // DECISION (spec §3, §4): the single object the view talks to. It owns the mmap,

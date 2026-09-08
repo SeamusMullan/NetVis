@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/SvgExport.cpp — #55 vector (SVG) export of the current graph.
 //
 // DECISION: SVG is emitted from the WORLD-SPACE layout (boxes + routed edges +

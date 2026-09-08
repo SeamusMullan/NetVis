@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/TensorTable.cpp — flat-tensor browsing mode (spec §8.6, has_graph==false).
 //
 // For formats with no compute graph (GGUF, SafeTensors, state_dict-only

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_cost.cpp — compute_cost contract (v0.3.0 analyzer mode).
 //
 // DECISION: compute_cost is a pure structural function that NEVER reads tensor

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // core/HostInfo.cpp — platform host-description probes (#154).
 //
 // See HostInfo.h for the contract: empty string / 0 always means "the platform

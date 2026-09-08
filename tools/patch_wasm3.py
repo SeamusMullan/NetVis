@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Patch a fetched wasm3 source tree so the sandbox can kill a runaway module and
 so wasm3's fallback m3_Yield does not collide with the host's on MSVC.
 

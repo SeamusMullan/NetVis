@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // view/ViewHistory.cpp — the bounded undo/redo ring + capture/apply (#106).
 //
 // The RULES are specified in ViewHistory.h; this file is their only

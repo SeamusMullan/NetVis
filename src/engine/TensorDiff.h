@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/TensorDiff.h — cross-model tensor matching + weight-stat deltas
 // (#34 per-tensor weight-stat diff, #50 same-tensor side-by-side compare).
 //

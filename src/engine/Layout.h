@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/Layout.h — layered (Sugiyama-style) graph layout output types.
 //
 // DECISION (spec §7.2): from-scratch layered layout, no OGDF/Graphviz. The

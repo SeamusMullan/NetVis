@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/openvino/XmlReader.h — minimal, bounded, hostile-input-safe reader for
 // the XML subset OpenVINO IR (.xml topology) uses.
 //

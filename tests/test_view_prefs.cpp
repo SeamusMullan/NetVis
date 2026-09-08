@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_view_prefs.cpp — #151 view-preference persistence.
 //
 // What this file can and cannot reach: ViewPrefs and view_prefs.json live in

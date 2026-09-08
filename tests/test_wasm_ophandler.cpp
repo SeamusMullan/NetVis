@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_wasm_ophandler.cpp — WASM OpHandler adapter (#10, Increment A).
 //
 // Loads the hand-encoded plugin_ophandler.wasm fixtures through the real WasmEngine

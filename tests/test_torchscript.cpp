@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_torchscript.cpp — TorchScript archive best-effort op listing (§#40).
 //
 // The fixture is a TorchScript archive with data.pkl + constants.pkl +

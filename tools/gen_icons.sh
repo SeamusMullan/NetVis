@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Rasterize assets/netvis.svg into the platform icon files committed under assets/:
 #   netvis.ico   — Windows (multi-size, embedded in the .exe via a .rc)
 #   netvis.icns  — macOS (.app bundle icon)

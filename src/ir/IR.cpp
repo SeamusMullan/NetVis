@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ir/IR.cpp — dtype metadata tables.
 #include "ir/IR.h"
 

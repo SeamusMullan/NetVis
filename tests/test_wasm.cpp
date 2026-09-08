@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_wasm.cpp — WASM plugin sandbox contract (v0.6.0 Increment 3, #10).
 //
 // THE acceptance bar: a hostile .wasm that loops forever is KILLED by the fuel

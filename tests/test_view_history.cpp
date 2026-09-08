@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_view_history.cpp — the #106 undo/redo ring, against the REAL type.
 //
 // This file used to test a hand-copied MIRROR of the ring, because

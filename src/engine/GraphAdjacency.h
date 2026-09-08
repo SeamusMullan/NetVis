@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // engine/GraphAdjacency.h — CSR forward/reverse adjacency over one graph.
 //
 // DECISION (v0.2.0 graph navigation): highlight fan-in/out, focus neighborhoods,

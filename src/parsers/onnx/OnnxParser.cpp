@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // parsers/onnx/OnnxParser.cpp — ONNX (protobuf) -> ir::Model.
 //
 // DECISION (spec §2.1): we walk the protobuf structure with a hand-rolled wire

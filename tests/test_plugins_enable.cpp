@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // tests/test_plugins_enable.cpp — per-plugin enable/disable + trust gate (#11).
 //
 // Core-only (no view): exercises PluginEnableSet defaults/overrides/persistence and

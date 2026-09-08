@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Validate a NetVis declarative plugin manifest before installing it.
 
 Stdlib-only. Mirrors the host loader's up-front checks (JSON shape, api_version,
