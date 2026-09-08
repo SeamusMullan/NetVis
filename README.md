@@ -285,4 +285,4 @@ NetVis is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE)
 for the full text.
 
 Releases up to and including `v0.9.5` were released under PolyForm Noncommercial
-1.0.0; this tag onward, NetVis is Apache-2.0.
+1.0.0; From `v0.9.6` onward, NetVis is under the Apache-2.0 Licence.
