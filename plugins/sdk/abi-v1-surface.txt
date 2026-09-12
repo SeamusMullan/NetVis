@@ -1,0 +1,117 @@
+# NetVis plugin SDK — FROZEN ABI v1 surface inventory.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every macro, enumerator, typedef and host import that plugins/sdk/netvis_plugin.h
+# exposes, one per line, sorted. tests/test_plugin_abi_freeze.cpp re-derives this
+# list from the header on every run and fails if the two disagree.
+#
+# This file is the freeze. A shipped plugin binds to these names and values at
+# compile time, so changing one is not a refactor — it is an ABI break, and it
+# has to be an explicit, reviewable edit here rather than a side effect of
+# editing the header. See docs/plugin-abi.md ("Compatibility promise") for what
+# may change within ABI v1 and what forces a version bump.
+#
+# Lines are `<kind> <name>[ = <value>]`, where kind is one of:
+#   define  a preprocessor macro; `NAME()` marks a function-like macro, whose
+#           body is not frozen (it expands to toolchain attributes)
+#   enum    an enumerator of nv_dtype_t or nv_category_t, with its exact value
+#   import  a host function a guest module may import, as `<module> <name>`
+#   type    a typedef name (nv_tensor_hdr_t's layout is _Static_assert'ed in the
+#           header itself, so only its existence is frozen here)
+define NETVIS_OP_ABI_VERSION = 1u
+define NETVIS_PARSER_ABI_VERSION = 1u
+define NETVIS_PASS_ABI_VERSION = 1u
+define NETVIS_PLUGIN_H
+define NV_ARENA_BYTES = 4096
+define NV_ERR_MSG_MAX = 1024
+define NV_EXPORT()
+define NV_IMPORT()
+define NV_MAX_ATTR_LEN = 65536
+define NV_MAX_INTERN_LEN = 4096
+define NV_MAX_MEMORY_PAGES = 256u
+define NV_MAX_NODE_IO = 4096
+define NV_MAX_RANK = 8
+define NV_MAX_STEPS = 200000000ull
+define NV_NULL_GUARD_OFF = 8u
+define NV_READ_CHUNK_CAP = 4096
+define NV_SNIFF_HEAD = 4096
+define NV_SNIFF_TAIL = 4096
+define NV_STATUS_ABSTAIN = 1
+define NV_STATUS_OK = 0
+enum NV_CAT_ACTIVATION = 2
+enum NV_CAT_ATTENTION = 11
+enum NV_CAT_CONTROLFLOW = 9
+enum NV_CAT_CONV = 0
+enum NV_CAT_ELEMENTWISE = 5
+enum NV_CAT_IO = 10
+enum NV_CAT_MATMUL = 1
+enum NV_CAT_NORM = 3
+enum NV_CAT_OTHER = 14
+enum NV_CAT_POOL = 4
+enum NV_CAT_QUANTIZE = 13
+enum NV_CAT_RECURRENT = 12
+enum NV_CAT_REDUCE = 7
+enum NV_CAT_SHAPE = 6
+enum NV_CAT_TENSOR = 8
+enum NV_DT_BF16 = 2
+enum NV_DT_BOOL = 12
+enum NV_DT_F16 = 1
+enum NV_DT_F32 = 0
+enum NV_DT_F64 = 3
+enum NV_DT_I16 = 5
+enum NV_DT_I32 = 6
+enum NV_DT_I64 = 7
+enum NV_DT_I8 = 4
+enum NV_DT_Q4 = 13
+enum NV_DT_Q8 = 14
+enum NV_DT_U16 = 9
+enum NV_DT_U32 = 10
+enum NV_DT_U64 = 11
+enum NV_DT_U8 = 8
+enum NV_DT_UNKNOWN = 15
+import netvis host_add_attr_float
+import netvis host_add_attr_int
+import netvis host_add_attr_ints
+import netvis host_add_attr_string
+import netvis host_add_node
+import netvis host_add_value
+import netvis host_begin_graph
+import netvis host_emit_metric
+import netvis host_file_len
+import netvis host_intern_range
+import netvis host_node_count
+import netvis host_read_range
+import netvis host_record_tensor
+import netvis host_set_error
+import netvis host_set_graph_io
+import netvis host_set_metadata
+import netvis host_set_model_info
+import netvis host_total_flops
+import netvis host_total_params
+import netvis_op op_attr_float
+import netvis_op op_attr_int
+import netvis_op op_attr_ints
+import netvis_op op_attr_string
+import netvis_op op_default_category
+import netvis_op op_has_attr
+import netvis_op op_input_const_ints
+import netvis_op op_input_count
+import netvis_op op_input_dims
+import netvis_op op_input_dtype
+import netvis_op op_input_init_byte_len
+import netvis_op op_input_init_dtype
+import netvis_op op_input_init_elem_count
+import netvis_op op_input_is_initializer
+import netvis_op op_input_rank
+import netvis_op op_output_count
+import netvis_op op_output_dims
+import netvis_op op_output_dtype
+import netvis_op op_output_rank
+import netvis_op op_set_category
+import netvis_op op_set_color
+import netvis_op op_set_flops
+import netvis_op op_set_output_shape
+import netvis_op op_type
+type nv_category_t
+type nv_dtype_t
+type nv_tensor_hdr_t
