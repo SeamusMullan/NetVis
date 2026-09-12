@@ -395,23 +395,29 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::PyTorchLegacy;
   }
 
-  // TensorFlow (#107): a frozen GraphDef, or a SavedModel bundle's saved_model.pb.
-  // Both run BEFORE the ONNX structural sniff — a SavedModel would otherwise be
-  // claimed as ONNX (see looks_like_saved_model).
-  if (looks_like_graph_def(d, size) || looks_like_saved_model(d, size)) {
-    reason = DetectReason::Structure;
-    return Format::TensorFlow;
-  }
-
   // CoreML .mlmodel is a bare `Model` protobuf whose first field
   // (specificationVersion, a field-1 varint) structurally mimics ONNX's
-  // ir_version, so a bare .mlmodel also satisfies looks_like_onnx_proto. The
-  // two are otherwise ambiguous, so the `.mlmodel` extension is the decisive
-  // tiebreaker (spec §5): a file carrying it routes to CoreML before the ONNX
-  // structural sniff below could claim it.
+  // ir_version AND a SavedModel's schema_version, so a bare .mlmodel satisfies
+  // looks_like_onnx_proto and looks_like_saved_model alike: CoreML's field 2 is
+  // `description`, a length-delimited ModelDescription whose own first field is
+  // length-delimited, which is exactly the shape looks_like_saved_model accepts
+  // for meta_graphs[0]. The formats are otherwise ambiguous, so the `.mlmodel`
+  // extension is the decisive tiebreaker (spec §5) and has to be tested BEFORE
+  // both structural sniffs below - #107 added the TensorFlow one above this
+  // guard, which routed every ordinary .mlmodel to the TensorFlow parser and
+  // failed the open with "SavedModel meta_graph carries no graph_def".
   if (ext_hint == "mlmodel") {
     reason = DetectReason::Extension;
     return Format::CoreML;
+  }
+
+  // TensorFlow (#107): a frozen GraphDef, or a SavedModel bundle's saved_model.pb.
+  // Both run BEFORE the ONNX structural sniff — a SavedModel would otherwise be
+  // claimed as ONNX (see looks_like_saved_model) — and AFTER the .mlmodel guard
+  // above, which they collide with.
+  if (looks_like_graph_def(d, size) || looks_like_saved_model(d, size)) {
+    reason = DetectReason::Structure;
+    return Format::TensorFlow;
   }
 
   // ONNX: plausible top-level protobuf ModelProto. Runs after the .mlmodel

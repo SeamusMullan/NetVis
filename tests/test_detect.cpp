@@ -126,6 +126,27 @@ TEST_CASE("detect CoreML by .mlmodel extension tiebreaker") {
   CHECK(detect_bytes("coreml", b, "mlmodel") == Format::CoreML);
 }
 
+TEST_CASE("detect CoreML wins over the SavedModel sniff on a real .mlmodel (#114)") {
+  // REGRESSION. The hand-built buffer above has a zero-length neuralNetwork body,
+  // which is the one shape looks_like_saved_model happens to reject - so it kept
+  // passing while every REAL .mlmodel broke. A CoreML Model is
+  //   field 1 specificationVersion (varint)  ->  SavedModel's schema_version
+  //   field 2 description (len-delimited)    ->  SavedModel's meta_graphs[0]
+  //   ... whose own first field is len-delimited (input) -> MetaGraphDef's
+  // which satisfies looks_like_saved_model exactly. #107 placed the TensorFlow
+  // sniff ahead of the .mlmodel guard, so those files were handed to the
+  // TensorFlow parser and died with "SavedModel meta_graph carries no graph_def".
+  // Assert against the shipped fixture, not a synthetic buffer: the whole point
+  // is that the synthetic one was not representative.
+  auto mf = MappedFile::open("tests/fixtures/model.mlmodel");
+  REQUIRE_MESSAGE(mf, "fixture missing; run tools/gen_fixtures.py");
+  CHECK(detect_format(*mf, "mlmodel") == Format::CoreML);
+
+  DetectReason reason = DetectReason::None;
+  CHECK(detect_format(*mf, "mlmodel", reason) == Format::CoreML);
+  CHECK(reason == DetectReason::Extension);
+}
+
 TEST_CASE("detect Unknown on random bytes") {
   std::vector<uint8_t> b = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
   b.resize(32, 0);
