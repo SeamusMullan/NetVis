@@ -1,4 +1,4 @@
-# NetVis Plugin ABI (v0.7.0)
+# NetVis Plugin ABI (v1, frozen)
 
 NetVis loads plugins that extend op coverage, add file-format parsers, and compute
 analysis passes — without a rebuild. Three plugin kinds, two trust tiers:
@@ -11,7 +11,9 @@ analysis passes — without a rebuild. Three plugin kinds, two trust tiers:
 The single source of truth for the WASM wire ABI is the freestanding C header
 [`plugins/sdk/netvis_plugin.h`](../plugins/sdk/netvis_plugin.h). `tests/test_sdk_abi.cpp`
 static-asserts it against the host C++ contracts, so the shipped header can never
-silently drift from the host.
+silently drift from the host, and `tests/test_plugin_abi_freeze.cpp` holds its
+*surface* to [`plugins/sdk/abi-v1-surface.txt`](../plugins/sdk/abi-v1-surface.txt) —
+see **Compatibility promise** below.
 
 ## Zero-payload thesis (per facet — stated honestly)
 
@@ -41,11 +43,77 @@ NetVis never eagerly decodes weights; a plugin must not be able to change that.
 - One process-wide mutex serializes all engine load/link/call (the wasm3
   `IM3Environment` is shared mutable state; fuel is thread-local).
 
-## Versioning + trust
+## Compatibility promise (ABI v1)
 
-- Each plugin declares `api_version`; a WASM module also exports
-  `netvis_<facet>_abi_version`. A mismatch → the plugin is **refused**, never
-  half-registered.
+All three plugin ABIs — op handler, parser, pass — are at **version 1** and frozen.
+The promise to a plugin that is already built and shipped:
+
+> A plugin compiled against ABI v1 keeps loading and keeps answering, unchanged, on
+> every later NetVis release that still declares ABI v1. When NetVis can no longer
+> honour that, it bumps the version and **refuses** the plugin — it never loads one
+> it cannot honour and hopes.
+
+### What is frozen
+
+Everything in [`plugins/sdk/abi-v1-surface.txt`](../plugins/sdk/abi-v1-surface.txt):
+every macro name and value, every enumerator and its number, every host import's
+module and name, and the typedefs. `tests/test_plugin_abi_freeze.cpp` re-derives that
+inventory from `netvis_plugin.h` on every test run and fails if the two disagree — so
+changing the header is only possible as a deliberate, reviewed edit to the freeze
+file. The same test reads the host's own `m3_LinkRawFunctionEx` tables and requires
+them to name exactly the header's import set, so an import can never exist on one
+side only (a guest importing a name the host does not link fails to instantiate).
+
+### Changes that keep ABI v1
+
+| Change | Why an existing plugin is unaffected |
+|---|---|
+| Adding a host import | An ABI v1 plugin does not import it. A plugin that does simply will not run on an older host — the author's choice, made at build time. |
+| Adding an optional export the host probes for | Absent export → the host falls back exactly as it does today (honest-unknown). |
+| Adding a defaulted virtual to a C++ handler interface | `OpHandler::color/flops/infer_shape` are already defaulted; a handler that does not implement a newly added one is not broken by it. |
+| Raising a cap (`NV_MAX_*`) | A plugin built against the old header still marshals within the old, smaller bound. |
+| Anything behind `#if defined(__wasm__)` that is not a name or a number — the bump allocator's body, an attribute spelling | Guest-side convenience, not wire format. Only `NV_ARENA_BYTES` is frozen. |
+
+Each of these still edits the freeze file. That is the point: the edit is where
+someone asks "does this need a bump?", and the table above is the answer.
+
+### Changes that force a version bump
+
+- Renaming or removing a host import, or changing its signature.
+- Renumbering an enumerator. Note that `nv_dtype_t` and `nv_category_t` byte-match
+  `ir::DType` and `OpCategory`, whose honest-unknown sentinels (`NV_DT_UNKNOWN` = 15,
+  `NV_CAT_OTHER` = 14) are **last** — so adding a dtype or a category renumbers the
+  sentinel and is a break, not an addition.
+- Lowering a cap, or changing what one means.
+- Changing a wire struct's layout (`nv_tensor_hdr_t` is `_Static_assert`ed at 24
+  bytes in the header itself, on both the host and the wasm32 toolchain).
+- Changing an entry point's status convention (`NV_STATUS_OK` / `NV_STATUS_ABSTAIN`).
+
+NetVis supports **one ABI version at a time**. A bump means plugin authors rebuild
+against the new header; there is no shim layer, because a shim that mistranslates is
+worse than a refusal that is visible.
+
+### How a mismatch is refused
+
+A mismatch is refused *cleanly*: nothing half-registers, no partial answer reaches
+the view, and the built-in result still stands.
+
+- **Manifest** — `plugin.json`'s `api_version` is checked before anything is
+  constructed (`declarative/Manifest.cpp`, `wasm/WasmOpHandler.cpp`,
+  `wasm/WasmParser.cpp`). A mismatch rejects the whole file with a diagnostic.
+- **Module** — a WASM module must export `netvis_<facet>_abi_version` returning the
+  host's version. A wrong value *or* a missing export sets `WasmOpDiag::abi_mismatch`
+  and the handler answers honest-unknown; a parser refuses to claim the file.
+- **Registry** — `register_op_handler` / `register_parser` / `register_pass` each
+  re-check `api_version()` and drop the plugin rather than insert it, so even a
+  loader that skipped the earlier gates cannot get a wrong-ABI plugin into the table.
+
+`tests/test_plugin_abi_freeze.cpp` covers all three, in both directions (a plugin
+from the future, and one so old it declares no version at all), and asserts that a
+matching plugin still answers — so the gate cannot pass by refusing everything.
+
+## Trust
+
 - Declarative plugins auto-load. WASM plugins are **disabled by default**; enabling
   one requires a one-time confirm dialog and is then persisted per-plugin in
   `view_prefs.json` under `"plugins"` (keyed by the discovery-subdir name). The gate

@@ -1441,14 +1441,19 @@ def build_wasm_const():
     return _wasm_module(types, funcs, exports, code)
 
 
-def build_wasm_ophandler(hostile=False):
+def build_wasm_ophandler(hostile=False, abi_version=1, omit_abi=False):
     """An OP-HANDLER plugin (#10, Increment A). Exports:
       netvis_op_abi_version : ()->i32   (returns 1)
       netvis_op_category    : ()->i32   (calls op_set_category(Conv=0), returns 0)
       netvis_op_flops       : ()->i32   (calls op_set_flops(1024, 1), returns 0)
     Imports from module "netvis_op": op_set_category:(i32)->() , op_set_flops:(i64,i32)->().
     hostile=True makes netvis_op_category call op_set_category(9999) to exercise the
-    host-side clamp (must become OpCategory::Other, never OOB)."""
+    host-side clamp (must become OpCategory::Other, never OOB).
+
+    abi_version sets what netvis_op_abi_version returns, and omit_abi drops the
+    export entirely. Both feed the ABI-freeze tests (#113): the host must refuse a
+    module declaring an ABI it was not built for, and refuse one that declares
+    none, in both cases cleanly (honest-unknown, nothing half-registered)."""
     CONV = 0
     CAT = 9999 if hostile else CONV
     # Type section:
@@ -1470,13 +1475,17 @@ def build_wasm_ophandler(hostile=False):
     # Functions: three local funcs, all type 2 () -> i32.
     funcs = _uleb(3) + _uleb(2) + _uleb(2) + _uleb(2)
     # Exports: the three entry points (func indices 2,3,4 after 2 imported).
-    exp = _uleb(3)
-    exp += nm("netvis_op_abi_version") + b"\x00" + _uleb(2)
+    # omit_abi keeps func 2 in the module but unexported, so the host sees a module
+    # that simply does not answer the ABI question -- the "old plugin, new host"
+    # shape, not a malformed module.
+    exp = _uleb(2 if omit_abi else 3)
+    if not omit_abi:
+        exp += nm("netvis_op_abi_version") + b"\x00" + _uleb(2)
     exp += nm("netvis_op_category") + b"\x00" + _uleb(3)
     exp += nm("netvis_op_flops") + b"\x00" + _uleb(4)
 
-    # func 2 abi_version: i32.const 1 ; end
-    b_abi = _uleb(0) + b"\x41" + _uleb(1) + b"\x0b"
+    # func 2 abi_version: i32.const <abi_version> ; end
+    b_abi = _uleb(0) + b"\x41" + _sleb(abi_version) + b"\x0b"
     # func 3 category: i32.const CAT ; call 0 (op_set_category) ; i32.const 0 ; end
     b_cat = _uleb(0) + b"\x41" + _sleb(CAT) + b"\x10" + _uleb(0) + b"\x41\x00" + b"\x0b"
     # func 4 flops: i64.const 1024 ; i32.const 1 ; call 1 (op_set_flops) ; i32.const 0 ; end
@@ -1494,7 +1503,7 @@ def build_wasm_ophandler(hostile=False):
     return bytes(out)
 
 
-def build_wasm_toyparser():
+def build_wasm_toyparser(abi_version=1):
     """A PARSER plugin (#10, Increment B). Exports:
       netvis_parser_abi_version : ()->i32  (returns 1)
       netvis_can_parse          : ()->i32  (returns 1 — claims the file)
@@ -1503,7 +1512,11 @@ def build_wasm_toyparser():
     host_begin_graph:(i32)->i32, host_add_node:(i32,i32,i32,i32,i32,i32,i32)->i32,
     host_record_tensor:(i32,i32,i64,i64,i32,i32,i32)->i32, host_set_model_info:(i32,i32,i32)->().
     Uses no linear memory reads for structure (interns are host-side); a minimal
-    exercise of the append-only command path + zero-payload witness."""
+    exercise of the append-only command path + zero-payload witness.
+
+    abi_version sets what netvis_parser_abi_version returns; a value the host was
+    not built for must make can_parse/parse refuse rather than claim the file
+    (#113)."""
     # Type section
     #  t0 (I i)->i    host_intern_range(i64,i32)->i32
     #  t1 (i)->i      host_begin_graph(i32)->i32
@@ -1541,8 +1554,8 @@ def build_wasm_toyparser():
     exp += nm("netvis_can_parse") + b"\x00" + _uleb(7)
     exp += nm("netvis_parse") + b"\x00" + _uleb(8)
 
-    # func 6 abi_version: i32.const 1 ; end
-    b_abi = _uleb(0) + b"\x41\x01\x0b"
+    # func 6 abi_version: i32.const <abi_version> ; end
+    b_abi = _uleb(0) + b"\x41" + _sleb(abi_version) + b"\x0b"
     # func 7 can_parse: i32.const 1 ; end (always claims)
     b_can = _uleb(0) + b"\x41\x01\x0b"
     # func 8 parse:
@@ -1996,6 +2009,12 @@ def main():
     write("plugin_ophandler.wasm", build_wasm_ophandler(hostile=False))
     write("plugin_ophandler_hostile.wasm", build_wasm_ophandler(hostile=True))
     write("plugin_toyparser.wasm", build_wasm_toyparser())
+    # ABI-negotiation fixtures (#113). A plugin built against a FUTURE host, and
+    # one built before the ABI export existed at all: the host must refuse both
+    # without registering anything and without losing the built-in answer.
+    write("plugin_ophandler_future_abi.wasm", build_wasm_ophandler(abi_version=2))
+    write("plugin_ophandler_no_abi.wasm", build_wasm_ophandler(omit_abi=True))
+    write("plugin_toyparser_future_abi.wasm", build_wasm_toyparser(abi_version=2))
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):
