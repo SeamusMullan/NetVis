@@ -10,16 +10,17 @@
 ; both snippets on every push. See the windows-installer-scripts job in
 ; .github/workflows/ci.yml.
 ;
-; NETVIS_PKG_DIR is passed on the command line as an ABSOLUTE path with forward
-; slashes, because that is exactly the form CMake substitutes into
-; CPACK_NSIS_EXTRA_INSTALL_COMMANDS (${CMAKE_SOURCE_DIR} is always forward-slashed,
-; even on Windows). Compiling it that way here is what proves makensis accepts it.
+; NETVIS_PKG_DIR is passed on the command line as an ABSOLUTE, BACKSLASHED path,
+; which is the form CMake substitutes into CPACK_NSIS_EXTRA_INSTALL_COMMANDS -- so
+; compiling it that way here is what proves makensis accepts it. It does NOT accept
+; a forward-slashed absolute path: !include reports "could not find" for a file that
+; plainly exists, which is how the CMake side was caught before it reached a release.
 ; The fallback keeps a bare `makensis packaging\windows\nsh-syntax-check.nsi` working
 ; from a checkout: !include resolves a relative path against the INCLUDING SCRIPT's
 ; directory, not the working directory.
 ;
 ; From the repository root:
-;   makensis /DNETVIS_PKG_DIR="<abs>/packaging/windows" packaging\windows\nsh-syntax-check.nsi
+;   makensis /DNETVIS_PKG_DIR="<abs>\packaging\windows" packaging\windows\nsh-syntax-check.nsi
 
 Name "netvis-nsh-syntax-check"
 OutFile "nsh-syntax-check-installer.exe"
@@ -38,9 +39,9 @@ Var ADD_TO_PATH_ALL_USERS
 
 Section "Install"
   WriteUninstaller "$INSTDIR\uninst.exe"
-  !include "${NETVIS_PKG_DIR}/nsis-add-to-path.nsh"
+  !include "${NETVIS_PKG_DIR}\nsis-add-to-path.nsh"
 SectionEnd
 
 Section "Uninstall"
-  !include "${NETVIS_PKG_DIR}/nsis-remove-from-path.nsh"
+  !include "${NETVIS_PKG_DIR}\nsis-remove-from-path.nsh"
 SectionEnd

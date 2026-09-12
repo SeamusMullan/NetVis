@@ -238,15 +238,16 @@ jobs:
       # jump in the snippets is a warning to makensis and a broken installer to a
       # user, which is exactly the class of bug this job exists to catch.
       #
-      # NETVIS_PKG_DIR is an absolute path with forward slashes because that is the
-      # form CMake substitutes into CPACK_NSIS_EXTRA_INSTALL_COMMANDS -- so this
-      # step also proves makensis accepts that spelling, which is otherwise only
-      # exercised at release time.
+      # NETVIS_PKG_DIR is an absolute, backslashed path because that is the form
+      # CMake substitutes into CPACK_NSIS_EXTRA_INSTALL_COMMANDS -- so this step
+      # also proves makensis accepts that spelling, which is otherwise only
+      # exercised at release time. (It rejects a forward-slashed absolute path,
+      # which is what this job caught before the first release could.)
       - name: Compile the installer PATH snippets
         shell: pwsh
         run: |
-          $pkg = (Get-Location).Path.Replace('\', '/') + '/packaging/windows'
-          makensis /WX /DNETVIS_PKG_DIR=$pkg packaging\windows\nsh-syntax-check.nsi
+          $pkg = Join-Path (Get-Location).Path 'packaging\windows'
+          makensis /WX /DNETVIS_PKG_DIR="$pkg" packaging\windows\nsh-syntax-check.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
 
   # --- Derive the version from the tag (only on a vX.Y.Z tag) -----------------

@@ -514,13 +514,24 @@ if(NETVIS_BUILD_APP)
     # !include rather than an inline NSIS string: CPack round-trips these
     # variables through a generated CPackConfig.cmake, so an inlined snippet
     # would need every backslash, double quote and ${...} escaped twice over
-    # before makensis ever saw it. The paths below contain none of those, so they
-    # survive the round trip unchanged, and the NSIS stays readable in its own
-    # files.
+    # before makensis ever saw it. A one-line !include of a real .nsh file needs
+    # none of that, and keeps the NSIS readable as NSIS.
+    #
+    # Two escaping facts, both load-bearing, both verified rather than assumed:
+    #   1. makensis' !include does NOT accept forward slashes on Windows, so
+    #      ${CMAKE_SOURCE_DIR} (always forward-slashed, even on Windows) has to be
+    #      converted. A forward-slashed absolute path fails with
+    #      "!include: could not find" naming a file that plainly exists.
+    #   2. The value survives one CMake round trip (CPack writes these into a
+    #      generated CPackConfig.cmake as `set(VAR "<value>")` and re-reads it),
+    #      so each backslash must be DOUBLED here to arrive single at makensis.
+    # Hence REPLACE "/" -> "\\" (two characters) rather than file(TO_NATIVE_PATH).
+    string(REPLACE "/" "\\\\" NETVIS_NSIS_DIR
+           "${CMAKE_SOURCE_DIR}/packaging/windows")
     set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
-        "  !include '${CMAKE_SOURCE_DIR}/packaging/windows/nsis-add-to-path.nsh'")
+        "  !include '${NETVIS_NSIS_DIR}\\\\nsis-add-to-path.nsh'")
     set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS
-        "  !include '${CMAKE_SOURCE_DIR}/packaging/windows/nsis-remove-from-path.nsh'")
+        "  !include '${NETVIS_NSIS_DIR}\\\\nsis-remove-from-path.nsh'")
     # Installer + Add/Remove-Programs icon (the exe's own icon is embedded via the
     # .rc). MUI_ICON/UNICON must be a valid multi-size .ico.
     set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/assets/netvis.ico")
