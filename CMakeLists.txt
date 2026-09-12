@@ -358,6 +358,15 @@ if(NETVIS_BUILD_APP)
     install(FILES ${CMAKE_SOURCE_DIR}/assets/netvis.png
             DESTINATION share/icons/hicolor/256x256/apps OPTIONAL)
   endif()
+  # Windows: the PATH helper the NSIS installer shells out to, at install AND at
+  # uninstall time (#149). It ships inside the payload rather than living only in
+  # the source tree because the uninstaller has to be able to call it on a machine
+  # that never had the repo — CPack's uninstall hook runs before file deletion, so
+  # it is still here when it is needed. See the NSIS packaging block below.
+  if(WIN32)
+    install(FILES ${CMAKE_SOURCE_DIR}/packaging/windows/netvis-path.ps1
+            DESTINATION share/netvis)
+  endif()
 endif()
 
 # =============================================================================
@@ -491,7 +500,27 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     # ON: the installer offers to add bin/ to PATH, which is what lets an MCP
     # client resolve `netvis_mcp` by bare name after a normal install.
+    #
+    # ON draws the options page and records the choice in the uninstall registry
+    # key, but the template's AddToPath does NOT perform the edit — the two hooks
+    # below replace it (#149). The template reads PATH into an NSIS string, which
+    # a standard makensis build caps at 1024 characters, so past that it aborts
+    # with "Warning! PATH too long installer unable to modify PATH!"; and it gates
+    # the edit on `IfFileExists "<dir>\*.*"` plus a `GetFullPathName /SHORT`
+    # dedupe, both of which fail silently on virtual drives and on volumes with
+    # 8.3 names disabled. packaging/windows/netvis-path.ps1 edits the registry
+    # directly and has neither limit.
     set(CPACK_NSIS_MODIFY_PATH ON)
+    # !include rather than an inline NSIS string: CPack round-trips these
+    # variables through a generated CPackConfig.cmake, so an inlined snippet
+    # would need every backslash, double quote and ${...} escaped twice over
+    # before makensis ever saw it. The paths below contain none of those, so they
+    # survive the round trip unchanged, and the NSIS stays readable in its own
+    # files.
+    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
+        "  !include '${CMAKE_SOURCE_DIR}/packaging/windows/nsis-add-to-path.nsh'")
+    set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS
+        "  !include '${CMAKE_SOURCE_DIR}/packaging/windows/nsis-remove-from-path.nsh'")
     # Installer + Add/Remove-Programs icon (the exe's own icon is embedded via the
     # .rc). MUI_ICON/UNICON must be a valid multi-size .ico.
     set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/assets/netvis.ico")
