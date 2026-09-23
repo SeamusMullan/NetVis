@@ -543,6 +543,16 @@ void draw_weight_inspector(App& app) {
     return;
   }
 
+  // An element type NetVis can't decode (FP4/FP8 and other labeled types from
+  // non-GGUF formats): a table of zeros and an empty histogram would look like
+  // a broken tensor, so say why there is nothing to show instead.
+  const std::string no_stats = stats_unavailable_reason(t, model);
+  if (!no_stats.empty()) {
+    ImGui::TextWrapped("%s", no_stats.c_str());
+    ImGui::End();
+    return;
+  }
+
   // Stats table.
   ImGui::SeparatorText("Statistics");
   const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;

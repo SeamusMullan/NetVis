@@ -5,8 +5,9 @@
 // scale: MXFP4 uses one E8M0 power of two per 32 elements, NVFP4 one FP8 E4M3
 // per 16. GGUF has dedicated block types for both (test_gguf_blocks.cpp,
 // test_quant_preview.cpp). The other formats store the elements and scales as
-// separate tensors, so what they need is honest element-type labels; that and
-// the scalar minifloat decoders in core/Half.h are covered here.
+// separate tensors, so what they need is honest element-type labels and an
+// explanation of why the inspector has no histogram for them; those and the
+// scalar minifloat decoders in core/Half.h are covered here.
 //
 // Expected values are hand-derived from the OCP MX v1.0 spec, not copied from
 // the implementation.
@@ -23,6 +24,7 @@
 #include "core/ByteReader.h"
 #include "core/Half.h"
 #include "core/MappedFile.h"
+#include "engine/TensorStats.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
 #include "parsers/pytorch/PickleVM.h"
@@ -278,4 +280,47 @@ TEST_CASE("PickleVM: _rebuild_tensor_v3 with torch.uint16 maps to a real DType")
   CHECK(v->dtype_label.empty());
   CHECK(v->tensor.file_offset == 66);  // 64 + 1 element * 2 bytes
   CHECK(v->tensor.byte_len == 4);
+}
+
+// --- stats_unavailable_reason: why the inspector shows no histogram -----------
+
+namespace {
+std::string reason_for(ir::Model& m, ir::DType dt, std::string_view label) {
+  ir::TensorRef t;
+  t.dtype = dt;
+  if (!label.empty()) t.dtype_label = m.intern(label);
+  return stats_unavailable_reason(t, &m);
+}
+}  // namespace
+
+TEST_CASE("stats_unavailable_reason: FP4 codes explain the missing block scales") {
+  ir::Model m;
+  // Every parser's spelling of the FP4 element type gets the same explanation.
+  for (const char* lbl : {"F4", "float4e2m1", "float4_e2m1fn_x2", "f4e2m1"}) {
+    const std::string r = reason_for(m, ir::DType::Unknown, lbl);
+    CAPTURE(lbl);
+    CHECK(r.find("FP4 (E2M1)") != std::string::npos);
+    CHECK(r.find("block scale") != std::string::npos);
+  }
+}
+
+TEST_CASE("stats_unavailable_reason: E8M0 and other FP8 scale tensors") {
+  ir::Model m;
+  for (const char* lbl : {"F8_E8M0", "float8e8m0", "float8_e8m0fnu", "f8e8m0"}) {
+    CAPTURE(lbl);
+    CHECK(reason_for(m, ir::DType::Unknown, lbl).find("E8M0") != std::string::npos);
+  }
+  const std::string e4m3 = reason_for(m, ir::DType::Unknown, "F8_E4M3");
+  CHECK(e4m3.find("FP8 (F8_E4M3)") != std::string::npos);
+  CHECK(e4m3.find("NVFP4") != std::string::npos);
+}
+
+TEST_CASE("stats_unavailable_reason: other labels, no label, and decodable types") {
+  ir::Model m;
+  CHECK(reason_for(m, ir::DType::Unknown, "complex64").find("complex64") !=
+        std::string::npos);
+  CHECK_FALSE(reason_for(m, ir::DType::Unknown, "").empty());
+  // Decodable types and GGUF block quants (explained elsewhere) get no reason.
+  CHECK(reason_for(m, ir::DType::F32, "").empty());
+  CHECK(reason_for(m, ir::DType::Q4, "MXFP4").empty());
 }
