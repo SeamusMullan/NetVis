@@ -195,6 +195,29 @@ ctest --preset core-only
 Open a model via the `File → Open` dialog, by dragging it onto the window, or by
 passing it as a CLI argument.
 
+### Linux: Wayland and X11
+
+The Linux GUI runs natively on both Wayland and X11 from one binary: it uses
+Wayland when a compositor is running and X11 otherwise. Set
+`NETVIS_PLATFORM=x11` (or `wayland`) to force a backend, e.g. to fall back to
+XWayland if a driver misbehaves natively.
+
+Build dependencies (the Wayland set is optional — without it the build is
+X11-only and still runs on Wayland through XWayland):
+
+```sh
+# Debian/Ubuntu
+sudo apt install libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev \
+  libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev wayland-protocols
+# Fedora
+sudo dnf install mesa-libGL-devel mesa-libEGL-devel libX11-devel libXrandr-devel \
+  libXinerama-devel libXcursor-devel libXi-devel wayland-devel libxkbcommon-devel
+```
+
+`-DNETVIS_GLFW_WAYLAND=AUTO|ON|OFF` controls the Wayland backend: `AUTO` (the
+default) builds it when the packages above are installed, `ON` makes them
+required, `OFF` skips it.
+
 ## Architecture
 
 Three strictly separated layers; the view never touches parsers directly.

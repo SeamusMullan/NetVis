@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NetVis
+GenericName=Neural Network Viewer
+Comment=Speed-first neural network model viewer
+Exec=netvis %f
+Icon=netvis
+Terminal=false
+Categories=Development;Science;
+StartupWMClass=netvis
