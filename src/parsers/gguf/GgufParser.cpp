@@ -78,6 +78,8 @@ ir::DType map_ggml_type(uint32_t t) {
     case 28: return ir::DType::F64;   // GGML_TYPE_F64
     case 29: return ir::DType::Q4;    // IQ1_M
     case 30: return ir::DType::BF16;  // GGML_TYPE_BF16
+    case 39: return ir::DType::Q4;    // MXFP4 (4-bit E2M1 + E8M0 scale)
+    case 40: return ir::DType::Q4;    // NVFP4 (4-bit E2M1 + E4M3 scales)
     default: return ir::DType::Unknown;
   }
 }

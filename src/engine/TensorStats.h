@@ -79,6 +79,16 @@ Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
                                          const std::string& model_dir,
                                          const ir::Model* model = nullptr);
 
+// Why compute_tensor_stats() can't produce statistics or a histogram for `t`,
+// as one plain sentence for the inspector, or "" when it can. Covers element
+// types with no ir::DType (dtype == Unknown), identified by t.dtype_label: the
+// FP4 E2M1 codes of MXFP4 / NVFP4 weights, their E8M0 / FP8 block scales, and
+// any other label. GGUF block quants (Q4/Q8) are not covered; the inspector
+// already explains those and offers the one-block preview. `model` resolves
+// the label and may be nullptr (the reason then omits the type name).
+std::string stats_unavailable_reason(const ir::TensorRef& t,
+                                     const ir::Model* model);
+
 // #47: a 2D heatmap thumbnail of a tensor slice, produced by streaming decode.
 // The last two dims are taken as the [rows, cols] image plane; higher dims are
 // fixed at index 0 (the first 2D slice). Values are normalized to [0,1] over the
@@ -114,10 +124,11 @@ Result<TensorThumbnail> compute_tensor_thumbnail(const ir::TensorRef& t,
 // dequantized tensor. It reads at most one block's bytes — strictly fewer than
 // the whole-tensor histogram pass the inspector already runs.
 //
-// Only the five legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) decode; K-quants
-// and the IQ* family report available=false with an honest reason rather than an
-// approximation. See parsers/gguf/GgufBlocks.h for why.
-constexpr uint32_t kQuantPreviewMaxElems = 32;
+// Only the five legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the two FP4
+// microscaling layouts (MXFP4/NVFP4) decode; K-quants and the IQ* family report
+// available=false with an honest reason rather than an approximation. See
+// parsers/gguf/GgufBlocks.h for why.
+constexpr uint32_t kQuantPreviewMaxElems = 64;
 
 struct QuantBlockPreview {
   bool available = false;
