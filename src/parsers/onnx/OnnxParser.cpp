@@ -29,6 +29,8 @@ enum OnnxDType : int32_t {
   UNDEFINED = 0, FLOAT = 1, UINT8 = 2, INT8 = 3, UINT16 = 4, INT16 = 5,
   INT32 = 6, INT64 = 7, STRING = 8, BOOL = 9, FLOAT16 = 10, DOUBLE = 11,
   UINT32 = 12, UINT64 = 13, COMPLEX64 = 14, COMPLEX128 = 15, BFLOAT16 = 16,
+  FLOAT8E4M3FN = 17, FLOAT8E4M3FNUZ = 18, FLOAT8E5M2 = 19, FLOAT8E5M2FNUZ = 20,
+  UINT4 = 21, INT4 = 22, FLOAT4E2M1 = 23, FLOAT8E8M0 = 24,
 };
 
 // AttributeProto.AttributeType
@@ -55,6 +57,24 @@ ir::DType map_dtype(int64_t t) {
     case UINT64:   return ir::DType::U64;
     case BFLOAT16: return ir::DType::BF16;
     default:       return ir::DType::Unknown;
+  }
+}
+
+// Exact ONNX name for the element types ir::DType cannot express (the frozen
+// 16-enumerator rule — see TensorRef::dtype_label). MXFP4 / NVFP4 weights are a
+// FLOAT4E2M1 tensor paired with a FLOAT8E8M0 / FLOAT8E4M3FN scale tensor, so
+// both halves read honestly instead of "?". "" => dtype_name() is already honest.
+const char* dtype_label(int64_t t) {
+  switch (t) {
+    case FLOAT8E4M3FN:   return "float8e4m3fn";
+    case FLOAT8E4M3FNUZ: return "float8e4m3fnuz";
+    case FLOAT8E5M2:     return "float8e5m2";
+    case FLOAT8E5M2FNUZ: return "float8e5m2fnuz";
+    case UINT4:          return "uint4";
+    case INT4:           return "int4";
+    case FLOAT4E2M1:     return "float4e2m1";
+    case FLOAT8E8M0:     return "float8e8m0";
+    default:             return "";
   }
 }
 
@@ -216,6 +236,8 @@ Result<ir::TensorRef> parse_tensor_proto(const SubRange& sr, ir::Model& model) {
           auto v = r.read_varint();
           if (!v) return v.error();
           tr.dtype = map_dtype(static_cast<int64_t>(*v));
+          const char* lbl = dtype_label(static_cast<int64_t>(*v));
+          if (*lbl != '\0') tr.dtype_label = model.intern(lbl);
         } else {
           auto sk = r.skip_field(h->wire_type);
           if (!sk) return sk.error();

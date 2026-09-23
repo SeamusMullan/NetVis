@@ -114,10 +114,11 @@ Result<TensorThumbnail> compute_tensor_thumbnail(const ir::TensorRef& t,
 // dequantized tensor. It reads at most one block's bytes — strictly fewer than
 // the whole-tensor histogram pass the inspector already runs.
 //
-// Only the five legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) decode; K-quants
-// and the IQ* family report available=false with an honest reason rather than an
-// approximation. See parsers/gguf/GgufBlocks.h for why.
-constexpr uint32_t kQuantPreviewMaxElems = 32;
+// Only the five legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the two FP4
+// microscaling layouts (MXFP4/NVFP4) decode; K-quants and the IQ* family report
+// available=false with an honest reason rather than an approximation. See
+// parsers/gguf/GgufBlocks.h for why.
+constexpr uint32_t kQuantPreviewMaxElems = 64;
 
 struct QuantBlockPreview {
   bool available = false;

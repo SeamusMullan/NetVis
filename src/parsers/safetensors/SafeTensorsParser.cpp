@@ -28,7 +28,9 @@ namespace {
 using json = nlohmann::json;
 
 // Map a SafeTensors dtype string to the IR DType. Unrecognized strings become
-// DType::Unknown (still a valid tensor, just an unlabeled element type).
+// DType::Unknown (still a valid tensor); the parser keeps the source string as
+// the tensor's dtype_label, so F4 (the MXFP4/NVFP4 element type), F8_E8M0,
+// F8_E4M3, F8_E5M2, F6_* read exactly as written instead of "?".
 ir::DType map_dtype(const std::string& s) {
   if (s == "F32") return ir::DType::F32;
   if (s == "F16") return ir::DType::F16;
@@ -162,7 +164,10 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
 
     ir::TensorRef t;
     t.name = model.intern(key);
-    t.dtype = map_dtype(val["dtype"].get<std::string>());
+    const std::string& dtype_str = val["dtype"].get_ref<const std::string&>();
+    t.dtype = map_dtype(dtype_str);
+    if (t.dtype == ir::DType::Unknown && !dtype_str.empty())
+      t.dtype_label = model.intern(dtype_str);
     for (const json& d : val["shape"]) {
       // Dimensions are non-negative ints in practice; store integrally and let
       // elem_count() treat anything <0 as dynamic (0 elems).

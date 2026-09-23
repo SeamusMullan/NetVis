@@ -5,18 +5,27 @@
 // supplies the bytes and the output buffer, so this file allocates nothing,
 // reads no files, and holds no state.
 //
-// The five supported layouts are the legacy ggml quants, all QK=32:
+// The supported layouts are the five legacy ggml quants (QK=32) plus the two
+// FP4 microscaling formats:
 //
 //   Q4_0  18B  { f16 d;                    u8 qs[16] }  v = (nibble - 8) * d
 //   Q4_1  20B  { f16 d; f16 m;             u8 qs[16] }  v = nibble * d + m
 //   Q5_0  22B  { f16 d;          u8 qh[4]; u8 qs[16] }  v = (nibble|bit5 - 16) * d
 //   Q5_1  24B  { f16 d; f16 m;   u8 qh[4]; u8 qs[16] }  v = (nibble|bit5) * d + m
 //   Q8_0  34B  { f16 d;                    i8 qs[32] }  v = q * d
+//   MXFP4 17B  { e8m0 e;                   u8 qs[16] }  v = e2m1(nibble) * 2^(e-127)
+//   NVFP4 36B  { ue4m3 d[4];               u8 qs[32] }  v = e2m1(nibble) * d[j/16]
 //
 // In every 4-bit layout the low nibble of qs[j] is element j and the high nibble
-// is element j+16 — the halves are interleaved, NOT sequential. Getting that
-// backwards produces plausible-looking but wrong numbers, which is exactly the
-// failure mode the honesty rules exist to prevent, so it is asserted in tests.
+// is element j+16 — the halves are interleaved, NOT sequential. NVFP4 applies
+// the same rule inside each 16-element sub-block: sub-block s owns qs[8s..8s+7],
+// low nibbles are its elements 0..7 and high nibbles its elements 8..15. Getting
+// that backwards produces plausible-looking but wrong numbers, which is exactly
+// the failure mode the honesty rules exist to prevent, so it is asserted in tests.
+//
+// FP4 scales follow the OCP spec: E8M0 0xFF and E4M3 0x7F are NaN. ggml's
+// quantizer never emits either (its reference dequant maps them to finite
+// values instead), so a NaN in the preview marks a block ggml did not write.
 #include "parsers/gguf/GgufBlocks.h"
 
 #include <cstring>
@@ -27,8 +36,10 @@ namespace netvis::gguf {
 
 namespace {
 
-constexpr uint32_t kQK = 32;      // elements per block, all supported layouts
+constexpr uint32_t kQK = 32;      // elements per legacy / MXFP4 block
 constexpr uint32_t kQK_K = 256;   // elements per K-quant / IQ super-block
+constexpr uint32_t kQK_NVFP4 = 64;     // elements per NVFP4 block
+constexpr uint32_t kQK_NVFP4_SUB = 16; // elements sharing one NVFP4 scale
 
 // Read a little-endian u16 without alignment assumptions.
 uint16_t rd_u16(const uint8_t* p) {
@@ -77,6 +88,8 @@ std::string_view ggml_type_name(uint32_t type_id) {
     case GgmlType::F64:     return "F64";
     case GgmlType::IQ1_M:   return "IQ1_M";
     case GgmlType::BF16:    return "BF16";
+    case GgmlType::MXFP4:   return "MXFP4";
+    case GgmlType::NVFP4:   return "NVFP4";
   }
   return {};  // an id this build does not know
 }
@@ -90,6 +103,8 @@ GgmlBlockLayout ggml_block_layout(uint32_t type_id) {
     case GgmlType::Q5_0: L = {kQK, 22, true, true}; break;
     case GgmlType::Q5_1: L = {kQK, 24, true, true}; break;
     case GgmlType::Q8_0: L = {kQK, 34, true, true}; break;
+    case GgmlType::MXFP4: L = {kQK, 17, true, true}; break;
+    case GgmlType::NVFP4: L = {kQK_NVFP4, 36, true, true}; break;
 
     // --- known quants we deliberately do NOT decode ---------------------------
     // Geometry is still reported so the inspector can say "block 3 of 1024" and
@@ -138,7 +153,7 @@ std::string_view dequant_status_message(DequantStatus s) {
       return "tensor is not block-quantized; values are read directly";
     case DequantStatus::UnsupportedLayout:
       return "K-quant / IQ super-block layout — preview supports only the "
-             "legacy Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 blocks";
+             "legacy Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and MXFP4/NVFP4 blocks";
     case DequantStatus::ShortBuffer:
       return "truncated: fewer bytes remain than this block needs";
   }
@@ -156,10 +171,10 @@ DequantStatus dequant_block(uint32_t type_id, const uint8_t* block, size_t avail
   if (!L.dequant_supported) return DequantStatus::UnsupportedLayout;
   if (avail < L.block_bytes) return DequantStatus::ShortBuffer;
 
-  // Every supported layout is QK=32, which the header's kMaxDequantBlockElems
-  // pins; this guards the caller's fixed-size buffer against a table edit that
-  // adds a wider layout without widening the bound.
-  static_assert(kQK <= kMaxDequantBlockElems,
+  // The header's kMaxDequantBlockElems must cover the widest supported layout;
+  // this guards the caller's fixed-size buffer against a table edit that adds a
+  // wider layout without widening the bound.
+  static_assert(kQK <= kMaxDequantBlockElems && kQK_NVFP4 <= kMaxDequantBlockElems,
                 "kMaxDequantBlockElems must cover every dequant_supported layout");
 
   switch (static_cast<GgmlType>(type_id)) {
@@ -222,13 +237,35 @@ DequantStatus dequant_block(uint32_t type_id, const uint8_t* block, size_t avail
       }
       break;
     }
+    case GgmlType::MXFP4: {
+      const float d = e8m0_to_f32(block[0]);
+      const uint8_t* qs = block + 1;
+      for (uint32_t j = 0; j < 16; ++j) {
+        out[j] = fp4_e2m1_to_f32(qs[j] & 0x0F) * d;
+        out[j + 16] = fp4_e2m1_to_f32(qs[j] >> 4) * d;
+      }
+      break;
+    }
+    case GgmlType::NVFP4: {
+      const uint8_t* qs = block + kQK_NVFP4 / kQK_NVFP4_SUB;
+      for (uint32_t s = 0; s < kQK_NVFP4 / kQK_NVFP4_SUB; ++s) {
+        const float d = fp8_e4m3fn_to_f32(block[s]);
+        const uint8_t* sq = qs + s * (kQK_NVFP4_SUB / 2);
+        float* so = out + s * kQK_NVFP4_SUB;
+        for (uint32_t j = 0; j < kQK_NVFP4_SUB / 2; ++j) {
+          so[j] = fp4_e2m1_to_f32(sq[j] & 0x0F) * d;
+          so[j + kQK_NVFP4_SUB / 2] = fp4_e2m1_to_f32(sq[j] >> 4) * d;
+        }
+      }
+      break;
+    }
     default:
       // dequant_supported was true but no case handled it — a table/switch drift
       // bug. Refuse rather than emit an uninitialized buffer.
       return DequantStatus::UnsupportedLayout;
   }
 
-  *out_count = kQK;
+  *out_count = L.elems_per_block;
   return DequantStatus::Ok;
 }
 

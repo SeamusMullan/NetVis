@@ -186,6 +186,8 @@ GGUF_TYPE_STRING = 8
 GGML_TYPE_F32 = 0
 GGML_TYPE_Q4_0 = 2
 GGML_TYPE_Q4_K = 12
+GGML_TYPE_MXFP4 = 39
+GGML_TYPE_NVFP4 = 40
 
 
 def gguf_string(s):
@@ -253,9 +255,25 @@ def _q4_0_block(d):
     return struct.pack("<e", d) + qs
 
 
+def _mxfp4_block(e):
+    """One 17-byte MXFP4 block: E8M0 scale byte `e` (scale 2^(e-127)) + 16
+    packed E2M1 nibble bytes, using the same asymmetric j / 15-j ramp as
+    _q4_0_block so a low/high-nibble swap shows up in the decoded values."""
+    return bytes([e]) + bytes((j | ((15 - j) << 4)) for j in range(16))
+
+
+def _nvfp4_block(scales):
+    """One 36-byte NVFP4 block: four E4M3 sub-block scale bytes + 32 packed
+    E2M1 nibble bytes. Each 16-element sub-block gets the 8-byte j / 15-j
+    ramp (low nibble = element j, high nibble = element j+8)."""
+    assert len(scales) == 4
+    ramp = bytes((j | ((15 - j) << 4)) for j in range(8))
+    return bytes(scales) + ramp * 4
+
+
 def build_gguf_quant():
     """GGUF v3 fixture with QUANTIZED tensors, for the #49 single-block preview
-    tests (tests/test_quant_preview.cpp). Three tensors:
+    tests (tests/test_quant_preview.cpp). Five tensors:
       weight_f32  - plain F32, exercises preview's "not quantized" refusal.
       weight_q4k  - Q4_K (a K-quant super-block): GgufBlocks.cpp deliberately
                     refuses to decode these, so its 144 bytes are left opaque
@@ -263,11 +281,15 @@ def build_gguf_quant():
       weight_q4_0 - Q4_0, TWO hand-encoded blocks with KNOWN values (block 0
                     scale=1.0, block 1 scale=2.0 -- doubled, so a block_index
                     mixup that always decodes block 0 is caught too).
+      weight_mxfp4 - MXFP4, TWO blocks: E8M0 scale 1.0 (e=127) then 2.0 (e=128).
+      weight_nvfp4 - NVFP4, ONE block, E4M3 sub-block scales 1.0/2.0/0.5/1.5
+                     (0x38/0x40/0x30/0x3C) so a sub-block/scale mixup shows.
     Tensor table order == data order == ascending offset, so each quantized
     tensor's byte length (GgufParser.cpp: gap to the next tensor's offset, or
     to end-of-data for the last) comes out exactly right without needing
     per-tensor alignment padding: F32@0 (16B, sized from shape), Q4_K@16
-    (144B = gap to Q4_0's offset), Q4_0@160 LAST (36B = gap to end-of-data).
+    (144B = gap to Q4_0's offset), Q4_0@160 (36B), MXFP4@196 (34B),
+    NVFP4@230 LAST (36B = gap to end-of-data).
     """
     alignment = 32
 
@@ -276,20 +298,28 @@ def build_gguf_quant():
     q4k_bytes = b"\x00" * 144  # opaque K-quant super-block; never decoded
     q4_0_bytes = _q4_0_block(1.0) + _q4_0_block(2.0)
     assert len(q4_0_bytes) == 36  # two 18-byte blocks
+    mxfp4_bytes = _mxfp4_block(127) + _mxfp4_block(128)
+    assert len(mxfp4_bytes) == 34  # two 17-byte blocks
+    nvfp4_bytes = _nvfp4_block([0x38, 0x40, 0x30, 0x3C])
+    assert len(nvfp4_bytes) == 36  # one 36-byte block
 
     f32_off = 0
     q4k_off = f32_off + len(f32_bytes)    # 16
     q4_0_off = q4k_off + len(q4k_bytes)   # 160
+    mxfp4_off = q4_0_off + len(q4_0_bytes)  # 196
+    nvfp4_off = mxfp4_off + len(mxfp4_bytes)  # 230
 
     header = bytearray()
     header += b"GGUF"
     header += struct.pack("<I", 3)  # version 3
-    header += struct.pack("<Q", 3)  # tensor_count
+    header += struct.pack("<Q", 5)  # tensor_count
     header += struct.pack("<Q", 1)  # metadata_kv_count
     header += gguf_kv_u32("general.alignment", alignment)
     header += gguf_tensor_info("weight_f32", [4], GGML_TYPE_F32, f32_off)
     header += gguf_tensor_info("weight_q4k", [256], GGML_TYPE_Q4_K, q4k_off)
     header += gguf_tensor_info("weight_q4_0", [64], GGML_TYPE_Q4_0, q4_0_off)
+    header += gguf_tensor_info("weight_mxfp4", [64], GGML_TYPE_MXFP4, mxfp4_off)
+    header += gguf_tensor_info("weight_nvfp4", [64], GGML_TYPE_NVFP4, nvfp4_off)
 
     pad = (-len(header)) % alignment
     header += b"\x00" * pad
@@ -298,7 +328,9 @@ def build_gguf_quant():
     data += f32_bytes
     data += q4k_bytes
     data += q4_0_bytes
-    assert len(data) == q4_0_off + len(q4_0_bytes)
+    data += mxfp4_bytes
+    data += nvfp4_bytes
+    assert len(data) == nvfp4_off + len(nvfp4_bytes)
 
     return bytes(header) + bytes(data)
 

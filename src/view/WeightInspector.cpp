@@ -529,8 +529,9 @@ void draw_weight_inspector(App& app) {
         "This tensor uses a quantized block format (e.g. GGUF Q4/Q8). NetVis "
         "does not dequantize it as a whole -- below is an optional, "
         "read-only preview of ONE decoded block (up to %u values) for the "
-        "legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0); K-quants and IQ* "
-        "formats report why they can't be previewed instead of guessing.",
+        "legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the FP4 "
+        "microscaling layouts (MXFP4/NVFP4); K-quants and IQ* formats report "
+        "why they can't be previewed instead of guessing.",
         kQuantPreviewMaxElems);
 
     // #49: opt-in BY CONTRACT, not merely by convention -- default off, and
