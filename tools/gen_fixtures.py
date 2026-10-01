@@ -20,6 +20,10 @@ Formats emitted:
   model_frozen.pb   - Frozen TensorFlow GraphDef (Const payload, ":1" slot ref).
   saved_model/      - TensorFlow SavedModel dir (stub + FunctionDef body +
                       a stand-in variables/ checkpoint).
+  model_mobile.ptl  - PyTorch Mobile lite-interpreter zip: data.pkl module object,
+                      constants.pkl, bytecode.pkl v8 (forward with an if/else).
+  model_mobile_v4.ptl, model_mobile_badop.ptl, model_mobile_nodata.ptl - its v4,
+                      unknown-opcode and no-data.pkl twins.
 """
 
 import os
@@ -499,6 +503,300 @@ def helper(a, b):
             info.external_attr = 0o600 << 16
             zf.writestr(info, data)
 
+
+# ---------------------------------------------------------------------------
+# PyTorch Mobile (.ptl): torch-style protocol-2 pickles + bytecode.pkl (#137)
+# ---------------------------------------------------------------------------
+
+class TGlobal:
+    """A pickle GLOBAL reference (module, name)."""
+    def __init__(self, module, name):
+        self.module, self.name = module, name
+
+
+class TIntList:
+    """A specialised int list: torch pickles it as torch.jit._pickle.build_intlist."""
+    def __init__(self, items):
+        self.items = list(items)
+
+
+class TTensor:
+    """A tensor whose payload lives in the archive record <tensor_dir><key>."""
+    def __init__(self, storage, key, numel, size, stride, offset=0):
+        self.storage, self.key, self.numel = storage, key, numel
+        self.size, self.stride, self.offset = size, stride, offset
+
+
+class TObject:
+    """A TorchScript class object: GLOBAL cls, EMPTY_TUPLE, NEWOBJ, state dict,
+    BUILD -- the attribute order IS the class slot order (pickler.cpp)."""
+    def __init__(self, module, name, attrs):
+        self.module, self.name, self.attrs = module, name, list(attrs)
+
+
+class TorchPickler:
+    """Protocol-2 writer that mirrors torch/csrc/jit/serialization/pickler.cpp:
+    strings and globals are memoized (BINPUT on first use, BINGET after), ints
+    use the narrowest of BININT1/BININT2/BININT/LONG1, tuples use EMPTY_TUPLE /
+    TUPLE1-3 / MARK..TUPLE, floats are BINFLOAT (big-endian)."""
+
+    def __init__(self):
+        self.b = bytearray(b"\x80\x02")
+        self.memo_id = 0
+        self.str_memo = {}
+        self.glob_memo = {}
+
+    def _binput(self):
+        if self.memo_id <= 0xFF:
+            self.b += b"q" + bytes([self.memo_id])
+        else:
+            self.b += b"r" + struct.pack("<I", self.memo_id)
+        self.memo_id += 1
+        return self.memo_id - 1
+
+    def _binget(self, i):
+        if i <= 0xFF:
+            self.b += b"h" + bytes([i])
+        else:
+            self.b += b"j" + struct.pack("<I", i)
+
+    def string(self, s):
+        if s in self.str_memo:
+            self._binget(self.str_memo[s])
+            return
+        d = s.encode("utf-8")
+        self.b += b"X" + struct.pack("<I", len(d)) + d
+        self.str_memo[s] = self._binput()
+
+    def global_(self, module, name):
+        key = (module, name)
+        if key in self.glob_memo:
+            self._binget(self.glob_memo[key])
+            return
+        self.b += b"c" + module.encode() + b"\n" + name.encode() + b"\n"
+        self.glob_memo[key] = self._binput()
+
+    def int_(self, n):
+        if 0 <= n <= 0xFF:
+            self.b += b"K" + bytes([n])
+        elif 0 <= n <= 0xFFFF:
+            self.b += b"M" + struct.pack("<H", n)
+        elif -(1 << 31) <= n < (1 << 31):
+            self.b += b"J" + struct.pack("<i", n)
+        else:
+            self.b += b"\x8a\x08" + struct.pack("<q", n)
+
+    def tuple_(self, items):
+        n = len(items)
+        if n == 0:
+            self.b += b")"
+            return
+        if n > 3:
+            self.b += b"("
+        for it in items:
+            self.push(it)
+        self.b += {1: b"\x85", 2: b"\x86", 3: b"\x87"}.get(n, b"t")
+
+    def push(self, v):
+        if v is None:
+            self.b += b"N"
+        elif isinstance(v, bool):                 # before int: bool is an int
+            self.b += b"\x88" if v else b"\x89"
+        elif isinstance(v, int):
+            self.int_(v)
+        elif isinstance(v, float):
+            self.b += b"G" + struct.pack(">d", v)
+        elif isinstance(v, str):
+            self.string(v)
+        elif isinstance(v, tuple):
+            self.tuple_(v)
+        elif isinstance(v, TGlobal):
+            self.global_(v.module, v.name)
+        elif isinstance(v, TIntList):             # pushSpecializedList
+            self.global_("torch.jit._pickle", "build_intlist")
+            self.b += b"(" + b"]" + b"("
+            for i in v.items:
+                self.int_(i)
+            self.b += b"e" + b"t" + b"R"
+        elif isinstance(v, TTensor):              # pushLiteralTensor
+            self.global_("torch._utils", "_rebuild_tensor_v2")
+            self.b += b"("
+            self.b += b"("                        # pushStorageOfTensor
+            self.string("storage")
+            self.global_("torch", v.storage)
+            self.string(v.key)
+            self.string("cpu")
+            self.int_(v.numel)
+            self.b += b"t" + b"Q"
+            self._binput()
+            self.int_(v.offset)
+            self.b += b"("
+            for d in v.size:
+                self.int_(d)
+            self.b += b"t" + b"("
+            for s in v.stride:
+                self.int_(s)
+            self.b += b"t"
+            self.push(False)                      # requires_grad
+            self.global_("collections", "OrderedDict")
+            self.b += b")" + b"R"                 # backward_hooks
+            self.b += b"t" + b"R"
+        elif isinstance(v, TObject):
+            self.global_(v.module, v.name)
+            self.b += b")" + b"\x81"              # EMPTY_TUPLE, NEWOBJ
+            self.b += b"}" + b"("                 # EMPTY_DICT, MARK
+            for k, val in v.attrs:
+                self.string(k)
+                self.push(val)
+            self.b += b"u" + b"b"                 # SETITEMS, BUILD
+        else:
+            raise TypeError(type(v))
+
+    def finish(self, value):
+        self.push(value)
+        self.b += b"."
+        return bytes(self.b)
+
+
+def torch_pickle(value):
+    return TorchPickler().finish(value)
+
+
+def bc_table(entries):
+    """export_module.cpp Table(): a tuple of (name, value) 2-tuples."""
+    return tuple((k, v) for k, v in entries)
+
+
+def bc_arg(name, type_str, default=None):
+    return bc_table([("name", name), ("type", type_str), ("default_value", default)])
+
+
+def bc_function(qualname, instructions, operators, constants, types,
+                register_size, args, returns, with_schema=True):
+    code = bc_table([("instructions", tuple(instructions)),
+                     ("operators", tuple(operators)),
+                     ("constants", tuple(constants)),
+                     ("types", tuple(types)),
+                     ("register_size", register_size)])
+    if not with_schema:
+        return (qualname, code)
+    schema = bc_table([("arguments", tuple(args)), ("returns", tuple(returns))])
+    return (qualname, code, schema)
+
+
+# The fixture module, as torch.jit.script + _save_for_lite_interpreter would
+# emit it for:
+#     class Model(nn.Module):              # __torch__.Model
+#         def __init__(self): self.fc = nn.Linear(4, 2)
+#         def forward(self, x, flag: bool):
+#             y = torch.relu(self.fc(x))
+#             if flag: return torch.add(y, CONST, alpha=2)
+#             else:    return torch.mean(y, [1], True)
+# The instruction stream is what the JIT emitter (code_impl.h) produces for
+# that graph after Inline + insertLastUses + CanEmitInline: linear is inlined
+# into relu, both GET_ATTRs of fc are inlined into linear, y's last use is
+# nested in the If so a DROPR follows the join, and each branch's op is
+# inlined into the branch return (no STORE inside the branches).
+MOBILE_FORWARD_V8 = [
+    ("STOREN", 1, 3),   # 0  self, x, flag -> r1..r3
+    ("MOVE", 1, 0),     # 1  self
+    ("GET_ATTR", 1, 0), # 2  .fc            (slot 1 of __torch__.Model)
+    ("STORE", 4, 0),    # 3  fc -> r4
+    ("MOVE", 2, 0),     # 4  x
+    ("LOAD", 4, 0),     # 5  fc
+    ("GET_ATTR", 1, 0), # 6  .weight        (slot 1 of Linear)
+    ("MOVE", 4, 0),     # 7  fc
+    ("GET_ATTR", 2, 0), # 8  .bias          (slot 2 of Linear)
+    ("OP", 0, 0),       # 9  aten::linear   (3 args)
+    ("OP", 1, 0),       # 10 aten::relu     (1 arg)
+    ("STORE", 5, 0),    # 11 y -> r5
+    ("MOVE", 3, 0),     # 12 flag
+    ("JF", 6, 0),       # 13 false -> 19
+    ("LOAD", 5, 0),     # 14 y
+    ("LOADC", 0, 0),    # 15 CONST (tensor)
+    ("LOADC", 1, 0),    # 16 2
+    ("OP", 2, 0),       # 17 aten::add.Tensor (3 args)
+    ("JMP", 5, 0),      # 18 -> 23
+    ("LOAD", 5, 0),     # 19 y
+    ("LOADC", 2, 0),    # 20 [1]
+    ("LOADC", 3, 0),    # 21 True
+    ("OP", 3, 0),       # 22 aten::mean.dim (3 args)
+    ("STORE", 6, 0),    # 23 if-output -> r6
+    ("DROPR", 5, 0),    # 24 y's last use was nested in the If
+    ("MOVE", 6, 0),     # 25
+    ("RET", 0, 0),      # 26
+]
+
+
+def build_mobile_bytecode(version, instructions, with_num_args=True,
+                          tensor_key="0.storage"):
+    ops = [("aten::linear", "", 3), ("aten::relu", "", 1),
+           ("aten::add", "Tensor", 3), ("aten::mean", "dim", 3)]
+    if not with_num_args:
+        ops = [(n, o) for (n, o, _) in ops]
+    const = TTensor("FloatStorage", tensor_key, 2, (2,), (1,))
+    fwd = bc_function(
+        "__torch__.Model.forward", instructions, ops,
+        [const, 2, TIntList([1]), True], [], 6,
+        [bc_arg("self", "__torch__.Model"), bc_arg("x", "Tensor"),
+         bc_arg("flag", "bool")],
+        [bc_arg("", "Tensor")])
+    return torch_pickle((version, fwd))
+
+
+def build_mobile_data_pkl():
+    w = TTensor("FloatStorage", "0", 8, (2, 4), (4, 1))
+    b = TTensor("FloatStorage", "1", 2, (2,), (1,))
+    fc = TObject("__torch__.torch.nn.modules.linear", "Linear",
+                 [("training", True), ("weight", w), ("bias", b)])
+    root = TObject("__torch__", "Model", [("training", True), ("fc", fc)])
+    return torch_pickle(root)
+
+
+def build_mobile_ptl(path, version=8, instructions=None, with_num_args=True,
+                     with_data_pkl=True):
+    """A PyTorch Mobile lite-interpreter archive laid out like
+    torch.jit._save_for_lite_interpreter writes it (records in writer order)."""
+    if instructions is None:
+        instructions = MOBILE_FORWARD_V8
+    # v<=4 kept bytecode tensors in bytecode/<idx>; v5+ share constants/<n>.storage.
+    legacy_dir = version <= 4
+    key = "0" if legacy_dir else "0.storage"
+    f32 = lambda vals: b"".join(struct.pack("<f", float(v)) for v in vals)
+    records = [
+        ("model/data/0", f32(range(8))),                  # fc.weight [2,4]
+        ("model/data/1", f32([0.5, -0.5])),               # fc.bias   [2]
+    ]
+    if with_data_pkl:
+        records.append(("model/data.pkl", build_mobile_data_pkl()))
+    records += [
+        ("model/code/__torch__.py",
+         b"class Model(Module):\n  def forward(self, x, flag: bool):\n"
+         b"    return torch.relu(self.fc(x))\n"),
+        ("model/constants/0.storage", f32([7.5, -3.25])),  # CONST [2] (unique bytes)
+        ("model/constants.pkl",
+         torch_pickle((TTensor("FloatStorage", "0.storage", 2, (2,), (1,)),))),
+    ]
+    if legacy_dir:
+        records.append(("model/bytecode/0", f32([7.5, -3.25])))
+    records.append(("model/bytecode.pkl",
+                    build_mobile_bytecode(version, instructions, with_num_args, key)))
+    if os.path.exists(path):
+        os.remove(path)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        for arcname, data in records:
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, data)
+
+
+def mobile_badop_instructions():
+    """MOBILE_FORWARD_V8 with the relu OP replaced by an opcode NetVis must not
+    know ("FROB"): its stack effect is unknowable, so the method is not graphed."""
+    ins = list(MOBILE_FORWARD_V8)
+    ins[10] = ("FROB", 1, 0)
+    return ins
 
 # ---------------------------------------------------------------------------
 # TFLite: a hand-built FlatBufferBuilder (bottom-up, vtables, alignment)
@@ -1981,6 +2279,18 @@ def main():
     build_pytorch(os.path.join(out_dir, "model.pt"))
     build_npz(os.path.join(out_dir, "model.npz"))
     build_torchscript(os.path.join(out_dir, "model_ts.pt"))
+    # PyTorch Mobile lite-interpreter archives (#137): a v8 graph, a v4 archive
+    # (no operator arity -> exact inventory fallback) and an unknown-instruction
+    # archive (-> exact inventory fallback with the reason and byte offset).
+    build_mobile_ptl(os.path.join(out_dir, "model_mobile.ptl"))
+    build_mobile_ptl(os.path.join(out_dir, "model_mobile_v4.ptl"), version=4,
+                     with_num_args=False)
+    build_mobile_ptl(os.path.join(out_dir, "model_mobile_badop.ptl"),
+                     instructions=mobile_badop_instructions())
+    # Same archive minus data.pkl: still detected (bytecode.pkl signal) and
+    # graphed, with `self` unbound (prim::GetAttr slot nodes, no parameters).
+    build_mobile_ptl(os.path.join(out_dir, "model_mobile_nodata.ptl"),
+                     with_data_pkl=False)
     tfl = build_tflite()
     # Self-check: the file_identifier must land at bytes 4..8 and the root
     # uoffset must point inside the buffer (spec §10 priorities).
