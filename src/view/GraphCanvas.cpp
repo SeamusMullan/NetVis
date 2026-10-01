@@ -520,7 +520,18 @@ void draw_graph_canvas(App& app) {
   ViewState& vs = app.view();
   ModelSession& session = app.session();
 
-  ImGui::Begin("Graph");
+  // #170 --canvas-only: the capture frame fills the viewport with this window, so
+  // it must have no title bar, no resize/move grip, no docking tab, and must not
+  // persist or restyle itself. In every other mode the flags are None, i.e. the
+  // old unconditional `Begin("Graph")`.
+  ImGuiWindowFlags graph_flags = ImGuiWindowFlags_None;
+  if (app.canvas_only()) {
+    graph_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                  ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+                  ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                  ImGuiWindowFlags_NoNav;
+  }
+  ImGui::Begin("Graph", nullptr, graph_flags);
   // Single child region: everything below is manual ImDrawList output.
   ImGui::BeginChild("canvas", ImVec2(0, 0), ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoScrollbar |
