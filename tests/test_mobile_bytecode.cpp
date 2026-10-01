@@ -1129,3 +1129,341 @@ TEST_CASE("T-B16 builds are deterministic") {
   REQUIRE(d.ok());
   check_same_graphs(c.model, d.model);
 }
+
+// ============================================================================
+// T-M: the .ptl fixtures through pytorch::parse_zip
+// ============================================================================
+namespace {
+
+const char* kMobile = "tests/fixtures/model_mobile.ptl";
+const char* kMobileV4 = "tests/fixtures/model_mobile_v4.ptl";
+const char* kMobileBadOp = "tests/fixtures/model_mobile_badop.ptl";
+const char* kMobileNoData = "tests/fixtures/model_mobile_nodata.ptl";
+
+bool have(const char* path) {
+  if (std::filesystem::exists(path)) return true;
+  WARN_MESSAGE(false, "fixture missing; run tools/gen_fixtures.py");
+  return false;
+}
+
+std::optional<ir::Model> parse_ptl(const char* path) {
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);
+  ProgressSink progress;
+  auto res = pytorch::parse_zip(*mf, progress);
+  REQUIRE_MESSAGE(res, (res ? std::string() : res.error().message));
+  return res.take();
+}
+
+std::optional<std::string> meta(const ir::Model& m, const std::string& key) {
+  for (const auto& kv : m.metadata)
+    if (m.str(kv.first) == key) return std::string(m.str(kv.second));
+  return std::nullopt;
+}
+
+std::vector<uint8_t> read_file(const char* path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+}
+
+size_t find_bytes(const std::vector<uint8_t>& hay, const void* needle, size_t n,
+                  size_t* count) {
+  size_t first = SIZE_MAX;
+  *count = 0;
+  for (size_t i = 0; i + n <= hay.size(); ++i) {
+    if (std::memcmp(hay.data() + i, needle, n) == 0) {
+      if (first == SIZE_MAX) first = i;
+      ++*count;
+    }
+  }
+  return first;
+}
+
+const VS kFourOps = {"aten::linear", "aten::relu", "aten::add.Tensor", "aten::mean.dim"};
+std::string joined(const VS& v) {
+  std::string s;
+  for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + v[i];
+  return s;
+}
+
+void check_parameter_table(const ir::Model& m) {
+  REQUIRE(m.flat_tensors.size() == 2);
+  CHECK(str(m, m.flat_tensors[0].name) == "fc.weight");
+  CHECK(str(m, m.flat_tensors[1].name) == "fc.bias");
+  CHECK(m.flat_tensors[0].file_offset != UINT64_MAX);
+  CHECK(m.flat_tensors[1].file_offset != UINT64_MAX);
+}
+
+}  // namespace
+
+TEST_CASE("T-M1 mobile .ptl v8: forward decodes to the expected graph") {
+  if (!have(kMobile)) return;
+  ByteReader::payload_read_counter() = 0;
+  auto pm = parse_ptl(kMobile);
+  const ir::Model& m = *pm;
+  CHECK(m.has_graph);
+  CHECK(m.flat_tensors.empty());
+  REQUIRE(m.graphs.size() == 3);
+  CHECK(str(m, m.format_name) == "PyTorch");
+  CHECK(str(m, m.version_info) == "bytecode v8");
+
+  const ir::Graph& g = m.graphs[0];
+  CHECK(str(m, g.name) == "__torch__.Model.forward");
+  CHECK(str(m, m.graphs[1].name) == "__torch__.Model.forward/if0.then");
+  CHECK(str(m, m.graphs[2].name) == "__torch__.Model.forward/if0.else");
+  CHECK(names_of(m, g, g.graph_inputs) == VS{"x", "flag"});
+  REQUIRE(g.initializers.size() == 2);
+  CHECK(init_names(m, g) == VS{"fc.weight", "fc.bias"});
+  CHECK(g.initializers[0].dtype == ir::DType::F32);
+  CHECK(g.initializers[0].shape.size() == 2);
+  CHECK(g.initializers[0].shape[0] == 2);
+  CHECK(g.initializers[0].shape[1] == 4);
+  CHECK(g.initializers[0].byte_len == 32);
+  CHECK(g.initializers[1].dtype == ir::DType::F32);
+  REQUIRE(g.initializers[1].shape.size() == 1);
+  CHECK(g.initializers[1].shape[0] == 2);
+  CHECK(g.initializers[1].byte_len == 8);
+  CHECK(g.initializers[0].file_offset != UINT64_MAX);
+  CHECK(g.initializers[1].file_offset != UINT64_MAX);
+  CHECK(g.initializers[0].file_offset != g.initializers[1].file_offset);
+
+  CHECK(ops_of(m, g) == VS{"aten::linear", "aten::relu", "prim::If"});
+  CHECK(ins_of(m, g, 0) == VS{"x", "fc.weight", "fc.bias"});
+  CHECK(outs_of(m, g, 0) == VS{"%1"});
+  CHECK(ins_of(m, g, 1) == outs_of(m, g, 0));
+  CHECK(outs_of(m, g, 1) == VS{"%2"});
+  CHECK(ins_of(m, g, 2) == VS{"flag", "%2"});
+  CHECK(g.nodes[2].subgraph == 1);
+  CHECK(attr_g(m, g, 2, "then_branch") == 1);
+  CHECK(attr_g(m, g, 2, "else_branch") == 2);
+  CHECK(attr_i(m, g, 2, "captures") == 1);
+  CHECK(outs_of(m, g, 2) == VS{"%5"});
+  CHECK(names_of(m, g, g.graph_outputs) == VS{"%5"});
+
+  const ir::Graph& t = m.graphs[1];
+  CHECK(names_of(m, t, t.graph_inputs) == VS{"%2"});
+  CHECK(init_names(m, t) == VS{"CONSTANTS.c0"});
+  REQUIRE(t.initializers.size() == 1);
+  CHECK(t.initializers[0].dtype == ir::DType::F32);
+  REQUIRE(t.initializers[0].shape.size() == 1);
+  CHECK(t.initializers[0].shape[0] == 2);
+  CHECK(ops_of(m, t) == VS{"aten::add"});
+  CHECK(ins_of(m, t, 0) == VS{"%2", "CONSTANTS.c0"});
+  CHECK(attr_s(m, t, 0, "overload") == "Tensor");
+  CHECK(attr_i(m, t, 0, "arg2") == 2);
+  CHECK(attr_names(m, t, 0) == VS{"overload", "arg2"});
+  CHECK(outs_of(m, t, 0) == VS{"%3"});
+  CHECK(names_of(m, t, t.graph_outputs) == VS{"%3"});
+
+  const ir::Graph& e = m.graphs[2];
+  CHECK(names_of(m, e, e.graph_inputs) == VS{"%2"});
+  CHECK(e.initializers.empty());
+  CHECK(ops_of(m, e) == VS{"aten::mean"});
+  CHECK(ins_of(m, e, 0) == VS{"%2"});
+  CHECK(attr_s(m, e, 0, "overload") == "dim");
+  const ir::AttrValue* a1 = attr_of(m, e, 0, "arg1");
+  REQUIRE(a1);
+  CHECK(a1->kind == ir::AttrValue::Kind::Ints);
+  CHECK(a1->ints == std::vector<int64_t>{1});
+  CHECK(attr_s(m, e, 0, "arg2") == "True");
+  CHECK(outs_of(m, e, 0) == VS{"%4"});
+  CHECK(names_of(m, e, e.graph_outputs) == VS{"%4"});
+
+  for (const ir::Graph& gr : m.graphs) {
+    std::vector<bool> is_init(gr.values.size(), false);
+    for (const auto& init : gr.initializers)
+      for (size_t v = 0; v < gr.values.size(); ++v)
+        if (gr.values[v].name == init.name) is_init[v] = true;
+    for (size_t v = 0; v < gr.values.size(); ++v) {
+      if (is_init[v]) continue;
+      CHECK(gr.values[v].dtype == ir::DType::Unknown);
+      CHECK(gr.values[v].shape.empty());
+    }
+    for (const ir::Node& n : gr.nodes) CHECK(m.str(n.name).empty());
+  }
+
+  CHECK(meta(m, "torchscript.bytecode_version") == std::string("8"));
+  CHECK(meta(m, "torchscript.ops") == joined(kFourOps));
+  CHECK(meta(m, "torchscript.methods") == std::string("__torch__.Model.forward"));
+  CHECK(meta(m, "torchscript.signature") ==
+        std::string("forward(self: __torch__.Model, x: Tensor, flag: bool) -> Tensor"));
+  CHECK(meta(m, "torchscript") ==
+        std::string("mobile lite-interpreter bytecode v8: __torch__.Model.forward "
+                    "decoded from bytecode.pkl"));
+  CHECK(meta(m, "tensors") == std::string("3"));
+  CHECK_FALSE(meta(m, "torchscript.unreferenced_tensors"));
+  CHECK_FALSE(meta(m, "torchscript.self"));
+  CHECK_FALSE(meta(m, "torchscript.bytecode"));
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("T-M2 mobile .ptl: parse is deterministic") {
+  if (!have(kMobile)) return;
+  ByteReader::payload_read_counter() = 0;
+  auto a = parse_ptl(kMobile);
+  auto b = parse_ptl(kMobile);
+  check_same_graphs(*a, *b);
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("T-M3 mobile .ptl: CONSTANTS.c0 shares the constants.pkl record") {
+  if (!have(kMobile)) return;
+  ByteReader::payload_read_counter() = 0;
+  auto pm = parse_ptl(kMobile);
+  std::vector<uint8_t> bytes = read_file(kMobile);
+  float pat[2] = {7.5f, -3.25f};
+  size_t count = 0;
+  size_t at = find_bytes(bytes, pat, sizeof(pat), &count);
+  REQUIRE(count == 1);
+  const ir::Graph& t = pm->graphs[1];
+  REQUIRE(t.initializers.size() == 1);
+  CHECK(t.initializers[0].file_offset == at);
+  CHECK(t.initializers[0].byte_len == 8);
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("T-M4 mobile .ptl v4: exact inventory, parameters listed, no graph") {
+  if (!have(kMobileV4)) return;
+  ByteReader::payload_read_counter() = 0;
+  auto pm = parse_ptl(kMobileV4);
+  const ir::Model& m = *pm;
+  CHECK_FALSE(m.has_graph);
+  CHECK(m.graphs.empty());
+  check_parameter_table(m);
+  CHECK(str(m, m.version_info) == "bytecode v4");
+  CHECK(meta(m, "torchscript.bytecode_version") == std::string("4"));
+  auto ops = meta(m, "torchscript.ops");
+  REQUIRE(ops);
+  CHECK(*ops == joined(kFourOps));
+  CHECK(ops->find("torch.relu") == std::string::npos);  // heuristic scan skipped
+  auto note = meta(m, "torchscript");
+  REQUIRE(note);
+  CHECK(note->find("graph not built") != std::string::npos);
+  CHECK(note->find("v6") != std::string::npos);
+  CHECK(meta(m, "torchscript.signature") ==
+        std::string("forward(self: __torch__.Model, x: Tensor, flag: bool) -> Tensor"));
+  CHECK(meta(m, "tensors") == std::string("2"));
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("T-M5 mobile .ptl unknown opcode: honest fallback with location") {
+  if (!have(kMobileBadOp)) return;
+  ByteReader::payload_read_counter() = 0;
+  auto pm = parse_ptl(kMobileBadOp);
+  const ir::Model& m = *pm;
+  CHECK_FALSE(m.has_graph);
+  CHECK(m.graphs.empty());
+  check_parameter_table(m);
+  auto note = meta(m, "torchscript");
+  REQUIRE(note);
+  INFO(*note);
+  CHECK(note->find("unknown instruction 'FROB'") != std::string::npos);
+  CHECK(note->find("pc 10") != std::string::npos);
+  size_t at = note->find("(byte ");
+  REQUIRE(at != std::string::npos);
+  uint64_t n = std::stoull(note->substr(at + 6));
+  std::vector<uint8_t> bytes = read_file(kMobileBadOp);
+  size_t count = 0;
+  size_t q = find_bytes(bytes, "FROB", 4, &count);
+  REQUIRE(count == 1);
+  // "FROB", BINPUT id, BININT1 1, BININT1 0, then the instruction's TUPLE3.
+  CHECK((n - q == 10 || n - q == 13));
+  CHECK(bytes[n] == 0x87);
+  CHECK(meta(m, "torchscript.ops") == joined(kFourOps));
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+namespace {
+// model/bytecode.pkl of the v8 fixture, extracted with miniz.
+std::vector<uint8_t> fixture_bytecode_pkl() {
+  std::vector<uint8_t> file = read_file(kMobile);
+  mz_zip_archive zip;
+  std::memset(&zip, 0, sizeof(zip));
+  REQUIRE(mz_zip_reader_init_mem(&zip, file.data(), file.size(), 0));
+  int idx = mz_zip_reader_locate_file(&zip, "model/bytecode.pkl", nullptr, 0);
+  REQUIRE(idx >= 0);
+  size_t n = 0;
+  void* p = mz_zip_reader_extract_to_heap(&zip, static_cast<mz_uint>(idx), &n, 0);
+  REQUIRE(p);
+  std::vector<uint8_t> out(static_cast<uint8_t*>(p), static_cast<uint8_t*>(p) + n);
+  mz_free(p);
+  mz_zip_reader_end(&zip);
+  return out;
+}
+
+// Decode `n` bytes and, if the tables decode, try to build the main method
+// with no data.pkl. Either may fail; neither may crash or read a payload.
+void decode_and_build(const uint8_t* data, size_t n) {
+  pytorch::StorageResolver none;
+  none.resolve = [](const std::string&, uint64_t&, uint64_t&) { return false; };
+  auto d = mb::decode_bytecode_pickle(data, n, none);
+  if (!d) {
+    CHECK(d.error().offset <= n);
+    return;
+  }
+  int32_t fi = mb::select_main_function(*d, "");
+  if (fi < 0) return;
+  ir::Model model;
+  mb::BuildContext ctx{model, empty_env(), no_names(), {}};
+  auto r = mb::build_method_graph(*d, static_cast<size_t>(fi), ctx);
+  if (!r) CHECK(model.graphs.empty());
+}
+}  // namespace
+
+TEST_CASE("T-M6 bytecode.pkl: every prefix decodes or errors, never crashes") {
+  if (!have(kMobile)) return;
+  std::vector<uint8_t> bc = fixture_bytecode_pkl();
+  REQUIRE(bc.size() > 100);
+  ByteReader::payload_read_counter() = 0;
+  for (size_t n = 0; n < bc.size(); ++n) decode_and_build(bc.data(), n);
+  // The full stream is the fixture: it must decode and graph.
+  auto full = mb::decode_bytecode_pickle(bc.data(), bc.size(), pytorch::StorageResolver{});
+  REQUIRE(full);
+  CHECK(full->version == 8);
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("T-M7 bytecode.pkl: every single-byte corruption decodes or errors") {
+  if (!have(kMobile)) return;
+  std::vector<uint8_t> bc = fixture_bytecode_pkl();
+  ByteReader::payload_read_counter() = 0;
+  for (size_t i = 0; i < bc.size(); ++i) {
+    std::vector<uint8_t> c = bc;
+    c[i] ^= 0xFF;
+    decode_and_build(c.data(), c.size());
+  }
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+TEST_CASE("T-M8 archive without data.pkl still graphs, self unbound") {
+  if (!have(kMobileNoData)) return;
+  ByteReader::payload_read_counter() = 0;
+  auto pm = parse_ptl(kMobileNoData);
+  const ir::Model& m = *pm;
+  CHECK(m.has_graph);
+  REQUIRE(m.graphs.size() == 3);
+  const ir::Graph& g = m.graphs[0];
+  CHECK(names_of(m, g, g.graph_inputs) == VS{"self", "x", "flag"});
+  VS ops = ops_of(m, g);
+  REQUIRE(ops.size() == 6);
+  CHECK(VS(ops.begin(), ops.begin() + 3) ==
+        VS{"prim::GetAttr", "prim::GetAttr", "prim::GetAttr"});
+  CHECK(attr_i(m, g, 0, "slot") == 1);
+  CHECK(attr_i(m, g, 1, "slot") == 1);
+  CHECK(attr_i(m, g, 2, "slot") == 2);
+  for (size_t i = 0; i < 3; ++i) CHECK(attr_of(m, g, i, "name") == nullptr);
+  CHECK(ins_of(m, g, 0) == VS{"self"});
+  CHECK(ins_of(m, g, 1) == outs_of(m, g, 0));  // fc-slot -> weight
+  CHECK(ins_of(m, g, 2) == outs_of(m, g, 0));  // fc-slot -> bias
+  CHECK(ops[3] == "aten::linear");
+  CHECK(ins_of(m, g, 3) ==
+        VS{"x", outs_of(m, g, 1)[0], outs_of(m, g, 2)[0]});
+  CHECK(g.initializers.empty());
+  CHECK(init_names(m, m.graphs[1]) == VS{"CONSTANTS.c0"});
+  auto self = meta(m, "torchscript.self");
+  REQUIRE(self);
+  CHECK(self->find("no data.pkl") != std::string::npos);
+  CHECK(m.flat_tensors.empty());
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
