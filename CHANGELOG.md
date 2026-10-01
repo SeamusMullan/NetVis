@@ -20,4 +20,21 @@ This file starts at the relicensing; earlier history is in the git tags and GitH
   the template's own PATH edit gets a turn, and the installer names the folder to
   add by hand. Not fixed: a drive-letter install that fails outright on a virtual
   or mapped drive; that needs its own repro (#149 stays open).
+- **Fixed: CoreML `.mlmodel` files failed to open** (#114). v0.9.5 added a TensorFlow
+  structural sniff ahead of the `.mlmodel` extension guard in format detection. A
+  CoreML `Model` protobuf satisfies that sniff exactly — field 1 varint, field 2
+  length-delimited, whose own first field is length-delimited — so ordinary
+  `.mlmodel` files were handed to the TensorFlow parser and died with "SavedModel
+  meta_graph carries no graph_def". The extension guard now runs first, and CoreML is
+  also recognised from content (its model type sits at a field number of 200 or
+  more, which no TensorFlow or ONNX protobuf uses), so a CoreML file renamed without
+  the `.mlmodel` suffix no longer falls through to TensorFlow or ONNX.
+- Format detection: length checks in the protobuf sniffs are now overflow-safe. A
+  hostile length varint near 2^64 could wrap the bounds check and be accepted.
+- Added [`docs/format-support.md`](docs/format-support.md): what every supported
+  format yields (graph, shapes, addressable weights) and the known gaps per format.
+  `tests/test_format_matrix.cpp` re-derives the table from the shipped fixtures on
+  every test run, so a stale row cannot go unnoticed. Only the table is checked, not
+  the prose around it, and the cost and shape-inference code has not yet been audited
+  for fabricated values (still open under #114).
 - CI builds the GUI app and runs `ctest` on Linux (both the `ubuntu-22.04` release image and `ubuntu-latest`), macOS and Windows for every pull request and push to master (#169), so a platform break shows up on the PR instead of when a release tag is built. The test suite was made portable to MSVC with test-only changes; no library or app behaviour changes.
