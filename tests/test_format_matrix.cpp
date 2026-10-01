@@ -37,6 +37,7 @@
 #include "engine/ModelPath.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -356,25 +357,20 @@ TEST_CASE("format matrix: -1 means unresolved, and a real 0 stays 0") {
     out.write(reinterpret_cast<const char*>(modelproto.data()),
               static_cast<std::streamsize>(modelproto.size()));
   }
-  {
-    // Scoped so the mapping is released before the file is removed (Windows
-    // refuses to delete a file that is still mapped).
-    auto mf = MappedFile::open(path.string());
-    REQUIRE(mf);
-    ProgressSink progress;
-    Result<ir::Model> r = parse_model(*mf, "onnx", progress);
-    REQUIRE_MESSAGE(r, "hand-built ONNX model failed to parse");
-    const ir::Model& m = *r;
-    REQUIRE(m.graphs.size() == 1);
-    const ir::Graph& g = m.graphs[0];
-    REQUIRE(g.graph_inputs.size() == 1);
-    const ir::ValueInfo& v = g.values[g.graph_inputs[0]];
-    REQUIRE(v.shape.size() == 4);
-    CHECK(v.shape[0] == -1);
-    CHECK(v.shape[1] == 3);
-    CHECK(v.shape[2] == 0);
-    CHECK(v.shape[3] == -1);
-  }
-  std::error_code ec;
-  std::filesystem::remove(path, ec);
+  netvis_test::TempFileGuard cleanup(path.string());  // before mf: unmap first, then delete
+  auto mf = MappedFile::open(path.string());
+  REQUIRE(mf);
+  ProgressSink progress;
+  Result<ir::Model> r = parse_model(*mf, "onnx", progress);
+  REQUIRE_MESSAGE(r, "hand-built ONNX model failed to parse");
+  const ir::Model& m = *r;
+  REQUIRE(m.graphs.size() == 1);
+  const ir::Graph& g = m.graphs[0];
+  REQUIRE(g.graph_inputs.size() == 1);
+  const ir::ValueInfo& v = g.values[g.graph_inputs[0]];
+  REQUIRE(v.shape.size() == 4);
+  CHECK(v.shape[0] == -1);
+  CHECK(v.shape[1] == 3);
+  CHECK(v.shape[2] == 0);
+  CHECK(v.shape[3] == -1);
 }
