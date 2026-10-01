@@ -264,7 +264,12 @@ cmake --preset tsan  && cmake --build --preset tsan  && ctest --preset tsan
 ## CI & releases
 
 `.github/workflows/ci.yml` runs on every push/PR: the ASan+UBSan and TSan
-sanitizer suites plus a headless `core-only` build + `ctest`.
+sanitizer suites, a headless `core-only` build + `ctest`, and a Release build of
+the full GUI app plus `ctest` on **Linux, macOS and Windows**
+(`build + ctest (<os>, app)`). That last job compiles the ImGui app and the test
+suite with GCC, AppleClang and MSVC, so a break on any platform fails the pull
+request instead of surfacing when a release tag is built. It mirrors the setup
+steps of `package.yml`, but does not gate releases.
 
 Pushing a `vX.Y.Z` tag additionally builds the per-OS installers and publishes a
 GitHub Release with them attached:
