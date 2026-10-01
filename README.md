@@ -110,8 +110,10 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   allowlist — unknown reduce targets become inert placeholders, never executed.
 - **Export & sharing:** PNG and **vector SVG/PDF** export of the current view,
   shareable view-state files, copy-node-as-JSON, TSV cost summaries, a diff change
-  report (Markdown/TSV), and a **headless report CLI** that emits a JSON model
-  report with no window at all.
+  report (Markdown/TSV), a **headless report CLI** that emits a JSON model
+  report with no window at all, and a **`--screenshot` mode** that renders a
+  model straight to PNG from the command line (see *Screenshots from the command
+  line*).
 - **Agent query CLI:** `netvis query <verb> <model>` answers one structural
   question per invocation as a line of JSON — nodes, tensors, weight stats,
   search, connectivity, per-node cost ranking, model diff — so scripts and
@@ -217,6 +219,56 @@ sudo dnf install mesa-libGL-devel mesa-libEGL-devel libX11-devel libXrandr-devel
 `-DNETVIS_GLFW_WAYLAND=AUTO|ON|OFF` controls the Wayland backend: `AUTO` (the
 default) builds it when the packages above are installed, `ON` makes them
 required, `OFF` skips it.
+
+## Screenshots from the command line
+
+`netvis --screenshot` opens a model exactly as the GUI does, waits until parsing,
+layout and shape inference have finished, renders it into an offscreen buffer of
+exactly the requested size, writes a PNG and exits. No window appears, and the
+output does not depend on the display's HiDPI scale.
+
+```sh
+netvis --screenshot graph.png model.onnx                          # 1600x1000, whole window
+netvis --screenshot canvas.png --canvas-only --size 1200x800 model.onnx
+netvis --screenshot heat.png --view heatmap.netvis-view --fit model.onnx
+```
+
+| Flag | Meaning |
+|---|---|
+| `--screenshot <out.png>` | Output file. Written atomically; an existing file is replaced only if it is a PNG. |
+| `--size WxH` | Pixels, 64–8192 per side (default `1600x1000`). |
+| `--view <file>` | Apply a view-state file saved with File → Save View State… |
+| `--fit` | Fit the graph to the canvas even if the view file stores a camera. |
+| `--canvas-only` | Capture only the graph canvas: no menus, tabs, panels or status bar. |
+| `--theme dark\|light` | Colour theme (default `dark`). |
+| `--timeout <s>` | Give up after this many seconds of loading (default 120, max 3600). |
+| `--no-layout-cache` | Recompute the layout instead of using the layout cache. |
+
+Exit codes: `0` written, `2` bad arguments, `3` the model failed to open or lay out
+(or `--canvas-only` on a weights-only file), `4` bad view file, `5` timed out, `6`
+OpenGL/window failure, `7` the PNG could not be written. The reason is on stderr.
+
+A view file sets the camera, collapse state (`"collapse": "all"` works on any
+model), edge routing, cost heatmap and metric, critical path, navigation mode,
+selection and filters. Save one from the GUI, or write the keys you need by hand.
+Model-specific keys (selection, collapse bitset, pins) apply only when the file's
+`"model"` names the model being captured. The camera is relative to the canvas
+it was saved from, so add `--fit` when reusing a GUI-saved view at another size.
+
+Screenshot mode ignores your saved preferences, recent files, `imgui.ini` and
+installed plugins, so a command produces the same picture every time on the same
+machine. Fonts and GL drivers differ between machines, so do not expect identical
+pixels across them. `--canvas-only` output is identical run to run. Full-window
+captures include the status bar's live load timings and so differ slightly. For
+before/after images of a layout change, pass `--no-layout-cache` so a layout
+cached by another build cannot stand in for the new one.
+
+It needs OpenGL 3.3 and a window system, though the window stays hidden. On
+macOS run the binary inside the bundle
+(`./build/release/netvis.app/Contents/MacOS/netvis`). On a Linux machine without
+a display, use a virtual one: `xvfb-run -a netvis --screenshot ...`. On Windows
+`netvis.exe` is a GUI-subsystem program: use `start /wait` and redirect stderr
+(`2> err.txt`) to see messages and the exit code.
 
 ## Architecture
 
