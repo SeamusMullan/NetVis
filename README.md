@@ -193,7 +193,11 @@ ctest --preset core-only
 ```
 
 Open a model via the `File → Open` dialog, by dragging it onto the window, or by
-passing it as a CLI argument.
+passing it as a CLI argument. The dialog's "All supported models" filter covers
+every extension listed under Formats. A CoreML `.mlpackage` is a directory, so
+the dialog can pick it only where the platform treats packages as files (macOS);
+elsewhere drag it onto the window or pass it on the command line. For a
+TensorFlow SavedModel, pick its `saved_model.pb`.
 
 ### Linux: Wayland and X11
 
