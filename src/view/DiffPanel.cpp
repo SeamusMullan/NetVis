@@ -934,7 +934,7 @@ void draw_diff_panel(App& app) {
     } else {
       add_dlg.start(FileDialog::Mode::Open, "Open comparison model", "",
                     {"*.onnx", "*.tflite", "*.safetensors", "*.gguf", "*.pt",
-                     "*.pth", "*.bin", "*.pb"},
+                     "*.pth", "*.ptl", "*.bin", "*.pb"},
                     "Model files");
     }
   }

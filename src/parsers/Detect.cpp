@@ -140,6 +140,9 @@ struct ZipFlags {
   bool keras_config = false;    // has "config.json"             -> keras v3
   bool keras_weights = false;   // has "model.weights.h5"        -> keras v3
   bool pytorch_pkl = false;     // has "*/data.pkl" or "data.pkl" -> PyTorch
+  // has "*/bytecode.pkl" or "bytecode.pkl" -> PyTorch Mobile (#137). Only
+  // torch's PyTorchStreamWriter writes it, so it is as specific as data.pkl.
+  bool pytorch_bytecode = false;
 };
 
 bool ends_with(std::string_view s, std::string_view suf) {
@@ -199,6 +202,7 @@ ZipFlags scan_zip_names(const uint8_t* d, uint64_t size) {
     if (bn == "config.json") fl.keras_config = true;
     if (bn == "model.weights.h5") fl.keras_weights = true;
     if (bn == "data.pkl") fl.pytorch_pkl = true;
+    if (bn == "bytecode.pkl") fl.pytorch_bytecode = true;
     off += 46ULL + *fn_len + *extra_len + *comment_len;
   }
   return fl;
@@ -322,6 +326,16 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::TFLite;
   }
 
+  // PyTorch Mobile flatbuffer (_use_flatbuffer=True): file identifier "PTMF" at
+  // bytes [4..8). Not parsed; routed to the PyTorch zip parser so the user gets
+  // its honest "flatbuffer not supported" error instead of "unrecognized". It
+  // cannot reach the SafeTensors check below: its u64 header-length field is
+  // uoffset | 'PTMF' << 32, larger than any real file.
+  if (size >= 8 && std::memcmp(d + 4, "PTMF", 4) == 0) {
+    reason = DetectReason::Magic;
+    return Format::PyTorchZip;
+  }
+
   // SafeTensors: u64 LE header length N at 0, then 8+N <= filesize and the JSON
   // header (after optional whitespace) begins with '{'.
   {
@@ -345,8 +359,9 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
   if (size >= 4 && std::memcmp(d, "PK\x03\x04", 4) == 0) {
     ZipFlags fl = scan_zip_names(d, size);
     // A specific in-archive content signal is as trustworthy as a magic match.
-    // PyTorch is the most specific signal (a data.pkl object graph); prefer it.
-    if (fl.pytorch_pkl) {
+    // PyTorch is the most specific signal (a data.pkl object graph, or a
+    // mobile bytecode.pkl); prefer it.
+    if (fl.pytorch_pkl || fl.pytorch_bytecode) {
       reason = DetectReason::Magic;
       return Format::PyTorchZip;
     }
@@ -367,7 +382,8 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
       reason = DetectReason::Extension;
       return Format::Keras;
     }
-    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
+    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin" ||
+        ext_hint == "ptl") {
       reason = DetectReason::Extension;
       return Format::PyTorchZip;
     }
@@ -436,7 +452,8 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
       return Format::Keras;
     if (ext_hint == "mlmodel") return Format::CoreML;
     if (ext_hint == "pb") return Format::TensorFlow;
-    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
+    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin" ||
+        ext_hint == "ptl") {
       return Format::PyTorchZip;
     }
     if (ext_hint == "pkl" || ext_hint == "pickle") return Format::PyTorchLegacy;

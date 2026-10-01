@@ -261,3 +261,176 @@ TEST_CASE("OpCategory: category_name is non-empty for every category") {
   CHECK(std::string(category_name(OpCategory::Recurrent)) != "Other");
   CHECK(std::string(category_name(OpCategory::Quantize)) != "Other");
 }
+
+TEST_CASE("OpCategory #137: TorchScript ns::name[.overload] op types") {
+  CHECK(categorize_op("aten::conv2d") == OpCategory::Conv);
+  CHECK(categorize_op("aten::_convolution") == OpCategory::Conv);
+  CHECK(categorize_op("aten::linear") == OpCategory::MatMul);
+  CHECK(categorize_op("aten::bmm") == OpCategory::MatMul);
+  CHECK(categorize_op("aten::relu_") == OpCategory::Activation);  // in-place
+  CHECK(categorize_op("aten::hardtanh_") == OpCategory::Activation);
+  CHECK(categorize_op("aten::batch_norm") == OpCategory::Norm);
+  CHECK(categorize_op("aten::adaptive_avg_pool2d") == OpCategory::Pool);
+  CHECK(categorize_op("aten::add.Tensor") == OpCategory::Elementwise);  // overload
+  CHECK(categorize_op("aten::add_.Tensor") == OpCategory::Elementwise);
+  CHECK(categorize_op("aten::cat") == OpCategory::Shape);
+  CHECK(categorize_op("aten::view") == OpCategory::Shape);
+  CHECK(categorize_op("prim::If") == OpCategory::ControlFlow);
+  CHECK(categorize_op("prim::Loop") == OpCategory::ControlFlow);
+  CHECK(categorize_op("prim::Constant") == OpCategory::Tensor);
+  // Dunder names keep their underscores; deliberately unmapped ops stay Other.
+  CHECK(categorize_op("aten::__is__") == OpCategory::Other);
+  CHECK(categorize_op("aten::addmm") == OpCategory::Other);
+  CHECK(categorize_op("aten::conv_transpose2d") == OpCategory::Other);
+  CHECK(categorize_op("custom::my_op") == OpCategory::Other);
+  CHECK(categorize_op("?") == OpCategory::Other);
+  // Regression: the dotted-domain rule is unchanged.
+  CHECK(categorize_op("com.microsoft.Gelu") == OpCategory::Activation);
+  CHECK(categorize_op("Conv") == OpCategory::Conv);
+  CHECK(categorize_op("ai.onnx.Relu") == OpCategory::Activation);
+}
+
+// --- #137: PyTorch Mobile (.ptl) detection --------------------------------------
+namespace {
+
+void le16(std::vector<uint8_t>& b, uint16_t v) {
+  b.push_back(static_cast<uint8_t>(v & 0xff));
+  b.push_back(static_cast<uint8_t>(v >> 8));
+}
+void le32(std::vector<uint8_t>& b, uint32_t v) {
+  for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+}
+
+// A minimal STORED zip with zero-size entries named `names`: per name a local
+// file header (+ name), then one central-directory record per name, then the
+// EOCD. Detection only reads the central directory and EOCD (CRCs are 0).
+std::vector<uint8_t> make_zip(const std::vector<std::string>& names) {
+  std::vector<uint8_t> b;
+  std::vector<uint32_t> local_ofs;
+  for (const std::string& n : names) {
+    local_ofs.push_back(static_cast<uint32_t>(b.size()));
+    le32(b, 0x04034b50);
+    le16(b, 20);  // version needed
+    le16(b, 0);   // flags
+    le16(b, 0);   // STORED
+    le16(b, 0);   // time
+    le16(b, 0);   // date
+    le32(b, 0);   // crc
+    le32(b, 0);   // compressed size
+    le32(b, 0);   // uncompressed size
+    le16(b, static_cast<uint16_t>(n.size()));
+    le16(b, 0);   // extra
+    b.insert(b.end(), n.begin(), n.end());
+  }
+  const auto cd_off = static_cast<uint32_t>(b.size());
+  for (size_t i = 0; i < names.size(); ++i) {
+    const std::string& n = names[i];
+    le32(b, 0x02014b50);
+    le16(b, 20);  // made by
+    le16(b, 20);  // needed
+    le16(b, 0);
+    le16(b, 0);
+    le16(b, 0);
+    le16(b, 0);
+    le32(b, 0);
+    le32(b, 0);
+    le32(b, 0);
+    le16(b, static_cast<uint16_t>(n.size()));
+    le16(b, 0);   // extra
+    le16(b, 0);   // comment
+    le16(b, 0);   // disk
+    le16(b, 0);   // internal attrs
+    le32(b, 0);   // external attrs
+    le32(b, local_ofs[i]);
+    b.insert(b.end(), n.begin(), n.end());
+  }
+  const auto cd_size = static_cast<uint32_t>(b.size() - cd_off);
+  le32(b, 0x06054b50);
+  le16(b, 0);
+  le16(b, 0);
+  le16(b, static_cast<uint16_t>(names.size()));
+  le16(b, static_cast<uint16_t>(names.size()));
+  le32(b, cd_size);
+  le32(b, cd_off);
+  le16(b, 0);
+  return b;
+}
+
+Format zip_detect(const std::string& stem, const std::vector<std::string>& names,
+                  const std::string& ext, DetectReason& r) {
+  return detect_bytes_reason(stem, make_zip(names), ext, r);
+}
+
+}  // namespace
+
+TEST_CASE("detect #137 T-D1/T-D2: bytecode.pkl is a PyTorch content signal") {
+  DetectReason r = DetectReason::None;
+  CHECK(zip_detect("d1a", {"bytecode.pkl"}, "", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Magic);
+  CHECK(zip_detect("d1b", {"data.pkl", "bytecode.pkl"}, "", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Magic);
+  CHECK(zip_detect("d2", {"model/bytecode.pkl"}, "", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Magic);
+}
+
+TEST_CASE("detect #137 T-D3: only the exact basename counts") {
+  DetectReason r = DetectReason::None;
+  CHECK(zip_detect("d3a", {"bytecode.pkl.bak"}, "", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::ContentDefault);
+  CHECK(zip_detect("d3b", {"xbytecode.pkl"}, "", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::ContentDefault);
+}
+
+TEST_CASE("detect #137 T-D4/T-D5: the PyTorch tier wins over npz and keras") {
+  DetectReason r = DetectReason::None;
+  CHECK(zip_detect("d4", {"bytecode.pkl", "w.npy"}, "", r) == Format::PyTorchZip);
+  CHECK(zip_detect("d5", {"bytecode.pkl", "config.json", "model.weights.h5"}, "", r) ==
+        Format::PyTorchZip);
+  CHECK(r == DetectReason::Magic);
+}
+
+TEST_CASE("detect #137 T-D6/T-D7/T-D8: .ptl is a tiebreak, never beats content") {
+  DetectReason r = DetectReason::None;
+  CHECK(zip_detect("d6", {"foo.txt"}, "ptl", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Extension);
+  CHECK(zip_detect("d7", {"w.npy"}, "ptl", r) == Format::Npz);
+  CHECK(r == DetectReason::Magic);
+  std::vector<uint8_t> legacy = {0x80, 0x02, 'K', 0x01, '.'};
+  legacy.resize(32, 0);
+  CHECK(detect_bytes_reason("d8", legacy, "ptl", r) == Format::PyTorchLegacy);
+  // Content nothing recognises: the extension tiebreak routes .ptl to PyTorch.
+  std::vector<uint8_t> junk = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
+  junk.resize(32, 0);
+  CHECK(detect_bytes_reason("d8b", junk, "ptl", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Extension);
+}
+
+TEST_CASE("detect #137 T-D9: a PTMF flatbuffer is routed to an honest error") {
+  std::vector<uint8_t> b = {0x1c, 0, 0, 0, 'P', 'T', 'M', 'F'};
+  b.resize(64, 0);
+  for (const char* ext : {"ptl", ""}) {
+    DetectReason r = DetectReason::None;
+    CHECK(detect_bytes_reason(std::string("d9") + ext, b, ext, r) == Format::PyTorchZip);
+    CHECK(r == DetectReason::Magic);
+  }
+  std::string path = write_temp("d9_parse", b);
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);
+  ProgressSink progress;
+  auto res = pytorch::parse_zip(*mf, progress);
+  REQUIRE_FALSE(res);
+  CHECK(res.error().message.find("flatbuffer") != std::string::npos);
+  CHECK(res.error().offset == 4);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("detect #137: a zip with neither pickle keeps the no-data.pkl error") {
+  std::string path = write_temp("nopkl", make_zip({"foo.txt"}));
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);
+  ProgressSink progress;
+  auto res = pytorch::parse_zip(*mf, progress);
+  REQUIRE_FALSE(res);
+  CHECK(res.error().message == "no data.pkl in archive");
+  std::filesystem::remove(path);
+}

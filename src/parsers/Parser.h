@@ -24,7 +24,7 @@ enum class Format : uint8_t {
   TFLite,
   SafeTensors,
   GGUF,
-  PyTorchZip,     // modern zip-based .pt/.pth/.bin
+  PyTorchZip,     // modern zip-based .pt/.pth/.bin/.ptl (incl. PyTorch Mobile lite-interpreter)
   PyTorchLegacy,  // standalone pickle
   // v0.5.0 format-breadth additions. APPEND ONLY — detection & any persisted
   // state key off the format NAME, but never renumber the existing values.

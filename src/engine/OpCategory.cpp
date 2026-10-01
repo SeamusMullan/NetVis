@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // engine/OpCategory.cpp — op_type string -> coloring category (spec §8.1).
 //
-// Pure logic, no GUI. The classification is case-insensitive on the last dot
-// segment of the op name so framework/domain prefixes ("com.microsoft.Gelu",
-// "ai.onnx.Conv") are tolerated. A single static lookup table keeps this O(1)
-// per call and puts the whole palette-driving decision in one place.
+// Pure logic, no GUI. The classification is case-insensitive on the bare op
+// name: for dotted op types the last dot segment, so framework/domain prefixes
+// ("com.microsoft.Gelu", "ai.onnx.Conv") are tolerated; for TorchScript
+// "ns::name[.overload]" op types (#137: "aten::relu_", "aten::add.Tensor",
+// "prim::If") the name after the last "::", without its overload and without
+// the trailing '_' of an in-place variant. A single static lookup table keeps
+// this O(1) per call and puts the whole palette-driving decision in one place.
 #include "engine/OpCategory.h"
 
 #include <cctype>
@@ -15,14 +18,24 @@ namespace netvis {
 
 namespace {
 
-// Lowercase copy of the last dot-segment of `op_type`. Domain prefixes such as
-// "com.microsoft." are stripped by keeping only the final segment.
+// Lowercase bare op name of `op_type` (see the file comment).
 std::string normalize(std::string_view op_type) {
-  // Keep the substring after the last '.' (the bare op name).
-  size_t dot = op_type.rfind('.');
-  std::string_view last = (dot == std::string_view::npos)
-                              ? op_type
-                              : op_type.substr(dot + 1);
+  std::string_view last;
+  size_t ns = op_type.rfind("::");
+  if (ns != std::string_view::npos) {
+    // TorchScript: "aten::add.Tensor" -> "add", "aten::relu_" -> "relu".
+    last = op_type.substr(ns + 2);
+    size_t dot = last.find('.');
+    if (dot != std::string_view::npos) last = last.substr(0, dot);
+    // In-place variants end in exactly one '_'; dunder names ("__is__") keep it.
+    if (last.size() >= 2 && last.substr(0, 2) != "__" && last.back() == '_' &&
+        last[last.size() - 2] != '_')
+      last.remove_suffix(1);
+  } else {
+    // Keep the substring after the last '.' (the bare op name).
+    size_t dot = op_type.rfind('.');
+    last = (dot == std::string_view::npos) ? op_type : op_type.substr(dot + 1);
+  }
   std::string out;
   out.reserve(last.size());
   for (char c : last)
@@ -206,6 +219,43 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"qlinearmul", OpCategory::Elementwise},
       {"qlinearaveragepool", OpCategory::Pool},
       {"qlinearglobalaveragepool", OpCategory::Pool},
+      // TorchScript aten:: names (#137), reached through the "::" rule above.
+      // Deliberately NOT mapped: addmm/baddbmm (CostModel's MatMul formula would
+      // read K from the bias input) and conv_transpose* (its Conv formula only
+      // special-cases ONNX ConvTranspose). They stay Other until an aten shape
+      // pass exists and the formulas are audited.
+      {"conv1d", OpCategory::Conv},
+      {"conv2d", OpCategory::Conv},
+      {"conv3d", OpCategory::Conv},
+      {"convolution", OpCategory::Conv},
+      {"_convolution", OpCategory::Conv},
+      {"mm", OpCategory::MatMul},
+      {"bmm", OpCategory::MatMul},
+      {"batch_norm", OpCategory::Norm},
+      {"layer_norm", OpCategory::Norm},
+      {"group_norm", OpCategory::Norm},
+      {"instance_norm", OpCategory::Norm},
+      {"relu6", OpCategory::Activation},
+      {"hardtanh", OpCategory::Activation},
+      {"leaky_relu", OpCategory::Activation},
+      {"log_softmax", OpCategory::Activation},
+      {"max_pool1d", OpCategory::Pool},
+      {"max_pool2d", OpCategory::Pool},
+      {"max_pool3d", OpCategory::Pool},
+      {"avg_pool1d", OpCategory::Pool},
+      {"avg_pool2d", OpCategory::Pool},
+      {"avg_pool3d", OpCategory::Pool},
+      {"adaptive_avg_pool1d", OpCategory::Pool},
+      {"adaptive_avg_pool2d", OpCategory::Pool},
+      {"adaptive_avg_pool3d", OpCategory::Pool},
+      {"adaptive_max_pool1d", OpCategory::Pool},
+      {"adaptive_max_pool2d", OpCategory::Pool},
+      {"adaptive_max_pool3d", OpCategory::Pool},
+      {"cat", OpCategory::Shape},
+      {"stack", OpCategory::Shape},
+      {"view", OpCategory::Shape},
+      {"permute", OpCategory::Shape},
+      {"contiguous", OpCategory::Shape},
   };
   return t;
 }

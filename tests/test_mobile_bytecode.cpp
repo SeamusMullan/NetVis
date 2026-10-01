@@ -1439,6 +1439,14 @@ TEST_CASE("T-M7 bytecode.pkl: every single-byte corruption decodes or errors") {
 TEST_CASE("T-M8 archive without data.pkl still graphs, self unbound") {
   if (!have(kMobileNoData)) return;
   ByteReader::payload_read_counter() = 0;
+  {
+    // The bytecode.pkl signal alone (no data.pkl, no extension) decides it.
+    auto mf = MappedFile::open(kMobileNoData);
+    REQUIRE(mf);
+    DetectReason reason = DetectReason::None;
+    CHECK(detect_format(*mf, "", reason) == Format::PyTorchZip);
+    CHECK(reason == DetectReason::Magic);
+  }
   auto pm = parse_ptl(kMobileNoData);
   const ir::Model& m = *pm;
   CHECK(m.has_graph);

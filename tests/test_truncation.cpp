@@ -105,6 +105,11 @@ TEST_CASE("truncation: PyTorch zip parser stays safe at every 1/8th") {
                    [](const MappedFile& f, ProgressSink& p) { return pytorch::parse_zip(f, p); });
 }
 
+TEST_CASE("truncation: PyTorch Mobile .ptl stays safe at every 1/8th") {
+  truncation_sweep("ptl", fixture("model_mobile.ptl"),
+                   [](const MappedFile& f, ProgressSink& p) { return pytorch::parse_zip(f, p); });
+}
+
 TEST_CASE("truncation: TFLite parser stays safe at every 1/8th") {
   truncation_sweep("tflite", fixture("model.tflite"),
                    [](const MappedFile& f, ProgressSink& p) { return tflite::parse(f, p); });
