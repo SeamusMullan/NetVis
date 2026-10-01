@@ -28,11 +28,19 @@ class TempFileGuard {
  public:
   explicit TempFileGuard(std::string path) : path_(std::move(path)) {}
   ~TempFileGuard() {
+    if (path_.empty()) return;  // moved-from: the new owner deletes
     std::error_code ec;
     std::filesystem::remove(path_, ec);
   }
+  // Movable, so a helper can create the guard BEFORE it writes and maps the file
+  // (a REQUIRE inside the helper then still cleans up) and hand it back together
+  // with the mapping, e.g. in a struct whose guard member is declared first.
+  TempFileGuard(TempFileGuard&& other) noexcept : path_(std::move(other.path_)) {
+    other.path_.clear();
+  }
   TempFileGuard(const TempFileGuard&) = delete;
   TempFileGuard& operator=(const TempFileGuard&) = delete;
+  TempFileGuard& operator=(TempFileGuard&&) = delete;
 
  private:
   std::string path_;

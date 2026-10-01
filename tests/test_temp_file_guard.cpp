@@ -13,6 +13,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "core/MappedFile.h"
 #include "temp_file_guard.h"
@@ -54,6 +55,25 @@ TEST_CASE("TempFileGuard: cleans up when an exception leaves the scope") {
     throw std::runtime_error("simulated REQUIRE failure");
   };
   CHECK_THROWS_AS(leave_by_exception(), std::runtime_error);
+  CHECK_FALSE(std::filesystem::exists(path));
+}
+
+TEST_CASE("TempFileGuard: ownership moves with the guard") {
+  // A helper that creates the guard first and returns it with the mapping relies
+  // on this: the moved-from guard must not delete the file early (it is still
+  // being used), and the destination must delete it exactly once at the end.
+  const std::string path = probe_path("nv_guard_moved.bin");
+  {
+    auto handed_back = [&] {
+      netvis_test::TempFileGuard local(path);
+      {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "x";
+      }
+      return netvis_test::TempFileGuard(std::move(local));
+    }();  // `local` (moved-from) is destroyed here
+    CHECK(std::filesystem::exists(path));
+  }
   CHECK_FALSE(std::filesystem::exists(path));
 }
 
