@@ -176,6 +176,7 @@ void collect_tensors(const ValuePtr& v, const std::string& prefix,
     case Value::Kind::Tensor: {
       ir::TensorRef t = v->tensor;
       t.name = model.intern(prefix);
+      if (!v->dtype_label.empty()) t.dtype_label = model.intern(v->dtype_label);
       model.flat_tensors.push_back(std::move(t));
       break;
     }

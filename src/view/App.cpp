@@ -16,6 +16,8 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -114,6 +116,44 @@ void drop_callback(GLFWwindow* window, int count, const char** paths) {
   if (count <= 0 || paths == nullptr) return;
   auto* app = static_cast<App*>(glfwGetWindowUserPointer(window));
   if (app != nullptr && paths[0] != nullptr) app->open_file(paths[0]);
+}
+
+// GLFW reports failures (no display, missing GL/EGL driver, an unsupported
+// call on the current platform) only through this callback. Without it a failed
+// glfwInit/glfwCreateWindow exits silently, which is especially opaque on Linux
+// where the backend (Wayland or X11) is picked at runtime.
+void glfw_error_callback(int code, const char* description) {
+  std::fprintf(stderr, "NetVis: GLFW error 0x%x: %s\n", code,
+               description != nullptr ? description : "(no description)");
+}
+
+// NETVIS_PLATFORM=wayland|x11 forces a GLFW backend, for the cases where the
+// runtime pick is wrong for a given machine (e.g. a compositor or GL driver
+// that misbehaves natively; x11 then goes through XWayland). Unset or any other
+// value keeps GLFW's default: Wayland when a compositor is running, else X11.
+// Must be called before glfwInit.
+void apply_platform_override() {
+  const char* want = std::getenv("NETVIS_PLATFORM");
+  if (want == nullptr || *want == '\0') return;
+  int platform = GLFW_ANY_PLATFORM;
+  if (std::strcmp(want, "wayland") == 0) {
+    platform = GLFW_PLATFORM_WAYLAND;
+  } else if (std::strcmp(want, "x11") == 0) {
+    platform = GLFW_PLATFORM_X11;
+  } else {
+    std::fprintf(stderr,
+                 "NetVis: ignoring NETVIS_PLATFORM=%s (expected wayland or x11)\n",
+                 want);
+    return;
+  }
+  if (glfwPlatformSupported(platform) == GLFW_FALSE) {
+    std::fprintf(stderr,
+                 "NetVis: NETVIS_PLATFORM=%s is not compiled into this build; "
+                 "using the default backend\n",
+                 want);
+    return;
+  }
+  glfwInitHint(GLFW_PLATFORM, platform);
 }
 
 // Try a short list of platform font files at `size`; return nullptr if none
@@ -243,6 +283,8 @@ void App::install_size_fn(Tab& tab) {
 // Initialization
 // ---------------------------------------------------------------------------
 bool App::init(const std::string& initial_path) {
+  glfwSetErrorCallback(glfw_error_callback);
+  apply_platform_override();
   if (!glfwInit()) return false;
 
   // OpenGL 3.3 core + forward-compat (matches ImGui_ImplOpenGL3 "#version 330").
@@ -250,6 +292,12 @@ bool App::init(const std::string& initial_path) {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
   glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+  // Wayland has no window-icon API: compositors look the icon (and taskbar
+  // grouping) up from the .desktop file whose name matches the app_id. The X11
+  // WM_CLASS plays the same role there. Both are ignored on other platforms.
+  glfwWindowHintString(GLFW_WAYLAND_APP_ID, "netvis");
+  glfwWindowHintString(GLFW_X11_CLASS_NAME, "netvis");
+  glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "netvis");
 
   window_ = glfwCreateWindow(1600, 1000, "NetVis", nullptr, nullptr);
   if (window_ == nullptr) {
