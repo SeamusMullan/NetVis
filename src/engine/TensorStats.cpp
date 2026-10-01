@@ -12,12 +12,14 @@
 #include "engine/TensorStats.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/ByteReader.h"
@@ -218,6 +220,46 @@ const char* npy_descr(DType d) {
 }
 
 }  // namespace
+
+std::string stats_unavailable_reason(const ir::TensorRef& t,
+                                     const ir::Model* model) {
+  if (t.dtype != DType::Unknown) return {};
+
+  std::string label;
+  if (model && t.dtype_label.valid()) label = std::string(model->str(t.dtype_label));
+  // Parsers spell these differently (SafeTensors "F8_E8M0", ONNX "float8e8m0",
+  // torch "float8_e8m0fnu", OpenVINO "f8e8m0"); compare lowercased, no '_'.
+  std::string key;
+  for (char c : label) {
+    if (c == '_') continue;
+    key.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  auto starts = [&](std::string_view p) { return key.rfind(p, 0) == 0; };
+
+  if (key == "f4" || starts("float4e2m1") || starts("f4e2m1")) {
+    return "No histogram: this tensor holds packed 4-bit FP4 (E2M1) codes. In "
+           "MXFP4 and NVFP4 each code is multiplied by a block scale stored in "
+           "a separate tensor (E8M0 per 32 values for MXFP4, FP8 E4M3 per 16 "
+           "for NVFP4), and NetVis can't reliably tell which scale tensor "
+           "belongs to this one. Without the scales the codes only take 16 "
+           "possible values, so a histogram of them would not show the real "
+           "weights.";
+  }
+  if (starts("f8e8m0") || starts("float8e8m0")) {
+    return "No histogram: this is an E8M0 tensor, the power-of-two block "
+           "scales used by MXFP4 (one per 32 values). NetVis doesn't decode "
+           "E8M0 tensors yet.";
+  }
+  if (starts("f8") || starts("float8")) {
+    return "No histogram: NetVis doesn't decode FP8 (" + label +
+           ") tensors yet. In NVFP4 checkpoints, FP8 E4M3 tensors hold the "
+           "per-16-value block scales.";
+  }
+  if (!label.empty())
+    return "No histogram: NetVis can't decode the " + label + " element type.";
+  return "No histogram: this tensor's element type is unknown, so its values "
+         "can't be decoded.";
+}
 
 Result<TensorStats> compute_tensor_stats(const ir::TensorRef& t,
                                          const MappedFile& base,

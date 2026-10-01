@@ -4,7 +4,8 @@
 // SECURITY (spec, non-negotiable): pickle is a stack VM whose GLOBAL/REDUCE
 // opcodes normally *import and call arbitrary Python*. We never execute
 // anything. Only an explicit ALLOWLIST of torch/collections symbols is
-// interpreted (rebuild_tensor, OrderedDict, Size, the *Storage types); every
+// interpreted (rebuild_tensor, OrderedDict, Size, the *Storage types, torch
+// dtype names); every
 // other global/reduce target degrades to an inert Opaque(module,name) value
 // that is recorded but never invoked. This lets us reconstruct a state_dict's
 // structure and tensor metadata without running untrusted code.
@@ -62,6 +63,9 @@ struct Value {
   std::vector<std::pair<ValuePtr, ValuePtr>> pairs;  // Dict (ordered)
   ValuePtr inner;         // Persistent -> the pid value
   ir::TensorRef tensor;   // Kind::Tensor
+  // Kind::Tensor: exact torch dtype name when ir::DType cannot express it
+  // (e.g. "float4_e2m1fn_x2"); the parser interns it as tensor.dtype_label.
+  std::string dtype_label;
 
   static ValuePtr make_none() { auto v = std::make_shared<Value>(); v->kind = Kind::None; return v; }
 };
@@ -135,5 +139,13 @@ class PickleVM {
 // element byte size. Returns false for unknown storage types.
 bool torch_storage_dtype(const std::string& storage_name, ir::DType& out_dtype,
                          uint32_t& out_elem_size);
+
+// Maps a torch dtype global name (the trailing `torch.<dtype>` argument of
+// _rebuild_tensor_v3, e.g. "float4_e2m1fn_x2") to an ir::DType and element byte
+// size. `out_label` is set to the torch name when the dtype has no ir::DType
+// (out_dtype == Unknown) and to nullptr otherwise. Returns false for unknown
+// names.
+bool torch_dtype_global(const std::string& name, ir::DType& out_dtype,
+                        uint32_t& out_elem_size, const char*& out_label);
 
 }  // namespace netvis::pytorch

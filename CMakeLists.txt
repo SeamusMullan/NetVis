@@ -237,14 +237,41 @@ if(NETVIS_BUILD_APP)
   set(GLFW_BUILD_TESTS OFF CACHE INTERNAL "")
   set(GLFW_BUILD_DOCS OFF CACHE INTERNAL "")
   set(GLFW_INSTALL OFF CACHE INTERNAL "")
-  # On Linux, GLFW 3.4 builds the Wayland backend by default, which requires
-  # wayland-scanner + Wayland dev headers not present on a stock CI image. Build
-  # the X11 backend only — it works everywhere (incl. XWayland) and drops the
-  # extra build-time dependency. NETVIS_GLFW_WAYLAND=ON re-enables both backends.
-  option(NETVIS_GLFW_WAYLAND "Also build the GLFW Wayland backend on Linux" OFF)
-  if(UNIX AND NOT APPLE AND NOT NETVIS_GLFW_WAYLAND)
-    set(GLFW_BUILD_WAYLAND OFF CACHE INTERNAL "")
+  # On Linux, build BOTH GLFW backends into one binary: GLFW picks Wayland at
+  # runtime when a Wayland compositor is running and falls back to X11 otherwise
+  # (NETVIS_PLATFORM=x11|wayland overrides that, see App::init). The Wayland
+  # backend needs wayland-scanner plus the wayland-client/-cursor/-egl and
+  # xkbcommon dev packages, so the default AUTO builds it only when those are
+  # present and otherwise keeps the X11-only build (which still runs on Wayland
+  # through XWayland). ON makes a missing dependency a configure error; OFF
+  # always skips it.
+  set(NETVIS_GLFW_WAYLAND AUTO CACHE STRING
+    "Build the GLFW Wayland backend on Linux (AUTO, ON or OFF)")
+  set_property(CACHE NETVIS_GLFW_WAYLAND PROPERTY STRINGS AUTO ON OFF)
+  if(UNIX AND NOT APPLE)
+    set(_netvis_wayland OFF)
+    if(NETVIS_GLFW_WAYLAND STREQUAL "AUTO")
+      find_package(PkgConfig QUIET)
+      find_program(NETVIS_WAYLAND_SCANNER wayland-scanner)
+      if(PKG_CONFIG_FOUND AND NETVIS_WAYLAND_SCANNER)
+        pkg_check_modules(NETVIS_WAYLAND_DEPS QUIET
+          wayland-client>=0.2.7 wayland-cursor>=0.2.7 wayland-egl>=0.2.7
+          xkbcommon>=0.5.0)
+      endif()
+      if(NETVIS_WAYLAND_DEPS_FOUND)
+        set(_netvis_wayland ON)
+      else()
+        message(STATUS "NetVis: Wayland dev packages not found; building the "
+          "GLFW X11 backend only (runs on Wayland via XWayland). Install "
+          "wayland-scanner, wayland-client/-cursor/-egl and xkbcommon dev "
+          "packages for native Wayland.")
+      endif()
+    elseif(NETVIS_GLFW_WAYLAND)
+      set(_netvis_wayland ON)
+    endif()
+    set(GLFW_BUILD_WAYLAND ${_netvis_wayland} CACHE INTERNAL "")
     set(GLFW_BUILD_X11 ON CACHE INTERNAL "")
+    message(STATUS "NetVis: GLFW Wayland backend: ${_netvis_wayland}")
   endif()
   FetchContent_MakeAvailable(glfw)
 
@@ -357,6 +384,11 @@ if(NETVIS_BUILD_APP)
   if(UNIX AND NOT APPLE)
     install(FILES ${CMAKE_SOURCE_DIR}/assets/netvis.png
             DESTINATION share/icons/hicolor/256x256/apps OPTIONAL)
+    # The desktop entry's basename must match the Wayland app_id / X11 WM_CLASS
+    # set in App::init ("netvis"): Wayland has no window-icon API, so this file
+    # is how compositors find the icon and group the window in the taskbar.
+    install(FILES ${CMAKE_SOURCE_DIR}/assets/netvis.desktop
+            DESTINATION share/applications)
   endif()
 endif()
 

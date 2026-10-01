@@ -15,6 +15,7 @@
 #include <doctest/doctest.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 
 #include "parsers/gguf/GgufBlocks.h"
@@ -23,9 +24,14 @@ using namespace netvis;
 
 namespace {
 
-// Every supported layout is QK=32; the header pins kMaxDequantBlockElems to it.
-static_assert(gguf::kMaxDequantBlockElems == 32,
-             "test assumes the frozen v0.9.1b bound");
+// NVFP4's 64-element block is the widest supported layout; the header pins
+// kMaxDequantBlockElems to it.
+static_assert(gguf::kMaxDequantBlockElems == 64,
+             "test assumes NVFP4 is the widest decodable block");
+
+// OCP MX FP4 E2M1, code -> value, straight from the spec's table (0x8 is -0).
+constexpr float kE2M1[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                             -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
 // Shared shape of every dequant_block FAILURE path: no elements written, and a
 // non-empty human explanation. Factored out so each refusal test below states
@@ -52,6 +58,12 @@ TEST_CASE("#49 ggml_type_name: decodable, K-quant, scalar, and unknown ids") {
   CHECK(gguf::ggml_type_name(9999).empty());  // id this build does not know
 }
 
+TEST_CASE("ggml_type_name: FP4 microscaling types use their upstream wire ids") {
+  // ggml.h: GGML_TYPE_MXFP4 = 39, GGML_TYPE_NVFP4 = 40.
+  CHECK(gguf::ggml_type_name(39) == "MXFP4");
+  CHECK(gguf::ggml_type_name(40) == "NVFP4");
+}
+
 // --- ggml_block_layout geometry ------------------------------------------------
 
 TEST_CASE("#49 ggml_block_layout: geometry for every decodable legacy layout") {
@@ -69,6 +81,23 @@ TEST_CASE("#49 ggml_block_layout: geometry for every decodable legacy layout") {
     CHECK(L.quantized);
     CHECK(L.dequant_supported);
   }
+}
+
+TEST_CASE("ggml_block_layout: MXFP4 and NVFP4 geometry") {
+  // block_mxfp4 = { u8 e; u8 qs[16]; }            -> 32 elems in 17 bytes
+  // block_nvfp4 = { u8 d[4]; u8 qs[32]; }          -> 64 elems in 36 bytes
+  gguf::GgmlBlockLayout mx =
+      gguf::ggml_block_layout(static_cast<uint32_t>(gguf::GgmlType::MXFP4));
+  CHECK(mx.elems_per_block == 32);
+  CHECK(mx.block_bytes == 17);
+  CHECK(mx.quantized);
+  CHECK(mx.dequant_supported);
+  gguf::GgmlBlockLayout nv =
+      gguf::ggml_block_layout(static_cast<uint32_t>(gguf::GgmlType::NVFP4));
+  CHECK(nv.elems_per_block == 64);
+  CHECK(nv.block_bytes == 36);
+  CHECK(nv.quantized);
+  CHECK(nv.dequant_supported);
 }
 
 TEST_CASE("#49 ggml_block_layout: K-quant and IQ4_NL are known but NOT decodable") {
@@ -237,6 +266,94 @@ TEST_CASE("#49 dequant_block Q8_0: int8 sign extension at the extremes") {
   CHECK(out[0] == -128.0f);
   CHECK(out[1] == 127.0f);
   for (uint32_t j = 2; j < 32; ++j) CHECK(out[j] == 0.0f);
+}
+
+TEST_CASE("dequant_block MXFP4: E8M0 scale x E2M1 with the j / j+16 interleave") {
+  // 17B = e8m0 e + u8 qs[16]. e=128 -> scale 2^(128-127) = 2.0.
+  // Same asymmetric ramp as Q4_0: low nibble of qs[j] = j, high = 15-j, so
+  // out[j] = e2m1(j)*2 and out[j+16] = e2m1(15-j)*2.
+  std::array<uint8_t, 17> block = {
+      128,                                            // e = 2^1
+      0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87,  // qs[0..7]
+      0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F,  // qs[8..15]
+  };
+  std::array<float, gguf::kMaxDequantBlockElems> out{};
+  uint32_t count = 0;
+  auto st = gguf::dequant_block(static_cast<uint32_t>(gguf::GgmlType::MXFP4),
+                                block.data(), block.size(), out.data(), &count);
+  REQUIRE(st == gguf::DequantStatus::Ok);
+  REQUIRE(count == 32);
+  for (uint32_t j = 0; j < 16; ++j) {
+    CHECK(out[j] == kE2M1[j] * 2.0f);
+    CHECK(out[j + 16] == kE2M1[15 - j] * 2.0f);
+  }
+  // Spot literals so a table typo in both places can't cancel out.
+  CHECK(out[7] == 12.0f);    // e2m1 0x7 = 6
+  CHECK(out[16] == -12.0f);  // high nibble of qs[0] = 0xF = -6
+  CHECK(out[3] == 3.0f);     // e2m1 0x3 = 1.5
+}
+
+TEST_CASE("dequant_block MXFP4: E8M0 edge scales") {
+  std::array<uint8_t, 17> block{};
+  block[1] = 0x02;  // element 0 = e2m1 0x2 = 1.0, element 16 = 0
+  std::array<float, gguf::kMaxDequantBlockElems> out{};
+  uint32_t count = 0;
+  const uint32_t mx = static_cast<uint32_t>(gguf::GgmlType::MXFP4);
+
+  block[0] = 127;  // 2^0
+  REQUIRE(gguf::dequant_block(mx, block.data(), block.size(), out.data(), &count) ==
+          gguf::DequantStatus::Ok);
+  CHECK(out[0] == 1.0f);
+
+  block[0] = 0;  // 2^-127: subnormal in float, must not flush to 0
+  REQUIRE(gguf::dequant_block(mx, block.data(), block.size(), out.data(), &count) ==
+          gguf::DequantStatus::Ok);
+  CHECK(out[0] == std::ldexp(1.0f, -127));
+
+  block[0] = 0xFF;  // the E8M0 NaN encoding
+  REQUIRE(gguf::dequant_block(mx, block.data(), block.size(), out.data(), &count) ==
+          gguf::DequantStatus::Ok);
+  CHECK(std::isnan(out[0]));
+}
+
+TEST_CASE("dequant_block NVFP4: four E4M3 sub-block scales, interleave per 16") {
+  // 36B = u8 d[4] (E4M3) + u8 qs[32]. Scales: 0x38=1.0, 0x40=2.0, 0x30=0.5,
+  // 0x3C=1.5 (exp 7, mantissa 4/8). Sub-block s owns qs[8s..8s+7]; within it
+  // low nibble of byte j is element j, high nibble element j+8. Ramp: low = j
+  // (0..7, the positive codes), high = 15-j (the negative codes).
+  std::array<uint8_t, 36> block{};
+  block[0] = 0x38;
+  block[1] = 0x40;
+  block[2] = 0x30;
+  block[3] = 0x3C;
+  for (uint32_t s = 0; s < 4; ++s)
+    for (uint32_t j = 0; j < 8; ++j)
+      block[4 + 8 * s + j] = static_cast<uint8_t>(((15 - j) << 4) | j);
+  const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f};
+
+  std::array<float, gguf::kMaxDequantBlockElems> out{};
+  uint32_t count = 0;
+  auto st = gguf::dequant_block(static_cast<uint32_t>(gguf::GgmlType::NVFP4),
+                                block.data(), block.size(), out.data(), &count);
+  REQUIRE(st == gguf::DequantStatus::Ok);
+  REQUIRE(count == 64);
+  for (uint32_t s = 0; s < 4; ++s) {
+    for (uint32_t j = 0; j < 8; ++j) {
+      CHECK(out[16 * s + j] == kE2M1[j] * scale[s]);
+      CHECK(out[16 * s + 8 + j] == kE2M1[15 - j] * scale[s]);
+    }
+  }
+  CHECK(out[7] == 6.0f);        // sub-block 0, scale 1.0
+  CHECK(out[8] == -6.0f);       // sub-block 0 high half starts at element 8
+  CHECK(out[16 + 7] == 12.0f);  // sub-block 1, scale 2.0
+  CHECK(out[32 + 7] == 3.0f);   // sub-block 2, scale 0.5
+  CHECK(out[48 + 7] == 9.0f);   // sub-block 3, scale 1.5
+}
+
+TEST_CASE("dequant_block NVFP4: ShortBuffer at 35 of 36 bytes") {
+  const std::array<uint8_t, 36> buf{};
+  check_refusal(gguf::DequantStatus::ShortBuffer,
+               static_cast<uint32_t>(gguf::GgmlType::NVFP4), buf.data(), 35);
 }
 
 // --- refusal paths --------------------------------------------------------------

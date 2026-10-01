@@ -20,6 +20,7 @@ tests/fixtures/*.wasm
 .wf/
 imgui.ini
 tests/fixtures/model.mlpackage/
+docs/ai-logs/
 
 # Python bytecode from tools/
 __pycache__/
