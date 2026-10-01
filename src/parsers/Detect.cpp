@@ -358,18 +358,13 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
       reason = DetectReason::Magic;
       return Format::Npz;
     }
-    // Ambiguous zip: the file extension breaks the tie.
-    if (ext_hint == "npz") {
-      reason = DetectReason::Extension;
-      return Format::Npz;
-    }
-    if (ext_hint == "keras") {
-      reason = DetectReason::Extension;
-      return Format::Keras;
-    }
-    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
-      reason = DetectReason::Extension;
-      return Format::PyTorchZip;
+    // Ambiguous zip: the file extension breaks the tie. Table-driven
+    // (kZipExtensionFormats in Parser.h) so no extension literal can hide here.
+    for (const ExtensionFormat& e : kZipExtensionFormats) {
+      if (ext_hint == e.ext) {
+        reason = DetectReason::Extension;
+        return e.format;
+      }
     }
     // Unknown zip contents: default to PyTorch zip (its parser errors cleanly
     // if there is no data.pkl) rather than mis-claiming a tensor format.
@@ -409,7 +404,7 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
   // two are otherwise ambiguous, so the `.mlmodel` extension is the decisive
   // tiebreaker (spec §5): a file carrying it routes to CoreML before the ONNX
   // structural sniff below could claim it.
-  if (ext_hint == "mlmodel") {
+  if (ext_hint == kCoreMLExtension) {
     reason = DetectReason::Extension;
     return Format::CoreML;
   }

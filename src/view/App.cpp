@@ -730,15 +730,6 @@ void App::handle_shortcuts() {
 // ---------------------------------------------------------------------------
 // File open / recent / inspect
 // ---------------------------------------------------------------------------
-namespace {
-// Basename for a tab title: the file name without directory. Falls back to the
-// whole path if there is no separator.
-std::string basename_of(const std::string& path) {
-  auto slash = path.find_last_of("/\\");
-  return slash == std::string::npos ? path : path.substr(slash + 1);
-}
-}  // namespace
-
 void App::open_file_dialog() {
   start_file_dialog(DialogKind::OpenModel, FileDialog::Mode::Open, "Open model",
                     "", openable_patterns(), kOpenFilterDescription);
@@ -779,8 +770,13 @@ void App::poll_file_dialog() {
   }
 }
 
-void App::open_file(const std::string& path) {
-  if (path.empty()) return;
+void App::open_file(const std::string& picked) {
+  if (picked.empty()) return;
+  // A bundle can reach here as "M.mlpackage/" (macOS chooser, or a shell's tab
+  // completion on the command line) or as "M.mlpackage" (drag-and-drop). Use one
+  // spelling so the tab title is the bundle's name and the Recent list does not
+  // hold the same model twice.
+  const std::string path = detail::strip_trailing_separators(picked);
   // #62: reuse the active tab if it is still empty (never loaded a file); else
   // open the model in a fresh tab so the current one is not clobbered. This makes
   // "Open" additive once you already have a model up, matching the tabs mental
@@ -788,7 +784,7 @@ void App::open_file(const std::string& path) {
   if (session().stage() != LoadStage::Empty || !session().path().empty())
     new_tab();
   session().open_async(path);  // non-blocking (spec §4): pipeline kicks off.
-  tabs_[active_tab_]->title = basename_of(path);
+  tabs_[active_tab_]->title = std::string(detail::basename_of(path));
   add_recent(path);
 }
 

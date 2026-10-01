@@ -13,17 +13,47 @@
 // only and already modal-but-responsive, so there the answer is ready on the
 // first poll().
 
+#include <algorithm>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "parsers/Parser.h"
+
 namespace netvis {
 
-// Pure path helpers, in the header rather than the .cpp so netvis_tests can
-// exercise them: FileDialog.cpp is GUI/platform code compiled into the `netvis`
-// target only, and the test executable links netvis_core alone.
+// Pure path/filter helpers, in the header rather than the .cpp so netvis_tests
+// can exercise them: FileDialog.cpp is GUI/platform code compiled into the
+// `netvis` target only, and the test executable links netvis_core alone.
 namespace detail {
+
+inline bool is_path_separator(char c) { return c == '/' || c == '\\'; }
+
+// Drop trailing path separators from a picked path. A macOS package (a
+// `.mlpackage` bundle) comes back from the system chooser as "/a/M.mlpackage/",
+// and callers that show the file name or compare paths as strings (tab title,
+// diff ladder, Recent list) want the same string a drag-and-drop gives. A bare
+// root ("/" or "C:\") is kept as is.
+inline std::string strip_trailing_separators(std::string s) {
+  while (s.size() > 1 && is_path_separator(s.back())) {
+    if (s.size() == 3 && s[1] == ':') break;  // "C:\" is a root; "C:" is not
+    s.pop_back();
+  }
+  return s;
+}
+
+// Last path component, ignoring trailing separators ("/a/M.mlpackage/" ->
+// "M.mlpackage"); the whole path when it has no separator. The view aliases
+// `path`, so the caller's string must outlive it.
+inline std::string_view basename_of(std::string_view path) {
+  size_t end = path.size();
+  while (end > 0 && is_path_separator(path[end - 1])) --end;
+  path = path.substr(0, end);
+  const size_t slash = path.find_last_of("/\\");
+  return slash == std::string_view::npos ? path : path.substr(slash + 1);
+}
 
 // Strip everything after the first newline (a chooser prints one path per line;
 // we never ask for multi-select) plus any trailing CR/whitespace.
@@ -54,34 +84,88 @@ inline std::string apply_default_extension(
   return path + suffix_of(patterns.front());
 }
 
+// "*.onnx" -> "*.[oO][nN][nN][xX]". The GTK and Qt choosers match a glob
+// case-sensitively on Linux, yet detection lowercases the extension, so
+// `Model.ONNX` opens by drag-and-drop but would be hidden by a plain "*.onnx"
+// filter. Only the Linux helper choosers get this (tinyfd's macOS path slices the
+// plain "*.ext" itself, so openable_patterns() stays plain). Anything that is not
+// a simple suffix glob is returned unchanged.
+inline std::string case_folded_glob(const std::string& pattern) {
+  if (suffix_of(pattern).empty()) return pattern;
+  std::string out = "*.";
+  for (size_t i = 2; i < pattern.size(); ++i) {
+    const char c = pattern[i];
+    const bool upper = c >= 'A' && c <= 'Z';
+    const bool lower = c >= 'a' && c <= 'z';
+    if (upper || lower) {
+      const char lo = upper ? static_cast<char>(c - 'A' + 'a') : c;
+      out += '[';
+      out += lo;
+      out += static_cast<char>(lo - 'a' + 'A');
+      out += ']';
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+// The space-separated, case-folded glob list the Linux helper choosers take.
+inline std::string helper_globs(const std::vector<std::string>& patterns) {
+  std::string out;
+  for (const std::string& p : patterns) {
+    if (!out.empty()) out += ' ';
+    out += case_folded_glob(p);
+  }
+  return out;
+}
+
+// kdialog takes ONE argument holding newline-separated "globs|Description"
+// entries. The model filter is followed by an "All files" entry so a format with
+// no listed extension (a WASM-plugin format, or a file detection would accept
+// under another name) can still be picked; the zenity family gets the same as a
+// second --file-filter.
+inline std::string kdialog_filter(const std::string& globs,
+                                  const std::string& description) {
+  return globs + "|" + description + "\n*|All files";
+}
+
 }  // namespace detail
 
 
-// The extensions the "open a model" choosers offer (App::open_file_dialog and the
-// DiffPanel comparison picker both build their filter from this table — do not
-// hand-maintain a second list). Lowercase, no dot. A new format adds its
-// extension HERE; tests/test_file_dialog.cpp fails if any extension the format
-// detector acts on (kExtensionFormats in parsers/Parser.h) is missing.
-//
-// "mlpackage" is not a detector extension: a CoreML bundle is a directory that
-// engine/ModelPath resolves to its inner model. macOS choosers treat a package as
-// a single file, so listing it lets the bundle be picked there; the GTK/Qt/Win32
-// choosers cannot select a directory, where drag-and-drop or the CLI argument
-// still open it.
-inline constexpr std::string_view kOpenableExtensions[] = {
-    "onnx", "tflite", "safetensors", "gguf", "pt",   "pth",       "bin",
-    "pb",   "xml",    "npz",         "keras", "h5",  "hdf5",      "mlmodel",
-    "mlpackage",      "pkl",         "pickle",
-};
+// "mlpackage" is the one extension the Open choosers offer that detect_format()
+// does not act on: a CoreML bundle is a directory that engine/ModelPath resolves
+// to its inner model, and macOS choosers treat a package as a single file, so
+// listing it lets the bundle be picked there. The GTK/Qt/Win32 choosers cannot
+// select a directory; drag-and-drop or the CLI argument still open it. Anything
+// else the detector acts on is NOT listed here - it comes from kExtensionFormats.
+inline constexpr std::string_view kDialogOnlyExtensions[] = {"mlpackage"};
 
-// First filter in the chooser, ahead of the "All files" fallback it appends.
+// Every extension the "open a model" choosers offer (App::open_file_dialog and
+// the DiffPanel comparison picker both build their filter from this): the
+// detector's own table (kExtensionFormats, parsers/Parser.h) in table order, then
+// kDialogOnlyExtensions. There is no second hand-kept list, so a format that
+// parses cannot be unpickable and a stale or misspelled entry cannot exist.
+// Lowercase, no dot.
+inline std::vector<std::string_view> openable_extensions() {
+  std::vector<std::string_view> out;
+  out.reserve(std::size(kExtensionFormats) + std::size(kDialogOnlyExtensions));
+  for (const ExtensionFormat& e : kExtensionFormats) out.push_back(e.ext);
+  for (const std::string_view ext : kDialogOnlyExtensions) {
+    if (std::find(out.begin(), out.end(), ext) == out.end()) out.push_back(ext);
+  }
+  return out;
+}
+
+// First filter in the chooser. The Linux helpers (zenity family, and kdialog)
+// and Windows follow it with an "All files" entry; macOS's chooser takes a list
+// of types only, so it shows neither this label nor an "All files" fallback.
 inline constexpr const char* kOpenFilterDescription = "All supported models";
 
-// kOpenableExtensions as chooser globs ("*.onnx", ...), in table order.
+// openable_extensions() as chooser globs ("*.onnx", ...), in the same order.
 inline std::vector<std::string> openable_patterns() {
   std::vector<std::string> out;
-  out.reserve(sizeof(kOpenableExtensions) / sizeof(kOpenableExtensions[0]));
-  for (const std::string_view ext : kOpenableExtensions) {
+  for (const std::string_view ext : openable_extensions()) {
     out.push_back("*." + std::string(ext));
   }
   return out;

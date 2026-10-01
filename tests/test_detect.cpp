@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/MappedFile.h"
@@ -141,18 +142,28 @@ TEST_CASE("detect Keras HDF5 by superblock signature") {
 }
 
 // #135: kExtensionFormats (parsers/Parser.h) is the single source for the
-// detector's extension knowledge, and the file chooser's openable list is tested
-// against it. That is only a real guard if the table is the whole truth, so check
-// each entry actually routes the way it says on content no sniffer claims.
+// detector's extension knowledge, and the file chooser's openable list is built
+// from it. That is only a real guard if the table is the whole truth, so check
+// each entry actually routes the way it says on content no sniffer claims, and
+// that the two other places detect_format() consults an extension (the .mlmodel
+// guard and the zip tiebreak) go through names the table knows about.
 TEST_CASE("detect: every kExtensionFormats entry routes ambiguous content") {
   std::vector<uint8_t> junk = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
   junk.resize(32, 0);
   for (const ExtensionFormat& e : kExtensionFormats) {
     INFO("extension: " << e.ext);
-    CHECK(detect_bytes("extmap", junk, std::string(e.ext)) == e.format);
+    // The reason matters too: the status bar's confidence signal (#45) must say
+    // the extension decided this, not "none" or a content signal.
+    DetectReason r = DetectReason::None;
+    CHECK(detect_bytes_reason("extmap", junk, std::string(e.ext), r) == e.format);
+    CHECK(r == DetectReason::Extension);
   }
-  // An extension outside the table must not claim anything.
-  CHECK(detect_bytes("extmap_none", junk, "txt") == Format::Unknown);
+  // An extension outside the table must not claim anything, and the hint is the
+  // lowercased extension: an uppercase spelling is not in the contract.
+  DetectReason r = DetectReason::Extension;
+  CHECK(detect_bytes_reason("extmap_none", junk, "txt", r) == Format::Unknown);
+  CHECK(r == DetectReason::None);
+  CHECK(detect_bytes("extmap_upper", junk, "ONNX") == Format::Unknown);
 }
 
 TEST_CASE("detect: kExtensionFormats has no dead (duplicate) entries") {
@@ -162,6 +173,119 @@ TEST_CASE("detect: kExtensionFormats has no dead (duplicate) entries") {
     for (size_t j = i + 1; j < n; ++j) {
       INFO("duplicate extension: " << kExtensionFormats[i].ext);
       CHECK(kExtensionFormats[i].ext != kExtensionFormats[j].ext);
+    }
+  }
+  const size_t z = std::size(kZipExtensionFormats);
+  for (size_t i = 0; i < z; ++i) {
+    for (size_t j = i + 1; j < z; ++j) {
+      INFO("duplicate zip extension: " << kZipExtensionFormats[i].ext);
+      CHECK(kZipExtensionFormats[i].ext != kZipExtensionFormats[j].ext);
+    }
+  }
+}
+
+namespace {
+// Format the main table assigns an extension, or Unknown when it is absent.
+Format table_format(std::string_view ext) {
+  for (const ExtensionFormat& e : kExtensionFormats) {
+    if (e.ext == ext) return e.format;
+  }
+  return Format::Unknown;
+}
+
+// A zip that starts with the local-file-header magic and, when `with_directory`,
+// carries a real central directory with one entry called `name`. The default
+// "notes.txt" is not data.pkl, config.json or a .npy, so scan_zip_names finds no
+// content signal and only the extension can break the tie.
+std::vector<uint8_t> ambiguous_zip(bool with_directory,
+                                   const std::string& name = "notes.txt") {
+  std::vector<uint8_t> b = {'P', 'K', 0x03, 0x04};
+  b.resize(30, 0);  // a (bogus but unread) local file header
+  if (!with_directory) {
+    b.resize(64, 0);
+    return b;
+  }
+  auto u16 = [&b](uint16_t v) {
+    b.push_back(static_cast<uint8_t>(v & 0xff));
+    b.push_back(static_cast<uint8_t>(v >> 8));
+  };
+  auto u32 = [&b](uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>(v >> (8 * i)));
+  };
+  const uint32_t cd_off = static_cast<uint32_t>(b.size());
+  u32(0x02014b50);                               // central directory header
+  b.resize(b.size() + 24, 0);                    // version .. uncompressed size
+  u16(static_cast<uint16_t>(name.size()));       // file name length (@28)
+  u16(0);                                        // extra length
+  u16(0);                                        // comment length
+  b.resize(b.size() + 12, 0);                    // disk, attrs, local offset
+  b.insert(b.end(), name.begin(), name.end());
+  const uint32_t cd_size = static_cast<uint32_t>(b.size()) - cd_off;
+  u32(0x06054b50);                               // end of central directory
+  u16(0);
+  u16(0);
+  u16(1);                                        // entries on this disk
+  u16(1);                                        // total entries (@10)
+  u32(cd_size);
+  u32(cd_off);                                   // central directory offset (@16)
+  u16(0);                                        // comment length
+  return b;
+}
+}  // namespace
+
+TEST_CASE("detect: the .mlmodel guard's extension is in kExtensionFormats") {
+  // The guard in detect_format() routes through kCoreMLExtension, and the chooser
+  // list is built from the table, so the two must agree on name and Format.
+  CHECK(table_format(kCoreMLExtension) == Format::CoreML);
+}
+
+TEST_CASE("detect: every kZipExtensionFormats entry is in kExtensionFormats") {
+  // A zip-only extension that the main table lacks would be detectable but
+  // hidden from the Open dialog (macOS and KDE offer no way around the filter).
+  for (const ExtensionFormat& e : kZipExtensionFormats) {
+    INFO("zip extension: " << e.ext);
+    CHECK(table_format(e.ext) == e.format);
+  }
+}
+
+TEST_CASE("detect: the synthetic zip's central directory really is scanned") {
+  // Guards the two zip tests below: the same builder with an entry the scan DOES
+  // recognise must be claimed by content, so "notes.txt" proves the tiebreak
+  // (not a malformed directory) is what decides them.
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("zip_cd_npy", ambiguous_zip(true, "arr_0.npy"), "",
+                            r) == Format::Npz);
+  CHECK(r == DetectReason::Magic);
+  CHECK(detect_bytes_reason("zip_cd_pkl", ambiguous_zip(true, "m/data.pkl"),
+                            "npz", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Magic);
+}
+
+TEST_CASE("detect: each zip tiebreak extension routes an ambiguous zip") {
+  for (const bool with_directory : {false, true}) {
+    const std::vector<uint8_t> zip = ambiguous_zip(with_directory);
+    for (const ExtensionFormat& e : kZipExtensionFormats) {
+      INFO("zip extension: " << e.ext << ", central directory: "
+                             << with_directory);
+      DetectReason r = DetectReason::None;
+      CHECK(detect_bytes_reason("zip_tie", zip, std::string(e.ext), r) ==
+            e.format);
+      CHECK(r == DetectReason::Extension);
+    }
+  }
+}
+
+TEST_CASE("detect: only kZipExtensionFormats break an ambiguous zip's tie") {
+  // `.h5` / `.onnx` on a zip is not evidence of Keras / ONNX: such a zip falls to
+  // the content default (PyTorch zip) rather than being claimed by the main table.
+  for (const bool with_directory : {false, true}) {
+    const std::vector<uint8_t> zip = ambiguous_zip(with_directory);
+    for (const char* ext : {"h5", "hdf5", "onnx", "gguf", "txt", ""}) {
+      INFO("extension: " << ext << ", central directory: " << with_directory);
+      DetectReason r = DetectReason::None;
+      CHECK(detect_bytes_reason("zip_default", zip, ext, r) ==
+            Format::PyTorchZip);
+      CHECK(r == DetectReason::ContentDefault);
     }
   }
 }

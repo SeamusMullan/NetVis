@@ -35,11 +35,13 @@ namespace netvis {
 
 namespace {
 
-// first_line / suffix_of / apply_default_extension now live in FileDialog.h so
-// netvis_tests can reach them (this TU is GUI-only and never linked into
-// netvis_core). Pulled in unqualified here to keep the call sites below intact.
+// first_line / suffix_of / apply_default_extension / strip_trailing_separators
+// now live in FileDialog.h so netvis_tests can reach them (this TU is GUI-only
+// and never linked into netvis_core). Pulled in unqualified here to keep the call
+// sites below intact.
 using detail::apply_default_extension;
 using detail::first_line;
+using detail::strip_trailing_separators;
 
 #if NETVIS_FD_HELPER_PROCESS
 
@@ -86,25 +88,26 @@ const char* helper_binary() {
   return kHelper;
 }
 
-// kdialog wants one "glob glob|Description" string; the zenity family wants a
-// repeated --file-filter=Description | glob glob.
+// kdialog wants one string of newline-separated "glob glob|Description" entries;
+// the zenity family wants a repeated --file-filter=Description | glob glob. Both
+// get the model filter followed by an "All files" entry, and both get
+// case-folded globs (detail::case_folded_glob) because their matching is
+// case-sensitive on Linux while detection is not.
 std::vector<std::string> helper_argv(const char* helper, FileDialog::Mode mode,
                                      const std::string& title,
                                      const std::string& default_path,
                                      const std::vector<std::string>& patterns,
                                      const std::string& description) {
-  std::string globs;
-  for (const std::string& p : patterns) {
-    if (!globs.empty()) globs += ' ';
-    globs += p;
-  }
+  const std::string globs = detail::helper_globs(patterns);
 
   std::vector<std::string> argv{helper};
   if (std::strcmp(helper, "kdialog") == 0) {
     argv.emplace_back(mode == FileDialog::Mode::Save ? "--getsavefilename"
                                                      : "--getopenfilename");
     argv.emplace_back(default_path.empty() ? "." : default_path);
-    if (!globs.empty()) argv.emplace_back(globs + "|" + description);
+    if (!globs.empty()) {
+      argv.emplace_back(detail::kdialog_filter(globs, description));
+    }
     if (!title.empty()) {
       argv.emplace_back("--title");
       argv.emplace_back(title);
@@ -230,6 +233,8 @@ FileDialog::FileDialog(Mode mode, const std::string& title,
         run_helper(argv, state->cancelled, state->child_pid);
     if (mode == Mode::Save)
       picked = apply_default_extension(std::move(picked), patterns);
+    else
+      picked = strip_trailing_separators(std::move(picked));
     {
       std::lock_guard<std::mutex> lock(state->mu);
       state->result = std::move(picked);
@@ -254,6 +259,8 @@ FileDialog::FileDialog(Mode mode, const std::string& title,
   std::string result = picked != nullptr ? std::string(picked) : std::string();
   if (mode == Mode::Save)
     result = apply_default_extension(std::move(result), patterns);
+  else
+    result = strip_trailing_separators(std::move(result));  // macOS package: "M.mlpackage/"
   state_->result = std::move(result);
   state_->done.store(true);
 #endif
