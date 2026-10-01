@@ -5,15 +5,33 @@
 // opcodes normally *import and call arbitrary Python*. We never execute
 // anything. Only an explicit ALLOWLIST of torch/collections symbols is
 // interpreted (rebuild_tensor, OrderedDict, Size, the *Storage types, torch
-// dtype names); every
-// other global/reduce target degrades to an inert Opaque(module,name) value
-// that is recorded but never invoked. This lets us reconstruct a state_dict's
-// structure and tensor metadata without running untrusted code.
+// dtype names, and -- #137 -- exactly five pure-identity helpers from
+// torch.jit._pickle: build_intlist / build_doublelist / build_boollist /
+// build_tensorlist return their list argument and restore_type_tag returns its
+// first argument, mirroring torch/jit/_pickle.py). Every other global/reduce
+// target degrades to an inert Opaque(module,name) value that is recorded but
+// never invoked. This lets us reconstruct a state_dict's structure and tensor
+// metadata without running untrusted code.
+//
+// Object state is RECORDED, never executed (#137): a non-allowlisted REDUCE /
+// NEWOBJ result keeps its arguments as inert data (Value::items), and BUILD on
+// such an Opaque object stores the state value in Value::inner (the last BUILD
+// wins). __setstate__ is never called. TorchScript archives pickle their module
+// objects this way (GLOBAL __torch__.<Class>, NEWOBJ, state dict, BUILD), so the
+// recorded state is what lets the parser find module parameters.
+//
+// Known and pre-existing in kind: a hostile stream can build shared_ptr CYCLES
+// through the memo (APPEND a list to itself, or BUILD an object with a state
+// that contains the object). They are leaked, never followed unboundedly: every
+// traversal of VM output is visited-gated and depth-capped, and CI runs ASan
+// with detect_leaks=0 for this reason. Do not add new cycle sources.
 //
 // The VM reads ONLY through a bounds-checked cursor; a malformed stream yields
 // a Result error with a byte offset, never an out-of-bounds read or crash. It
 // records tensor payload location (file_offset + byte_len) but NEVER reads the
-// payload bytes.
+// payload bytes. Every Value it creates is stamped with the byte offset of the
+// opcode that created it (Value::src_pos), so decoders built on top of the VM
+// can report errors at the exact spot in the stream.
 #pragma once
 
 #include <cstdint>
@@ -66,6 +84,9 @@ struct Value {
   // Kind::Tensor: exact torch dtype name when ir::DType cannot express it
   // (e.g. "float4_e2m1fn_x2"); the parser interns it as tensor.dtype_label.
   std::string dtype_label;
+  // #137, APPEND-ONLY: byte offset (within the pickle stream) of the opcode that
+  // created this value. UINT64_MAX for values built outside the VM.
+  uint64_t src_pos = UINT64_MAX;
 
   static ValuePtr make_none() { auto v = std::make_shared<Value>(); v->kind = Kind::None; return v; }
 };
@@ -82,13 +103,22 @@ struct StorageResolver {
       resolve;
 };
 
+// Optional resource caps for one VM run (#137). The default is unlimited, so
+// existing call sites keep their behavior.
+struct PickleLimits {
+  // Maximum number of Values the VM may create. Checked after every opcode;
+  // exceeding it is err("pickle value cap exceeded", <offset of that opcode>).
+  uint64_t max_values = UINT64_MAX;
+};
+
 class PickleVM {
  public:
   // `data`/`size` bound the pickle stream. `resolver` maps storage keys to
   // payload locations. The VM does not own the mmap; the caller guarantees it
   // outlives the run and any TensorRefs produced.
-  PickleVM(const uint8_t* data, uint64_t size, const StorageResolver& resolver)
-      : data_(data), size_(size), resolver_(resolver) {}
+  PickleVM(const uint8_t* data, uint64_t size, const StorageResolver& resolver,
+           PickleLimits limits = {})
+      : data_(data), size_(size), resolver_(resolver), limits_(limits) {}
 
   // Execute until STOP. Returns the top-of-stack value (the unpickled object).
   Result<ValuePtr> run();
@@ -97,8 +127,11 @@ class PickleVM {
   const uint8_t* data_;
   uint64_t size_;
   const StorageResolver& resolver_;
+  PickleLimits limits_;
 
   uint64_t pos_ = 0;
+  uint64_t op_start_ = 0;     // offset of the opcode being executed
+  uint64_t value_count_ = 0;  // Values created so far (PickleLimits::max_values)
   std::vector<ValuePtr> stack_;
   std::vector<size_t> marks_;                 // MARK positions into stack_
   std::map<int64_t, ValuePtr> memo_;
@@ -118,6 +151,10 @@ class PickleVM {
   Result<std::string> rd_bytes(uint64_t n);
   Result<std::string> rd_line();  // until '\n' (for GLOBAL, text ints)
   Result<int64_t> rd_long(uint64_t n);  // little-endian signed, n bytes
+
+  // Every Value the VM creates goes through make(): it stamps src_pos with the
+  // current opcode's offset and counts the value against limits_.max_values.
+  ValuePtr make(Value::Kind kind);
 
   // --- stack helpers ---
   Error underflow() const { return err("pickle stack underflow", pos_); }
