@@ -99,6 +99,7 @@
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
 #include "view/PanelHelpers.h"  // #56: display_index_for_node (re-select on load)
+#include "view/PlatformGestures.h"  // #158: macOS pinch + precise-scroll bridge (stub elsewhere)
 #include "view/PluginsPanel.h"
 #include "view/Onboarding.h"        // #105: empty state + Help menu
 #include "view/PreferencesPanel.h"  // #102: the unified Settings window
@@ -314,6 +315,10 @@ bool App::init(const std::string& initial_path) {
 
   ImGui_ImplGlfw_InitForOpenGL(window_, true);
   ImGui_ImplOpenGL3_Init("#version 330");
+  // #158: macOS trackpad pinch and precise-scroll detection (no-ops elsewhere).
+  // The monitor never swallows an event, so GLFW and ImGui see exactly what they
+  // saw before.
+  platform_gestures_install(window_);
 
   // Pre-bake three font handles for LOD text (spec §8.1). If no TTF is present,
   // fall back to the built-in font and reuse it for all three roles.
@@ -385,6 +390,9 @@ bool App::init(const std::string& initial_path) {
 int App::run() {
   while (!glfwWindowShouldClose(window_)) {
     glfwPollEvents();
+    // #158: take the pinch every frame, even when no canvas draws, so a pinch
+    // made over the tensor table can never be applied to a graph later.
+    frame_pinch_log_ = platform_take_pinch_log();
     // Drain EVERY tab's completions, not just the active one (#62): a background
     // tab's parse/layout/shape jobs must still land so switching to it shows a
     // finished model rather than a frozen loading state.
@@ -409,7 +417,9 @@ int App::run() {
   // cameras still exist. A no-op unless the pref is on.
   save_session_now();
 
-  // Orderly teardown: backends, context, window, GLFW.
+  // Orderly teardown: backends, context, window, GLFW. The gesture monitor goes
+  // first so its block can never run against a window that is being destroyed.
+  platform_gestures_uninstall();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
