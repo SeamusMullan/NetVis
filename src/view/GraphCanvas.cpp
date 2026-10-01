@@ -251,8 +251,8 @@ ImU32 with_alpha_mul(ImU32 col, float mul) {
 constexpr float kZoomFull = 0.70f;
 constexpr float kZoomMid = 0.30f;
 constexpr float kZoomFlat = 0.08f;
-constexpr float kMinZoom = 0.02f;
-constexpr float kMaxZoom = 4.0f;
+// kMinZoom / kMaxZoom come from view/CanvasInput.h (via App.h) since #158; a
+// local copy here would be ambiguous with netvis::kMinZoom.
 
 // Smooth ease-in-out for the fly-to animation.
 float ease(float t) { return t * t * (3.0f - 2.0f * t); }

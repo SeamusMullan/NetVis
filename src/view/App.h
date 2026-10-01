@@ -31,6 +31,7 @@
 // header is ImGui-free and cheap (it lives in netvis_core precisely so the
 // tests can link it), so including it costs nothing.
 #include "engine/ViewSnapshot.h"
+#include "view/CanvasInput.h"    // #158: WheelMode + the single kMinZoom/kMaxZoom (ImGui-free)
 #include "view/CategoryStyle.h"   // #104: accessible palette + non-colour cue
 #include "view/FileDialog.h"   // non-blocking native chooser
 #include "engine/TensorStats.h"
