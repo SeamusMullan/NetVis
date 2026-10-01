@@ -37,6 +37,7 @@
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
 #include "view/PanelHelpers.h"
+#include "view/PlatformGestures.h"  // #158: macOS precise-scroll flag (stub elsewhere)
 #include "view/TextContrast.h"  // #150: per-node label colour from the fill
 
 namespace netvis {
@@ -538,31 +539,111 @@ void draw_graph_canvas(App& app) {
                              ImGuiButtonFlags_MouseButtonRight |
                              ImGuiButtonFlags_MouseButtonMiddle);
   const bool canvas_hovered = ImGui::IsItemHovered();
+  const bool canvas_active = ImGui::IsItemActive();        // #158: the press began on the canvas
+  const bool canvas_released = ImGui::IsItemDeactivated();  // #158: ...and ended this frame
   ImGuiIO& io = ImGui::GetIO();
 
   Camera& cam = vs.cam;
 
-  // --- Input: zoom to cursor -------------------------------------------------
-  if (canvas_hovered && io.MouseWheel != 0.0f) {
-    // Keep the world point under the cursor fixed while zooming (spec §8.1).
-    ImVec2 before = screen_to_world(cam, origin, io.MousePos);
-    float factor = std::pow(1.1f, io.MouseWheel);
-    cam.zoom = std::clamp(cam.zoom * factor, kMinZoom, kMaxZoom);
-    ImVec2 after = screen_to_world(cam, origin, io.MousePos);
-    cam.pan.x += (after.x - before.x) * cam.zoom;
-    cam.pan.y += (after.y - before.y) * cam.zoom;
-    vs.animating = false;  // manual zoom cancels a fly-to.
-  }
+  // --- Input (#158: Netron-style navigation) ---------------------------------
+  // Every decision below (pan or zoom, the anchor, the clamp, hostile deltas) is
+  // made by the pure functions in view/CanvasInput.h, which netvis_tests covers.
+  // This block only reads the signals, calls them and applies the result.
+  //
+  // Precedence within a frame, top wins, each rule reading the camera the previous
+  // one left: pinch, wheel, keyboard/menu requests, drag-pan. Every one of them
+  // cancels a running fly-to (vs.animating = false) BEFORE the animation step
+  // below can write the camera, exactly as the old zoom/pan input did.
+  auto pose = [&] { return CamPose{cam.pan.x, cam.pan.y, cam.zoom}; };
+  auto set_pose = [&](const CamPose& p) {
+    cam.pan = ImVec2(p.pan_x, p.pan_y);
+    cam.zoom = p.zoom;
+  };
+  // Canvas-relative anchor for pointer zooms.
+  const float ax = io.MousePos.x - origin.x, ay = io.MousePos.y - origin.y;
 
-  // --- Input: pan (middle-drag, or space+left-drag) --------------------------
-  const bool space = ImGui::IsKeyDown(ImGuiKey_Space);
-  if (canvas_hovered &&
-      (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
-       (space && ImGui::IsMouseDragging(ImGuiMouseButton_Left)))) {
-    cam.pan.x += io.MouseDelta.x;
-    cam.pan.y += io.MouseDelta.y;
+  // A press that starts inside the minimap belongs to the minimap: it must not
+  // pan or select on the canvas underneath it.
+  ImVec2 mm_min, mm_max;
+  const bool have_mm = minimap_rect(app, mm_min, mm_max);
+  const ImVec2 lp = io.MouseClickedPos[ImGuiMouseButton_Left];
+  const bool left_press_in_mm = have_mm && lp.x >= mm_min.x && lp.x <= mm_max.x &&
+                                lp.y >= mm_min.y && lp.y <= mm_max.y;
+
+  // Pinch (macOS trackpad; 0 elsewhere). Independent of the wheel mode, like
+  // Netron's gesture handler.
+  if (canvas_hovered && app.frame_pinch_log() != 0.0f) {
+    set_pose(zoom_about(pose(), ax, ay, pinch_factor(app.frame_pinch_log())));
     vs.animating = false;
   }
+
+  // Wheel: pan or zoom per ViewState::wheel_mode.
+  if (canvas_hovered && (io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f)) {
+    WheelInput in;
+    in.wheel_x = io.MouseWheelH;
+    in.wheel_y = io.MouseWheel;
+    in.shift = io.KeyShift;
+#ifdef __APPLE__
+    constexpr bool kIsMac = true;
+#else
+    constexpr bool kIsMac = false;
+#endif
+    // On macOS ImGui has swapped the keys (KeyCtrl is Command, KeySuper is
+    // Control), so this accepts both there and only Ctrl elsewhere.
+    in.zoom_mod = wheel_zoom_modifier(io.KeyCtrl, io.KeySuper, kIsMac);
+    in.precise = platform_last_scroll_precise();
+    const WheelResult r = map_wheel(in, vs.wheel_mode);
+    if (r.action == WheelAction::Zoom) {
+      set_pose(zoom_about(pose(), ax, ay, r.zoom_factor));
+      vs.animating = false;
+    } else if (r.action == WheelAction::Pan) {
+      cam.pan.x += r.pan_dx;
+      cam.pan.y += r.pan_dy;
+      vs.animating = false;
+    }
+  }
+
+  // Keyboard / menu requests: centre-anchored, because only the canvas knows its
+  // centre. Set by App::handle_shortcuts, the View menu and the command palette.
+  if (vs.request_actual_size || vs.request_zoom_steps != 0) {
+    const float cx = canvas_size.x * 0.5f, cy = canvas_size.y * 0.5f;
+    CamPose p = pose();
+    if (vs.request_actual_size) p = zoom_to(p, cx, cy, 1.0f);
+    if (vs.request_zoom_steps != 0)
+      p = zoom_about(p, cx, cy, key_zoom_factor(vs.request_zoom_steps));
+    set_pose(p);
+    vs.animating = false;
+    vs.request_actual_size = false;
+    vs.request_zoom_steps = 0;
+  }
+  if (vs.request_pan_x != 0.0f || vs.request_pan_y != 0.0f) {
+    cam.pan.x += vs.request_pan_x;
+    cam.pan.y += vs.request_pan_y;
+    vs.animating = false;
+    vs.request_pan_x = vs.request_pan_y = 0.0f;
+  }
+
+  // Drag-pan: left (not from the minimap), middle, or Space+left. Uses the
+  // canvas item's ACTIVE state (held since a press that began on it), not hover,
+  // so the pan keeps going when the cursor leaves the canvas — Netron's pointer
+  // capture. Middle beats left when both are held.
+  static DragPanState s_drag;  // main thread only; there is one canvas
+  const ImGuiMouseButton btn =
+      ImGui::IsMouseDown(ImGuiMouseButton_Middle) ? ImGuiMouseButton_Middle
+                                                  : ImGuiMouseButton_Left;
+  const bool drag_down = canvas_active && ImGui::IsMouseDown(btn) &&
+                         !(btn == ImGuiMouseButton_Left && left_press_in_mm);
+  const ImVec2 drag_total = ImGui::GetMouseDragDelta(btn, 0.0f);
+  const PanDelta dp = drag_pan_step(s_drag, drag_down, ImGui::IsMouseDragPastThreshold(btn),
+                                    drag_total.x, drag_total.y, io.MouseDelta.x,
+                                    io.MouseDelta.y);
+  if (dp.dx != 0.0f || dp.dy != 0.0f) {
+    cam.pan.x += dp.dx;
+    cam.pan.y += dp.dy;
+    vs.animating = false;
+  }
+  if (s_drag.active) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+  const bool space = ImGui::IsKeyDown(ImGuiKey_Space);  // used by the click test below
 
   // --- Camera animation step (fly-to) ---------------------------------------
   if (vs.animating) {
@@ -1092,11 +1173,20 @@ void draw_graph_canvas(App& app) {
   };
 
   if (canvas_hovered) {
-    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !space) {
+    // #158: select on RELEASE, and only if the press began on the canvas outside
+    // the minimap and never passed the drag threshold. Selecting on press meant a
+    // drag that started on a node selected it (and dimmed the rest of the graph)
+    // before panning; now a pan never selects.
+    const bool left_click = canvas_released &&
+                            ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+                            !ImGui::IsMouseDragPastThreshold(ImGuiMouseButton_Left) &&
+                            !left_press_in_mm && !space;
+    if (left_click) {
       vs.selected_display = hover_box;  // -1 clears when clicking empty space.
       record_focus_for_display(hover_box);
     }
-    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hover_box >= 0) {
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hover_box >= 0 &&
+        !left_press_in_mm) {
       const auto& disp = session.collapse().display_nodes();
       if (static_cast<size_t>(hover_box) < disp.size()) {
         const DisplayNode& dn = disp[static_cast<size_t>(hover_box)];
