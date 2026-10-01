@@ -13,6 +13,7 @@ bytes. Output directory is argv[1] (default: <repo>/tests/fixtures).
 Formats emitted:
   model.onnx        - 3-node Conv->Relu->MatMul ONNX ModelProto with one raw_data
                       initializer and one external_data initializer (>4GB offset).
+  model_blocks.onnx - stem + 12 named repeated blocks + head (38 nodes, one collapse group, no payload).
   model.safetensors - JSON header + 36-byte payload, two F32 tensors.
   model.gguf        - GGUF v3, 2 tensors (F32 + Q4_0), 2 KV pairs, aligned data.
   model.pt          - PyTorch zip: hand-written protocol-2 pickle + storage blob.
@@ -125,6 +126,46 @@ def onnx_tensor_external(name, dims, location, offset, length):
     b += pb_len(13, onnx_sse("length", str(length)))
     b += pb_varint(14, 1)            # data_location = EXTERNAL (1)
     return bytes(b)
+
+
+def onnx_value_info(name, elem_type, dims):
+    """ValueInfoProto{name=1, type=2: TypeProto{tensor_type=1: Tensor{elem_type=1,
+    shape=2: TensorShapeProto{dim=1: Dimension{dim_value=1}}}}}."""
+    shape = bytearray()
+    for d in dims:
+        shape += pb_len(1, pb_varint(1, d))              # TensorShapeProto.dim{dim_value}
+    tensor = pb_varint(1, elem_type) + pb_len(2, bytes(shape))
+    return pb_string(1, name) + pb_len(2, pb_len(1, tensor))
+
+
+def build_onnx_blocks(n_blocks=12):
+    """#170: a stem Relu, `n_blocks` identical SiLU-residual blocks named
+    "/model/layers.{i}/..." (Sigmoid -> Mul -> Add), and a head Relu. The names
+    give CollapseTree exactly ONE name-prefix group ("/model/layers.#",
+    n_blocks instances, 3*n_blocks members); stem/head stay leaves. Declared
+    input/output [1,64] f32 so ONNX shape inference resolves every shape (the
+    Enriching path does real work). No initializers: zero payload. n_blocks=12
+    -> 38 nodes, ~4.5 KB. The --screenshot gate tests and the manual capture
+    use it; build_onnx_blocks(200) is the 602-node 'large-ish' manual variant."""
+    nodes = bytearray()
+    nodes += pb_len(1, onnx_node("Relu", "/stem/Relu", ["input"], ["/stem/Relu_output_0"]))
+    x = "/stem/Relu_output_0"
+    for i in range(n_blocks):
+        p = "/model/layers.%d" % i
+        s, m, y = p + "/act/Sigmoid_output_0", p + "/act/Mul_output_0", p + "/Add_output_0"
+        nodes += pb_len(1, onnx_node("Sigmoid", p + "/act/Sigmoid", [x], [s]))
+        nodes += pb_len(1, onnx_node("Mul", p + "/act/Mul", [x, s], [m]))
+        nodes += pb_len(1, onnx_node("Add", p + "/Add", [x, m], [y]))
+        x = y
+    nodes += pb_len(1, onnx_node("Relu", "/head/Relu", [x], ["output"]))
+    graph = bytes(nodes) + pb_string(2, "blocks_graph")
+    graph += pb_len(11, onnx_value_info("input", 1, [1, 64]))    # GraphProto.input
+    graph += pb_len(12, onnx_value_info("output", 1, [1, 64]))   # GraphProto.output
+    model = bytearray()
+    model += pb_varint(1, 1)              # ir_version (same as build_onnx)
+    model += pb_string(2, "netvis-test")  # producer_name
+    model += pb_len(7, graph)
+    return bytes(model)
 
 
 def build_onnx():
@@ -1970,6 +2011,8 @@ def main():
             f.write(data)
 
     write("model.onnx", build_onnx())
+    # #170: stem + 12 named repeated blocks + head (one collapse group, no payload).
+    write("model_blocks.onnx", build_onnx_blocks(12))
     # Write sibling weights.bin for ONNX external-data resolution test.
     # Layout: 8 bytes padding + 8 bytes resolvable data (2 F32: 5.0, 6.0).
     weights_bin = b"\x00" * 8 + struct.pack("<f", 5.0) + struct.pack("<f", 6.0)
