@@ -10,7 +10,7 @@ the content moves with the gesture. All zoom is clamped to 2% to 400%.
 | Scroll wheel, or a two-finger swipe | Pans up/down and left/right (with **Scroll wheel: Zoom**, zooms at the pointer instead) |
 | Shift + scroll | Pans sideways |
 | Ctrl + scroll | Zooms at the pointer, 1.1x per notch. On macOS, Cmd + scroll and Control + scroll both zoom |
-| Pinch (macOS trackpad) | Zooms at the pointer |
+| Pinch (macOS trackpad) | Zooms at the pointer (expected; not yet verified on hardware) |
 | Left-drag, anywhere on the canvas, including over a node | Pans. The content stays glued to the cursor once the drag passes 6 px, and the pan continues outside the canvas while the button is held |
 | Middle-drag, or Space + left-drag | Pans (same rules as left-drag) |
 | Drag in the minimap | Moves the view in the minimap only; the canvas does not pan or select |
@@ -18,8 +18,8 @@ the content moves with the gesture. All zoom is clamped to 2% to 400%.
 | Double-click | Expands or collapses a repeated block |
 | Right-click | Node context menu |
 
-On macOS, trackpad scrolling tracks your fingers 1:1 and the OS momentum carries on
-panning. On a mouse, one notch pans 80 px. Starting a pan or zoom stops any running
+On macOS, trackpad scrolling is meant to track your fingers 1:1, with the OS momentum
+carrying on panning (expected; not yet verified on hardware). On a mouse, one notch pans 80 px. Starting a pan or zoom stops any running
 fly-to animation.
 
 ## Keyboard
@@ -27,7 +27,7 @@ fly-to animation.
 | Keys | What it does |
 |---|---|
 | Shift+Up / Shift+Down | Zoom in / out about the centre of the canvas (symmetric 1.1x steps) |
-| Ctrl+= / Ctrl+- (Cmd on macOS), keypad +/- | Same |
+| Ctrl+= / Ctrl+-, or Ctrl+keypad +/- (Cmd instead of Ctrl on macOS) | Same. The keypad keys need the modifier too |
 | Shift+Backspace, Ctrl+0 (Cmd+0 on macOS) | Actual size (100%) about the centre |
 | Arrow keys | Pan 40 px per press or repeat |
 | F | Fit the whole graph |
@@ -49,8 +49,11 @@ command palette) chooses what a plain scroll does:
   preference existed. A horizontal swipe does nothing in this mode.
 
 The choice is saved in `view_prefs.json` and shared by every tab. Dragging, keys and
-click-to-select behave the same in both modes. Users upgrading from an older release see
-a one-time notice about the new default.
+click-to-select behave the same in both modes. Anyone who has used NetVis
+before (it finds a saved preferences file, recent files, a saved session or a cached
+layout) sees a one-time notice about the new default on the first launch after
+upgrading. A fresh install does not. The preferences file is only written when a
+setting changes, so its absence alone does not mean a new user.
 
 ## Compared with Netron
 
@@ -63,7 +66,7 @@ The Netron column is read from the source of `lutzroeder/netron@df0d2df` (`sourc
 | Shift + wheel | Zooms | **Pans sideways** |
 | Ctrl + wheel | Zooms, at 10x rate | Zooms, 1.1x per notch |
 | Cmd + wheel (macOS) | Pans | **Zooms** |
-| Trackpad pan / pinch | Pans / zooms at the pointer | Pans / zooms at the pointer (macOS) |
+| Trackpad pan / pinch | Pans / zooms at the pointer | Pans / zooms at the pointer (macOS; not yet verified on hardware) |
 | Left-drag | Pans, even over nodes, never selects | Same |
 | Click | Selects on release | Same |
 | Zoom keys | Shift+Up x1.1, Shift+Down x0.9 | Shift+Up x1.1, Shift+Down /1.1 |
@@ -91,7 +94,9 @@ Deliberate differences:
 
 ## Platform notes
 
-- **macOS**: pinch and 1:1 trackpad scrolling come from a small native bridge. If macOS
+- **macOS**: pinch and 1:1 trackpad scrolling come from a small native bridge (an
+  `NSEvent` monitor) that has not yet been tried on real trackpad hardware. If the monitor
+  never fires, pinch does nothing and a trackpad pans at the mouse-notch scale. If macOS
   Accessibility Zoom ("Use scroll gesture with modifier keys") is on for Control, the OS
   consumes Control + scroll first; Cmd + scroll still works.
 - **Windows**: a precision-touchpad pinch reaches NetVis as Ctrl + scroll and so should

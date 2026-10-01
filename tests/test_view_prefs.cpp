@@ -11,10 +11,13 @@
 // on; the carry itself is a two-line mapping verified by building the GUI target.
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <system_error>
 
 #include "view/ViewPrefs.h"
 
@@ -347,29 +350,187 @@ TEST_CASE("ViewPrefs: no file / malformed / non-object reports file_read=false")
   PrefsFileBackup backup;
   const ViewPrefs base = all_non_default();  // wheel_mode Zoom, dark_theme false
 
-  auto check_unread = [&](const char* label) {
+  // `expect_present`: whether a file was there to open at all (a missing file is
+  // not "present"; a malformed one is, but unusable).
+  auto check_unread = [&](const char* label, bool expect_present) {
     // Start `info` dirty to prove load_view_prefs resets it rather than leaving
     // the caller's value in place.
     ViewPrefsLoadInfo info;
+    info.file_present = !expect_present;
     info.file_read = true;
     info.wheel_mode_present = true;
     const ViewPrefs out = load_view_prefs(base, &info);
     INFO(label);
     CHECK(out.wheel_mode == base.wheel_mode);
     CHECK(out.dark_theme == base.dark_theme);
+    CHECK(info.file_present == expect_present);
     CHECK_FALSE(info.file_read);
     CHECK_FALSE(info.wheel_mode_present);
   };
 
   std::remove(view_prefs_file_path().c_str());
-  check_unread("missing file");
+  check_unread("missing file", false);
   write_raw_prefs_file("{not json");
-  check_unread("malformed");
+  check_unread("malformed", true);
   write_raw_prefs_file("[1,2]");
-  check_unread("non-object");
-  // Parses far enough to see a wheel_mode, then throws: still reported unread.
+  check_unread("non-object", true);
+  // A document cut off after a wheel_mode key. nlohmann's `f >> j` parses the whole
+  // document before any key is read, so this fails in the parser, the same path as
+  // "{not json": it is NOT a throw part-way through reading keys. Every read after
+  // the parse is type-guarded and cannot throw, so no file content reaches the
+  // catch from there; the catch exists for the parser and for a future unguarded
+  // read.
   write_raw_prefs_file(R"({"wheel_mode": "zoom", "dark_theme": )");
-  check_unread("truncated after wheel_mode");
+  check_unread("truncated document", true);
+}
+
+TEST_CASE("ViewPrefs: a usable file reports file_present too") {
+  PrefsFileBackup backup;
+  write_raw_prefs_file(R"({"dark_theme": false})");
+  ViewPrefsLoadInfo info;
+  load_view_prefs(ViewPrefs{}, &info);
+  CHECK(info.file_present);
+  CHECK(info.file_read);
+}
+
+// --- #158 upgrade notice: who counts as an existing user ------------------------
+//
+// view_prefs.json is written only when a preference changes, never at startup, so
+// "has a prefs file" is not "has used NetVis": a long-time user who never changed
+// a setting has none, and their wheel still switches from zoom to pan.
+
+namespace {
+
+// A fresh, empty directory under the system temp dir, removed on destruction. The
+// real cache dir is never touched.
+struct TempCacheDir {
+  std::filesystem::path path;
+  TempCacheDir() {
+    static int counter = 0;
+    path = std::filesystem::temp_directory_path() /
+           ("nv_prior_data_" + std::to_string(counter++) + "_" +
+            std::to_string(reinterpret_cast<uintptr_t>(this)));
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+    std::filesystem::create_directories(path);
+  }
+  ~TempCacheDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+  void touch(const std::string& name) const {
+    std::ofstream(path / name, std::ios::binary) << "x";
+  }
+  std::string str() const { return path.string(); }
+};
+
+}  // namespace
+
+TEST_CASE("ViewPrefs: has_prior_user_data sees the files an existing user has") {
+  {
+    TempCacheDir d;
+    CHECK_FALSE(has_prior_user_data(d.str()));  // a fresh install: an empty dir
+  }
+  {
+    TempCacheDir d;
+    d.touch("recent.json");  // written the first time a model is opened
+    CHECK(has_prior_user_data(d.str()));
+  }
+  {
+    TempCacheDir d;
+    d.touch("session.json");
+    CHECK(has_prior_user_data(d.str()));
+  }
+  {
+    TempCacheDir d;
+    d.touch("123456789_987654321.nvl");  // a cached layout, recent.json since deleted
+    CHECK(has_prior_user_data(d.str()));
+  }
+}
+
+TEST_CASE("ViewPrefs: has_prior_user_data ignores unrelated files and bad directories") {
+  {
+    TempCacheDir d;
+    d.touch("view_prefs.json");  // the prefs file is the OTHER signal, not this one
+    d.touch("notes.txt");
+    d.touch("layout.nvl.tmp");  // extension is .tmp, not .nvl
+    CHECK_FALSE(has_prior_user_data(d.str()));
+  }
+  {
+    TempCacheDir d;
+    // A directory that does not exist, and one that is a file, are "no evidence"
+    // rather than an error.
+    CHECK_FALSE(has_prior_user_data((d.path / "missing").string()));
+    d.touch("plain_file");
+    CHECK_FALSE(has_prior_user_data((d.path / "plain_file").string()));
+  }
+  CHECK_FALSE(has_prior_user_data(""));
+}
+
+TEST_CASE("ViewPrefs: wheel_default_action tells existing users once") {
+  auto info = [](bool present, bool read, bool wheel) {
+    ViewPrefsLoadInfo i;
+    i.file_present = present;
+    i.file_read = read;
+    i.wheel_mode_present = wheel;
+    return i;
+  };
+
+  // A file that already records the wheel mode: nothing changed for them.
+  CHECK(wheel_default_action(info(true, true, true), false) == WheelDefaultAction::None);
+  CHECK(wheel_default_action(info(true, true, true), true) == WheelDefaultAction::None);
+
+  // A file from before wheel_mode (or with a bad value): they are told.
+  CHECK(wheel_default_action(info(true, true, false), false) == WheelDefaultAction::Notify);
+  CHECK(wheel_default_action(info(true, true, false), true) == WheelDefaultAction::Notify);
+
+  // THE BUG: no prefs file, but other NetVis files exist. Before the fix this
+  // user was never told and the wheel silently switched to pan.
+  CHECK(wheel_default_action(info(false, false, false), true) == WheelDefaultAction::Notify);
+
+  // No prefs file and nothing else: a fresh install. Not told (nothing changed),
+  // but the prefs are written so the next launch is not mistaken for an upgrade.
+  CHECK(wheel_default_action(info(false, false, false), false) == WheelDefaultAction::Stamp);
+
+  // A file that exists but cannot be used is left alone, whatever else exists:
+  // overwriting it at startup would destroy what the user was editing.
+  CHECK(wheel_default_action(info(true, false, false), false) == WheelDefaultAction::None);
+  CHECK(wheel_default_action(info(true, false, false), true) == WheelDefaultAction::None);
+}
+
+TEST_CASE("ViewPrefs: the notice fires once across launches (load, act, save, load)") {
+  PrefsFileBackup backup;  // starts with no prefs file
+
+  // One launch as App::load_prefs sees it: load, decide, and save when asked.
+  // `cache` stands in for the directory holding recent.json and friends.
+  auto launch = [&](const TempCacheDir& cache) {
+    ViewPrefsLoadInfo info;
+    const ViewPrefs p = load_view_prefs(ViewPrefs{}, &info);
+    const bool prior = !info.file_present && has_prior_user_data(cache.str());
+    const WheelDefaultAction act = wheel_default_action(info, prior);
+    if (act != WheelDefaultAction::None) save_view_prefs(p);
+    return act;
+  };
+
+  {
+    // An upgrading user who never changed a setting: recent.json, no prefs file.
+    TempCacheDir cache;
+    cache.touch("recent.json");
+    CHECK(launch(cache) == WheelDefaultAction::Notify);
+    CHECK(launch(cache) == WheelDefaultAction::None);  // wheel_mode is on disk now
+    CHECK(launch(cache) == WheelDefaultAction::None);
+  }
+
+  {
+    // A fresh install that opens a model during its first session: the first
+    // launch stamps the prefs, so the recent.json written afterwards never reads
+    // as an upgrade.
+    std::remove(view_prefs_file_path().c_str());
+    TempCacheDir cache;
+    CHECK(launch(cache) == WheelDefaultAction::Stamp);
+    cache.touch("recent.json");  // the user opens a model
+    CHECK(launch(cache) == WheelDefaultAction::None);
+  }
 }
 
 TEST_CASE("ViewPrefs: a null info pointer is accepted") {

@@ -562,13 +562,25 @@ void draw_graph_canvas(App& app) {
   // Canvas-relative anchor for pointer zooms.
   const float ax = io.MousePos.x - origin.x, ay = io.MousePos.y - origin.y;
 
-  // A press that starts inside the minimap belongs to the minimap: it must not
-  // pan or select on the canvas underneath it.
+  // A press that starts on an overlay drawn over the canvas belongs to that
+  // overlay: it must not pan, select or expand on the canvas underneath it. The
+  // overlays are the minimap and the pinned-node chips. They are draw-list only, so
+  // the canvas item is what ImGui activates under them.
   ImVec2 mm_min, mm_max;
   const bool have_mm = minimap_rect(app, mm_min, mm_max);
   const ImVec2 lp = io.MouseClickedPos[ImGuiMouseButton_Left];
   const bool left_press_in_mm = have_mm && lp.x >= mm_min.x && lp.x <= mm_max.x &&
                                 lp.y >= mm_min.y && lp.y <= mm_max.y;
+  // The pinned strip acts on the PRESS (flies to the node, or unpins it), while the
+  // canvas selects on RELEASE. Without this the release would overwrite the
+  // selection the chip just made, and a drag that began on a chip would pan and
+  // cancel its fly-to. The hit-test runs ON the press frame and is latched until
+  // the next press: by the release the chip may be gone (its "x" removed the pin)
+  // or have moved, so re-testing then would answer a different question.
+  static bool s_press_on_pinned_chip = false;  // main thread only; one canvas
+  if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+    s_press_on_pinned_chip = pinned_strip_hit(app, origin, canvas_size, lp);
+  const bool left_press_in_overlay = left_press_in_mm || s_press_on_pinned_chip;
 
   // Pinch (macOS trackpad; 0 elsewhere). Independent of the wheel mode, like
   // Netron's gesture handler.
@@ -623,7 +635,7 @@ void draw_graph_canvas(App& app) {
     vs.request_pan_x = vs.request_pan_y = 0.0f;
   }
 
-  // Drag-pan: left (not from the minimap), middle, or Space+left. Uses the
+  // Drag-pan: left (not from an overlay), middle, or Space+left. Uses the
   // canvas item's ACTIVE state (held since a press that began on it), not hover,
   // so the pan keeps going when the cursor leaves the canvas — Netron's pointer
   // capture. Middle beats left when both are held.
@@ -632,7 +644,7 @@ void draw_graph_canvas(App& app) {
       ImGui::IsMouseDown(ImGuiMouseButton_Middle) ? ImGuiMouseButton_Middle
                                                   : ImGuiMouseButton_Left;
   const bool drag_down = canvas_active && ImGui::IsMouseDown(btn) &&
-                         !(btn == ImGuiMouseButton_Left && left_press_in_mm);
+                         !(btn == ImGuiMouseButton_Left && left_press_in_overlay);
   const ImVec2 drag_total = ImGui::GetMouseDragDelta(btn, 0.0f);
   const PanDelta dp = drag_pan_step(s_drag, drag_down, ImGui::IsMouseDragPastThreshold(btn),
                                     drag_total.x, drag_total.y, io.MouseDelta.x,
@@ -1174,19 +1186,19 @@ void draw_graph_canvas(App& app) {
 
   if (canvas_hovered) {
     // #158: select on RELEASE, and only if the press began on the canvas outside
-    // the minimap and never passed the drag threshold. Selecting on press meant a
-    // drag that started on a node selected it (and dimmed the rest of the graph)
-    // before panning; now a pan never selects.
-    const bool left_click = canvas_released &&
-                            ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
-                            !ImGui::IsMouseDragPastThreshold(ImGuiMouseButton_Left) &&
-                            !left_press_in_mm && !space;
+    // the overlays (minimap, pinned chips) and never passed the drag threshold.
+    // Selecting on press meant a drag that started on a node selected it (and
+    // dimmed the rest of the graph) before panning; now a pan never selects.
+    const bool left_click = canvas_click_selects(
+        canvas_released && ImGui::IsMouseReleased(ImGuiMouseButton_Left),
+        ImGui::IsMouseDragPastThreshold(ImGuiMouseButton_Left), left_press_in_overlay,
+        space);
     if (left_click) {
       vs.selected_display = hover_box;  // -1 clears when clicking empty space.
       record_focus_for_display(hover_box);
     }
     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hover_box >= 0 &&
-        !left_press_in_mm) {
+        !left_press_in_overlay) {
       const auto& disp = session.collapse().display_nodes();
       if (static_cast<size_t>(hover_box) < disp.size()) {
         const DisplayNode& dn = disp[static_cast<size_t>(hover_box)];

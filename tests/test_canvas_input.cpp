@@ -5,7 +5,9 @@
 // CMakeLists.txt) and holds every DECISION the canvas makes about input: how a
 // wheel delta becomes a pan or a zoom, which modifier wins, how the zoom anchor
 // moves the camera, how keys, a pinch and a drag map to the camera, and how each
-// of those survives a NaN, an Inf or a huge delta from a driver.
+// of those survives a NaN, an Inf or a huge delta from a driver. It also covers
+// whether a click selects and the pinned-strip chip layout the canvas hit-tests, so
+// a press on an overlay is not also treated as a canvas click.
 //
 // What is NOT covered, and why: the ImGui and GLFW glue in GraphCanvas.cpp and
 // App.cpp (reading io.MouseWheel, IsItemActive, the menu items) and the macOS
@@ -482,4 +484,101 @@ TEST_CASE("CanvasInput: a new drag starts fresh") {
   d = drag_pan_step(st, true, true, 7, 0, 7, 0);
   CHECK(d.dx == 7.0f);
   CHECK(st.active);
+}
+
+// --- Overlay press ownership (the pinned-strip chips) --------------------------
+//
+// The pinned strip acts on the left PRESS, and the canvas selects on RELEASE. If
+// the canvas did not know a press began on a chip, its release would overwrite the
+// selection the chip had just made (a regression of #19 that #158 introduced).
+// GraphCanvas.cpp keeps the latch; what it asks is below.
+
+TEST_CASE("CanvasInput: rect_contains is inclusive and rejects NaN") {
+  const ScreenRect r{10.0f, 20.0f, 30.0f, 40.0f};
+  CHECK(rect_contains(r, 10.0f, 20.0f));  // every edge counts, as for the minimap
+  CHECK(rect_contains(r, 30.0f, 40.0f));
+  CHECK(rect_contains(r, 20.0f, 30.0f));
+  CHECK_FALSE(rect_contains(r, 9.99f, 30.0f));
+  CHECK_FALSE(rect_contains(r, 30.01f, 30.0f));
+  CHECK_FALSE(rect_contains(r, 20.0f, 19.99f));
+  CHECK_FALSE(rect_contains(r, 20.0f, 40.01f));
+  CHECK_FALSE(rect_contains(r, kNaN, 30.0f));
+  CHECK_FALSE(rect_contains(r, 20.0f, kNaN));
+  CHECK_FALSE(rect_contains(r, kInf, 30.0f));
+}
+
+TEST_CASE("CanvasInput: canvas_click_selects needs a clean canvas release") {
+  // The ordinary click: released, never dragged, not on an overlay, no Space.
+  CHECK(canvas_click_selects(true, false, false, false));
+  // No release this frame.
+  CHECK_FALSE(canvas_click_selects(false, false, false, false));
+  // A press that became a drag pans, it never selects.
+  CHECK_FALSE(canvas_click_selects(true, true, false, false));
+  // Space+click is a pan gesture.
+  CHECK_FALSE(canvas_click_selects(true, false, false, true));
+  // THE REGRESSION: a click on a pinned chip (or the minimap) was acted on at the
+  // press by the overlay. The canvas must not also select on the release, which
+  // would clear the selection the chip made (hover_box is -1 over empty canvas) or
+  // replace it with whatever node lies under the chip.
+  CHECK_FALSE(canvas_click_selects(true, false, true, false));
+}
+
+TEST_CASE("CanvasInput: pinned strip layout places chips left to right") {
+  // line_h 16, so a chip is text + 2*6 + 16 wide and 16 + 6 = 22 tall.
+  PinnedStripLayout layout(100.0f, 50.0f, 1000.0f, 16.0f);
+  PinnedChip a, b;
+  REQUIRE(layout.next(40.0f, a));
+  REQUIRE(layout.next(60.0f, b));
+
+  CHECK(a.box.min_x == 106.0f);  // origin + padding
+  CHECK(a.box.min_y == 56.0f);
+  CHECK(a.box.max_x == 106.0f + 40.0f + 12.0f + 16.0f);
+  CHECK(a.box.max_y == 56.0f + 22.0f);
+  CHECK(a.remove_x == a.box.max_x - 16.0f);  // the "x" target is the last line_h
+
+  CHECK(b.box.min_x == a.box.max_x + 6.0f);  // one gap after the previous chip
+  CHECK(b.box.min_y == a.box.min_y);
+  CHECK(b.box.max_x == b.box.min_x + 60.0f + 12.0f + 16.0f);
+}
+
+TEST_CASE("CanvasInput: pinned strip stops at the right edge but always places one") {
+  // Canvas 200 wide: the right limit is 100 + 200 - 6 = 294.
+  PinnedStripLayout layout(100.0f, 0.0f, 200.0f, 16.0f);
+  PinnedChip c;
+  REQUIRE(layout.next(80.0f, c));  // 106 .. 214
+  CHECK(c.box.max_x == 214.0f);
+  CHECK_FALSE(layout.next(80.0f, c));  // 220 + 108 = 328 > 294: does not fit
+  // The refusal consumed nothing: a narrower chip still fits where it would go.
+  REQUIRE(layout.next(10.0f, c));
+  CHECK(c.box.min_x == 220.0f);
+
+  // The first chip is placed even when wider than the whole canvas.
+  PinnedStripLayout tiny(0.0f, 0.0f, 20.0f, 16.0f);
+  REQUIRE(tiny.next(500.0f, c));
+  CHECK(c.box.min_x == 6.0f);
+  CHECK_FALSE(tiny.next(1.0f, c));
+}
+
+TEST_CASE("CanvasInput: a press on a pinned chip is found, one beside it is not") {
+  PinnedStripLayout layout(0.0f, 0.0f, 1000.0f, 16.0f);
+  PinnedChip a, b;
+  REQUIRE(layout.next(40.0f, a));
+  REQUIRE(layout.next(60.0f, b));
+
+  auto on_a_chip = [&](float x, float y) {
+    return rect_contains(a.box, x, y) || rect_contains(b.box, x, y);
+  };
+  const float mid_y = (a.box.min_y + a.box.max_y) * 0.5f;
+
+  CHECK(on_a_chip(a.box.min_x + 5.0f, mid_y));  // label of the first chip
+  CHECK(on_a_chip(b.box.min_x + 5.0f, mid_y));  // label of the second
+  CHECK(on_a_chip(a.remove_x + 1.0f, mid_y));   // its "x" target
+  CHECK_FALSE(on_a_chip(a.box.max_x + 3.0f, mid_y));                // the gap between chips
+  CHECK_FALSE(on_a_chip(a.box.min_x + 5.0f, a.box.max_y + 4.0f));   // canvas below the strip
+  CHECK_FALSE(on_a_chip(b.box.max_x + 20.0f, mid_y));               // canvas right of the last chip
+  CHECK_FALSE(on_a_chip(a.box.min_x - 3.0f, mid_y));                // left padding
+
+  // The remove target sits strictly inside the chip, so both targets exist.
+  CHECK(a.remove_x > a.box.min_x);
+  CHECK(a.remove_x < a.box.max_x);
 }

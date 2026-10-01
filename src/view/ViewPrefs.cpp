@@ -10,6 +10,7 @@
 // must keep loading.
 #include "view/ViewPrefs.h"
 
+#include <filesystem>
 #include <fstream>
 
 #include <nlohmann/json.hpp>
@@ -59,6 +60,14 @@ void read_bool(const nlohmann::json& j, const char* key, bool& dst) {
 constexpr float kUiScaleMin = 0.75f;
 constexpr float kUiScaleMax = 2.0f;
 
+// Whether `p` exists. Any error (a permissions problem, a dangling link) counts as
+// "no": the notice this feeds is a courtesy, and a probe that cannot tell must not
+// invent an upgrade.
+bool path_exists(const std::filesystem::path& p) {
+  std::error_code ec;
+  return std::filesystem::exists(p, ec) && !ec;
+}
+
 }  // namespace
 
 std::string view_prefs_file_path() {
@@ -106,6 +115,44 @@ void save_view_prefs(const ViewPrefs& p) {
   if (f) f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
+bool has_prior_user_data(const std::string& cache_dir) {
+  namespace fs = std::filesystem;
+  // An empty path would make "recent.json" resolve against the working directory.
+  if (cache_dir.empty()) return false;
+  const fs::path dir(cache_dir);
+  // The two small files NetVis keeps next to the prefs. recent.json is written the
+  // first time a model is opened; session.json by the opt-in session restore.
+  if (path_exists(dir / "recent.json") || path_exists(dir / "session.json"))
+    return true;
+  // A cached layout (`<hash>_<hash>.nvl`) means a model was opened here too, even
+  // if recent.json was since deleted. The scan stops at the first hit, so a cache
+  // with thousands of layouts costs one directory entry, not one per layout.
+  std::error_code ec;
+  fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+  if (ec) return false;
+  for (const fs::directory_iterator end; it != end; it.increment(ec)) {
+    if (it->path().extension() == ".nvl") return true;
+  }
+  return false;  // also reached when an increment fails: the iterator becomes end
+}
+
+WheelDefaultAction wheel_default_action(const ViewPrefsLoadInfo& info,
+                                        bool prior_user_data) {
+  // A usable file that already says what the wheel does: nothing changed for them.
+  if (info.file_read && info.wheel_mode_present) return WheelDefaultAction::None;
+  // A usable file from before wheel_mode existed, or with a bad wheel_mode value:
+  // the user has been here, and the wheel used to zoom.
+  if (info.file_read) return WheelDefaultAction::Notify;
+  // A file that exists but could not be used (malformed, not an object). Leave it
+  // alone: rewriting it at startup would destroy whatever the user was editing, and
+  // the first preference they change rewrites it anyway.
+  if (info.file_present) return WheelDefaultAction::None;
+  // No prefs file. view_prefs.json is only written when a preference CHANGES, so a
+  // user who never touched a setting has none, and their wheel still switches from
+  // zoom to pan. Other NetVis files say whether they have been here before.
+  return prior_user_data ? WheelDefaultAction::Notify : WheelDefaultAction::Stamp;
+}
+
 ViewPrefs load_view_prefs(const ViewPrefs& base) {
   return load_view_prefs(base, nullptr);
 }
@@ -116,12 +163,19 @@ ViewPrefs load_view_prefs(const ViewPrefs& base, ViewPrefsLoadInfo* info) {
   if (info) *info = ViewPrefsLoadInfo{};
   ViewPrefs p = base;
   std::ifstream f(view_prefs_file_path());
-  if (!f) return p;
+  if (!f) {
+    // Missing, or present but unreadable (permissions): only the first is a fresh
+    // install, and an unreadable file must not be mistaken for it.
+    if (info) info->file_present = path_exists(view_prefs_file_path());
+    return p;
+  }
+  if (info) info->file_present = true;
   try {
     nlohmann::json j;
     f >> j;
     if (!j.is_object()) return base;
     ViewPrefsLoadInfo seen;
+    seen.file_present = true;
     seen.file_read = true;
 
     read_bool(j, "dark_theme", p.dark_theme);

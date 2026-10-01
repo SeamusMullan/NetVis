@@ -148,6 +148,55 @@ float accumulate_pinch_log(float acc, double magnification);
 // (1 + m_i) equals exp(sum of log1p(m_i)), so the zoom follows finger spread 1:1.
 float pinch_factor(float acc_log);
 
+// --- Click and overlay press ownership ----------------------------------------
+
+// A screen-space rectangle in plain floats (ImVec2 is deliberately not used here).
+struct ScreenRect {
+  float min_x = 0.0f, min_y = 0.0f, max_x = 0.0f, max_y = 0.0f;
+};
+// Inclusive on all four edges (the same test the minimap and the pinned strip
+// have always used). A NaN coordinate is outside every rectangle.
+bool rect_contains(const ScreenRect& r, float x, float y);
+
+// Sizes of the pinned-node strip drawn along the canvas top edge (GraphNav.cpp).
+inline constexpr float kPinnedStripPad = 6.0f;  // canvas edge and chip inner padding
+inline constexpr float kPinnedStripGap = 6.0f;  // between chips
+
+// One chip of the strip. `remove_x` is where its "x" (remove pin) target starts:
+// a press in [box.min_x, remove_x) flies to the node, one in [remove_x, box.max_x]
+// removes the pin.
+struct PinnedChip {
+  ScreenRect box;
+  float remove_x = 0.0f;
+};
+
+// Lays the pinned-node chips out left to right. The strip DRAWS from this and the
+// canvas HIT-TESTS with it, so a press the strip acts on and a press the canvas
+// ignores are decided by the same rectangles and cannot drift apart (#173 review:
+// the canvas used to select on release over the node a chip had just selected).
+// Pure: the caller measures each label (ImGui::CalcTextSize) and passes the width.
+struct PinnedStripLayout {
+  PinnedStripLayout(float origin_x, float origin_y, float canvas_w, float line_h)
+      : origin_x_(origin_x), origin_y_(origin_y), canvas_w_(canvas_w),
+        line_h_(line_h), next_x_(origin_x + kPinnedStripPad) {}
+  // Place the next chip. Returns false, and places nothing, when it would overflow
+  // the canvas width; the strip is a single row, so the caller stops there. The
+  // FIRST chip is always placed, however wide.
+  bool next(float text_w, PinnedChip& out);
+
+ private:
+  float origin_x_, origin_y_, canvas_w_, line_h_, next_x_;
+};
+
+// Whether a left-button release is a click that selects (or, on empty space,
+// clears) the node under the pointer. `released`: the canvas item was active and
+// the left button went up this frame. `press_owned_by_overlay`: the press began on
+// the minimap or a pinned-strip chip, which acted on the press itself and so must
+// not also select on release. A press that became a drag, or Space+click (a pan
+// gesture), never selects.
+bool canvas_click_selects(bool released, bool past_drag_threshold,
+                          bool press_owned_by_overlay, bool space_held);
+
 // --- Drag --------------------------------------------------------------------
 
 // Advance a drag-to-pan by one frame and return the pan to apply. The press

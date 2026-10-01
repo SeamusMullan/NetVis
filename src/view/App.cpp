@@ -1639,18 +1639,24 @@ void App::load_prefs() {
   const ViewPrefs p = load_view_prefs(base, &info);
   apply_prefs_to_view(p, view());
   plugin_enabled_ = p.plugins;
-  // #158: a prefs file that parsed but has no "wheel_mode" was written by a
-  // release where the wheel always zoomed. The default is now Pan, so say so once.
-  // A fresh install (no file) never sees this, and the save below writes
-  // "wheel_mode" so the notice appears exactly once.
-  if (info.file_read && !info.wheel_mode_present) {
+  // #158: the wheel default changed from zoom to pan, so an existing user is told
+  // once. "Existing" is NOT "has a view_prefs.json": that file is written only when
+  // a preference changes, so many long-time users never had one. The decision,
+  // including the probe for other NetVis files (recent.json, session.json, cached
+  // layouts, which load_recent has not read yet), is in view/ViewPrefs.cpp so it is
+  // tested; this only acts on it. Both actions save the prefs, which writes
+  // "wheel_mode", so neither can repeat.
+  const bool prior_data =
+      !info.file_present && has_prior_user_data(layout_cache_dir());
+  const WheelDefaultAction act = wheel_default_action(info, prior_data);
+  if (act == WheelDefaultAction::Notify) {
     add_toast("Scrolling now pans the graph, like Netron. Zoom with Ctrl+scroll "
               "(Cmd+scroll on macOS). View > Scroll wheel > Zoom restores the old "
               "behaviour.",
               false);
     toasts_.back().ttl = 15.0f;
-    save_prefs();
   }
+  if (act != WheelDefaultAction::None) save_prefs();
 }
 
 void App::reload_plugins() {

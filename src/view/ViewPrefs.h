@@ -35,6 +35,7 @@
 // App.cpp (the same split ViewHistory.h uses for capture_view/apply_view).
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -87,13 +88,46 @@ void save_view_prefs(const ViewPrefs& p);
 // parsed, but has no `wheel_mode`, was written by a release where the wheel always
 // zoomed, and that user deserves to be told the default changed.
 struct ViewPrefsLoadInfo {
+  // The file exists, whether or not it could be read or parsed. Distinguishes "no
+  // file" (a fresh install, or a user who never changed a setting) from "a file we
+  // could not use", which must not be overwritten at startup.
+  bool file_present = false;
   // The file was opened AND parsed as a JSON object. False for a missing,
-  // unreadable, malformed or non-object file (a fresh install is not an upgrade).
+  // unreadable, malformed or non-object file.
   bool file_read = false;
   // `wheel_mode` was a string that wheel_mode_from_name() accepts. A wrong-typed,
   // unknown or wrong-case value is reported as absent, so it is rewritten too.
   bool wheel_mode_present = false;
 };
+
+// Whether the cache directory shows NetVis has been used here before: a
+// recent.json, a session.json, or a cached layout (`*.nvl`). Needed because
+// view_prefs.json is written ONLY when a preference changes (never at startup), so
+// a long-time user who never touched a setting has no prefs file at all and looks
+// exactly like a fresh install through it. Only the cheap checks above; it never
+// reads or parses any of them. `cache_dir` is a parameter so tests can use a temp
+// directory; production passes layout_cache_dir().
+bool has_prior_user_data(const std::string& cache_dir);
+
+// What App::load_prefs should do about the #158 change of the wheel default.
+enum class WheelDefaultAction : uint8_t {
+  // Nothing to say and nothing to write.
+  None,
+  // An existing user, whose wheel used to zoom and now pans: show the one-time
+  // notice and save the prefs, which writes `wheel_mode` so it appears only once.
+  Notify,
+  // A fresh install: no notice (nothing changed for them), but save the prefs so
+  // the NEXT launch finds a file with `wheel_mode` and does not mistake a user who
+  // has since opened a model (and so has a recent.json) for an upgrade.
+  Stamp,
+};
+
+// Pure decision from what load_view_prefs() reported and whether
+// has_prior_user_data() found anything. `prior_user_data` only matters when there
+// is no prefs file, so a caller may pass false without probing when
+// `info.file_present`.
+WheelDefaultAction wheel_default_action(const ViewPrefsLoadInfo& info,
+                                        bool prior_user_data);
 
 // Read view_prefs.json OVER `base`. Every key that is absent, of the wrong type,
 // or out of range leaves the corresponding field of `base` untouched — so an

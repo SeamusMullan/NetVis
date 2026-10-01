@@ -187,4 +187,27 @@ PanDelta drag_pan_step(DragPanState& st, bool button_down, bool past_threshold,
   return d;
 }
 
+bool rect_contains(const ScreenRect& r, float x, float y) {
+  return x >= r.min_x && x <= r.max_x && y >= r.min_y && y <= r.max_y;
+}
+
+bool PinnedStripLayout::next(float text_w, PinnedChip& out) {
+  const float chip_w = text_w + 2.0f * kPinnedStripPad + line_h_;  // label + "x" target
+  // Same overflow rule the strip always had: stop at the first chip that would
+  // cross the right padding, but never refuse the first one.
+  if (next_x_ + chip_w > origin_x_ + canvas_w_ - kPinnedStripPad &&
+      next_x_ > origin_x_ + kPinnedStripPad)
+    return false;
+  const float y = origin_y_ + kPinnedStripPad;
+  out.box = ScreenRect{next_x_, y, next_x_ + chip_w, y + line_h_ + 6.0f};
+  out.remove_x = out.box.max_x - line_h_;
+  next_x_ += chip_w + kPinnedStripGap;
+  return true;
+}
+
+bool canvas_click_selects(bool released, bool past_drag_threshold,
+                          bool press_owned_by_overlay, bool space_held) {
+  return released && !past_drag_threshold && !press_owned_by_overlay && !space_held;
+}
+
 }  // namespace netvis
