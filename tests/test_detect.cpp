@@ -126,6 +126,109 @@ TEST_CASE("detect CoreML by .mlmodel extension tiebreaker") {
   CHECK(detect_bytes("coreml", b, "mlmodel") == Format::CoreML);
 }
 
+TEST_CASE("detect CoreML wins over the SavedModel sniff on a real .mlmodel (#114)") {
+  // REGRESSION. The hand-built buffer above kept passing while every REAL
+  // .mlmodel broke, because it carries no `description` (field 2):
+  // looks_like_saved_model rejects it at its second tag (field 500, not field 2)
+  // and so never got as far as being mistaken for a SavedModel. A real CoreML
+  // Model always has one:
+  //   field 1 specificationVersion (varint)  ->  SavedModel's schema_version
+  //   field 2 description (len-delimited)    ->  SavedModel's meta_graphs[0]
+  //   ... whose own first field is len-delimited (input) -> MetaGraphDef's
+  // which satisfies the SavedModel prefix check exactly. #107 placed the
+  // TensorFlow sniff ahead of the .mlmodel guard, so those files were handed to
+  // the TensorFlow parser and died with "SavedModel meta_graph carries no
+  // graph_def". Assert against the shipped fixture, not a synthetic buffer: the
+  // whole point is that the synthetic one was not representative.
+  auto mf = MappedFile::open("tests/fixtures/model.mlmodel");
+  REQUIRE_MESSAGE(mf, "fixture missing; run tools/gen_fixtures.py");
+  CHECK(detect_format(*mf, "mlmodel") == Format::CoreML);
+
+  DetectReason reason = DetectReason::None;
+  CHECK(detect_format(*mf, "mlmodel", reason) == Format::CoreML);
+  CHECK(reason == DetectReason::Extension);
+}
+
+TEST_CASE("detect CoreML from content alone, without the .mlmodel suffix (#114)") {
+  // The extension is a tiebreaker, not the signal. A CoreML Model carries its
+  // `oneof Type` at a field number >= 200 that no SavedModel / GraphDef / ONNX
+  // ModelProto ever uses, so a renamed file is still recognised. Before the
+  // content check, every one of these hints sent the shipped fixture to the
+  // TensorFlow parser ("SavedModel meta_graph carries no graph_def").
+  auto mf = MappedFile::open("tests/fixtures/model.mlmodel");
+  REQUIRE_MESSAGE(mf, "fixture missing; run tools/gen_fixtures.py");
+  for (const char* ext : {"", "bin", "pb", "onnx", "txt"}) {
+    CAPTURE(ext);
+    DetectReason reason = DetectReason::None;
+    CHECK(detect_format(*mf, ext, reason) == Format::CoreML);
+    CHECK(reason == DetectReason::Structure);
+  }
+}
+
+TEST_CASE("detect CoreML mlProgram spec without the suffix is CoreML, not ONNX (#114)") {
+  // The .mlpackage's inner spec has no `description` at all - (1,varint) then the
+  // mlProgram at field 502 - so it matched the ONNX sniff (field 1 varint) when
+  // the extension was absent. A Manifest.json may name its inner spec anything.
+  auto mf = MappedFile::open(
+      "tests/fixtures/model.mlpackage/Data/com.apple.CoreML/model.mlmodel");
+  REQUIRE_MESSAGE(mf, "fixture missing; run tools/gen_fixtures.py");
+  DetectReason reason = DetectReason::None;
+  CHECK(detect_format(*mf, "", reason) == Format::CoreML);
+  CHECK(reason == DetectReason::Structure);
+}
+
+TEST_CASE("detect CoreML with a description field, synthetic (#114)") {
+  // The smallest buffer with the shape of a real .mlmodel: a version, a
+  // non-empty description whose first field is length-delimited (the shape the
+  // SavedModel prefix check accepts), then the neuralNetwork at field 500.
+  std::vector<uint8_t> b = {0x08, 0x04,                   // specificationVersion = 4
+                            0x12, 0x03, 0x0a, 0x01, 'x',  // description{ input: "x" }
+                            0xa2, 0x1f, 0x00};            // neuralNetwork (500), empty
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("coreml_desc_ext", b, "mlmodel", r) == Format::CoreML);
+  CHECK(r == DetectReason::Extension);
+  CHECK(detect_bytes_reason("coreml_desc_noext", b, "", r) == Format::CoreML);
+  CHECK(r == DetectReason::Structure);
+}
+
+TEST_CASE("detect frozen GraphDef is TensorFlow even when named .mlmodel") {
+  // GraphDef's field 1 is a length-delimited NodeDef and CoreML's is a varint, so
+  // the GraphDef sniff cannot collide with CoreML and keeps winning over the
+  // extension: the content is unambiguous.
+  auto mf = MappedFile::open("tests/fixtures/model_frozen.pb");
+  REQUIRE_MESSAGE(mf, "fixture missing");
+  DetectReason reason = DetectReason::None;
+  CHECK(detect_format(*mf, "mlmodel", reason) == Format::TensorFlow);
+  CHECK(reason == DetectReason::Structure);
+}
+
+TEST_CASE("detect: a SavedModel-shaped prefix with another top-level field is not TensorFlow") {
+  // SavedModel's top level is only fields 1 and 2. A buffer that opens like one
+  // but then carries an ONNX ModelProto's graph (field 7) is ONNX.
+  std::vector<uint8_t> b = {0x08, 0x01,                   // schema_version / ir_version = 1
+                            0x12, 0x03, 0x0a, 0x01, 'x',  // field 2: looks like meta_graphs[0]
+                            0x3a, 0x02, 0x00, 0x00};      // field 7 (graph), 2 bytes
+  CHECK(detect_bytes("saved_model_shaped_onnx", b, "") == Format::ONNX);
+}
+
+TEST_CASE("detect: hostile length varints do not wrap past the bounds check") {
+  // A length of 2^64-1 makes `offset + length` wrap to a small number, which the
+  // naive `offset + length > size` check lets through. The NodeDef sniff would
+  // then run with a "size" of 2^64-1 and trust the next length it finds.
+  // Detection must reject these instead of guessing a format.
+  const std::vector<uint8_t> huge = {0xff, 0xff, 0xff, 0xff, 0xff,
+                                     0xff, 0xff, 0xff, 0xff, 0x01};  // 2^64-1
+  std::vector<uint8_t> graph_def = {0x0a};  // field 1, length-delimited
+  graph_def.insert(graph_def.end(), huge.begin(), huge.end());
+  graph_def.insert(graph_def.end(), {0x0a, 0x01, 'a', 0x12, 0x01, 'b'});
+  CHECK(detect_bytes("huge_len_graphdef", graph_def, "") == Format::Unknown);
+
+  std::vector<uint8_t> onnx_like = {0x12};  // field 2 (producer_name), length-delimited
+  onnx_like.insert(onnx_like.end(), huge.begin(), huge.end());
+  onnx_like.insert(onnx_like.end(), {0x3a, 0x02, 0x00, 0x00});
+  CHECK(detect_bytes("huge_len_onnx", onnx_like, "") == Format::Unknown);
+}
+
 TEST_CASE("detect Unknown on random bytes") {
   std::vector<uint8_t> b = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
   b.resize(32, 0);
