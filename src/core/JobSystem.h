@@ -46,11 +46,36 @@ class JobSystem {
 
   // Queue work to run on a background thread.
   void submit(std::function<void()> job) {
+    // Counted BEFORE the push: a worker can only decrement a job that was
+    // already counted (see idle()).
+    in_flight_.fetch_add(1, std::memory_order_acq_rel);
     {
       std::lock_guard<std::mutex> lk(job_mu_);
       jobs_.push(std::move(job));
     }
     job_cv_.notify_one();
+  }
+
+  // True when nothing is queued, nothing is running, and no completion is left
+  // to drain (#170: the `--screenshot` capture gate waits on this instead of on
+  // LoadStage labels, which have been wrong before).
+  //
+  // Meaningful on the main thread AFTER drain_completions()/ModelSession::update():
+  // a drained completion may submit() more work, and that is counted
+  // synchronously, so a loop of {update; idle()} cannot slip between a job and
+  // its follow-up.
+  //
+  // ORDER MATTERS. A job posts its completion (under done_mu_) BEFORE it
+  // returns, and the worker decrements in_flight_ only AFTER it returns. So
+  // reading in_flight_ == 0 (acquire) guarantees every completion that job
+  // posted is already visible in the queue, and the queue check that follows
+  // cannot miss it. The reverse order has a hole: see the queue empty, then a
+  // job posts and decrements, then see 0, and report idle with a completion
+  // still pending.
+  bool idle() const {
+    if (in_flight_.load(std::memory_order_acquire) != 0) return false;
+    std::lock_guard<std::mutex> lk(done_mu_);
+    return completions_.empty();
   }
 
   // Called by a worker (via a job) to hand a result back to the main thread.
@@ -101,6 +126,8 @@ class JobSystem {
         jobs_.pop();
       }
       job();
+      // After job() returns: its completion (if any) is already queued.
+      in_flight_.fetch_sub(1, std::memory_order_acq_rel);
     }
   }
 
@@ -111,8 +138,12 @@ class JobSystem {
   std::queue<std::function<void()>> jobs_;
   bool stop_ = false;
 
-  std::mutex done_mu_;
+  mutable std::mutex done_mu_;
   std::queue<std::function<void()>> completions_;
+
+  // Jobs submitted and not yet finished (queued + running). shutdown() drains the
+  // queue before the workers exit, so the count stays consistent.
+  std::atomic<size_t> in_flight_{0};
 
   std::atomic<uint64_t> generation_{0};
 };
