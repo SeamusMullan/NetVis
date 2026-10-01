@@ -14,6 +14,11 @@
 // MappedFile -> parse_model) and asserts the row it was promised. A row that stops
 // being true fails here, not in a user's hands.
 //
+// What is checked is the TABLE between the BEGIN/END markers - and nothing else in
+// the document. The prose around it (the per-format "known gaps") is hand-written
+// and is NOT verified by this file; each gap there is pinned only to the extent a
+// table row shows it (e.g. the typed-data ONNX and compressed npz rows).
+//
 // Set NETVIS_EMIT_FORMAT_MATRIX=1 to print the rows this run derived, in the
 // document's own format, ready to paste back after an intentional change.
 #include <doctest/doctest.h>
@@ -117,7 +122,7 @@ struct Observed {
   bool has_graph = false;
   size_t tensors = 0;
   size_t shaped = 0;      // tensors with a non-empty shape
-  size_t addressable = 0; // tensors with a real file offset, or external data
+  size_t addressable = 0; // tensors with an in-file byte range, or external data
   uint64_t payload_reads = 0;
 };
 
@@ -156,12 +161,22 @@ Observed observe(const std::string& fixture) {
   o.format = std::string(m.str(m.format_name));
   o.has_graph = m.has_graph;
 
+  const uint64_t file_size = mf->size();
   auto count = [&](const ir::TensorRef& t) {
     ++o.tensors;
+    // "Shaped" is "has a non-empty shape". ir::TensorRef has no shape-known flag,
+    // so a genuine rank-0 scalar (empty shape) is indistinguishable from a shape
+    // the parser could not determine and reads as unshaped here. That errs toward
+    // claiming LESS, and a row that flips to "some" because of a scalar constant
+    // is a prompt to look, not a silent over-claim.
     if (!t.shape.empty()) ++o.shaped;
-    // A weight is addressable when it can be located without guessing: a real
-    // mmap offset, or an external-data path the loader resolves at inspect time.
-    if (t.file_offset != UINT64_MAX || m.str(t.external_path).size() > 0) ++o.addressable;
+    // A weight is addressable when it can be located without guessing: a byte
+    // range that lies inside the mapped file (overflow-safe), or an external-data
+    // path the loader resolves at inspect time.
+    const bool external = m.str(t.external_path).size() > 0;
+    const bool in_file = t.file_offset != UINT64_MAX && t.file_offset <= file_size &&
+                         t.byte_len <= file_size - t.file_offset;
+    if (external || in_file) ++o.addressable;
   };
   for (const ir::TensorRef& t : m.flat_tensors) count(t);
   for (const ir::Graph& g : m.graphs)
@@ -223,22 +238,30 @@ TEST_CASE("format matrix: every documented row matches what the parser produces"
                                                 << " (" << o.addressable << "/"
                                                 << o.tensors << ")");
 
-    // The zero-payload thesis, asserted for every format in one place. Individual
-    // parser tests check this for the formats they cover; this catches a format
-    // whose own test forgot to, and any future parser added to the table.
+    // The zero-payload rule, as far as it can be observed from here.
+    // ByteReader::payload_read_counter() is bumped only by code that explicitly
+    // calls mark_payload_read() - the weight inspector's decoders (TensorStats)
+    // and the WASM host's file reader. No built-in parser calls it, and plain
+    // ByteReader::bytes()/raw() reads are not counted at all; the counter is also
+    // thread_local, so a read on a worker thread would not register. So this
+    // asserts that a structural open never routes through the payload decoders.
+    // It is NOT proof that no parser touches a weight page: that holds because
+    // parsers record offset+len by construction, which this test cannot see.
     CHECK_MESSAGE(o.payload_reads == 0,
-                  "structural parse read " << o.payload_reads
-                      << " payload byte range(s) - the open must record "
+                  "structural parse routed through " << o.payload_reads
+                      << " payload decode(s) - the open must record "
                          "offset+len only");
   }
 }
 
-TEST_CASE("format matrix: an unresolved dimension is -1, never a guess") {
-  // The honest-unknown rule for shapes: a parser that does not know a dimension
-  // writes -1. A 0 would claim an empty tensor and silently zero every FLOP and
-  // byte count downstream, which is a fabricated answer wearing a real one's
-  // clothes. (A genuinely zero-length dim is not something any fixture format
-  // expresses, so treat 0 as the fabrication marker it would be.)
+TEST_CASE("format matrix: no fixture carries a dimension below -1") {
+  // The honest-unknown rule for shapes: -1 is the one marker for "unresolved", so
+  // nothing below it may appear. A parser that wrote some other negative number
+  // would be inventing a second, unreadable spelling of "unknown". (0 is NOT
+  // policed here: a zero-length dimension is a real, expressible shape - ONNX
+  // dim_value, a .npy shape and a SafeTensors shape can all hold one - and
+  // forcing it to -1 would turn a known fact into a fabricated unknown. The
+  // test below pins that 0 survives and -1 means unresolved.)
   std::string err;
   std::vector<MatrixRow> rows = read_matrix("docs/format-support.md", err);
   REQUIRE_MESSAGE(err.empty(), err);
@@ -255,7 +278,6 @@ TEST_CASE("format matrix: an unresolved dimension is -1, never a guess") {
 
     auto check_shape = [&](const netvis::SmallVec<int64_t, 6>& shape, const char* what) {
       for (int64_t d : shape) {
-        CHECK_MESSAGE(d != 0, what << " carries a 0 dimension");
         CHECK_MESSAGE(d >= -1, what << " carries dimension " << d
                                     << " (only -1 means unresolved)");
       }
@@ -266,4 +288,93 @@ TEST_CASE("format matrix: an unresolved dimension is -1, never a guess") {
       for (const ir::ValueInfo& v : g.values) check_shape(v.shape, "a value");
     }
   }
+}
+
+namespace {
+
+// Minimal protobuf encoders for hand-building an ONNX ModelProto in memory.
+void pb_put_varint(std::vector<uint8_t>& out, uint64_t v) {
+  while (v >= 0x80) {
+    out.push_back(static_cast<uint8_t>(v | 0x80));
+    v >>= 7;
+  }
+  out.push_back(static_cast<uint8_t>(v));
+}
+std::vector<uint8_t> pb_varint_field(uint32_t field, uint64_t v) {
+  std::vector<uint8_t> out;
+  pb_put_varint(out, (static_cast<uint64_t>(field) << 3) | 0);
+  pb_put_varint(out, v);
+  return out;
+}
+std::vector<uint8_t> pb_len_field(uint32_t field, const std::vector<uint8_t>& body) {
+  std::vector<uint8_t> out;
+  pb_put_varint(out, (static_cast<uint64_t>(field) << 3) | 2);
+  pb_put_varint(out, body.size());
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
+}
+std::vector<uint8_t> pb_str_field(uint32_t field, const std::string& s) {
+  return pb_len_field(field, std::vector<uint8_t>(s.begin(), s.end()));
+}
+void append(std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+  a.insert(a.end(), b.begin(), b.end());
+}
+
+}  // namespace
+
+TEST_CASE("format matrix: -1 means unresolved, and a real 0 stays 0") {
+  // The rule, pinned directly rather than inferred from the fixtures (none of
+  // which has a symbolic dimension). One ONNX graph input with four dimensions:
+  //   dim_param "N"   -> symbolic        -> -1 (unresolved)
+  //   dim_value 3     -> known           ->  3
+  //   dim_value 0     -> a real 0-length ->  0 (known, NOT turned into -1)
+  //   (neither field) -> unspecified     -> -1 (unresolved)
+  std::vector<uint8_t> shape;
+  append(shape, pb_len_field(1, pb_str_field(2, "N")));      // dim_param
+  append(shape, pb_len_field(1, pb_varint_field(1, 3)));     // dim_value = 3
+  append(shape, pb_len_field(1, pb_varint_field(1, 0)));     // dim_value = 0
+  append(shape, pb_len_field(1, {}));                        // empty Dimension
+
+  std::vector<uint8_t> tensor_type;
+  append(tensor_type, pb_varint_field(1, 1));                // elem_type = FLOAT
+  append(tensor_type, pb_len_field(2, shape));               // shape
+  std::vector<uint8_t> value_info;
+  append(value_info, pb_str_field(1, "x"));                  // name
+  append(value_info, pb_len_field(2, pb_len_field(1, tensor_type)));  // type
+
+  std::vector<uint8_t> graph;
+  append(graph, pb_str_field(2, "g"));
+  append(graph, pb_len_field(11, value_info));               // input
+  std::vector<uint8_t> modelproto;
+  append(modelproto, pb_varint_field(1, 8));                 // ir_version
+  append(modelproto, pb_len_field(7, graph));
+
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() / "nv_matrix_dims.onnx";
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(modelproto.data()),
+              static_cast<std::streamsize>(modelproto.size()));
+  }
+  {
+    // Scoped so the mapping is released before the file is removed (Windows
+    // refuses to delete a file that is still mapped).
+    auto mf = MappedFile::open(path.string());
+    REQUIRE(mf);
+    ProgressSink progress;
+    Result<ir::Model> r = parse_model(*mf, "onnx", progress);
+    REQUIRE_MESSAGE(r, "hand-built ONNX model failed to parse");
+    const ir::Model& m = *r;
+    REQUIRE(m.graphs.size() == 1);
+    const ir::Graph& g = m.graphs[0];
+    REQUIRE(g.graph_inputs.size() == 1);
+    const ir::ValueInfo& v = g.values[g.graph_inputs[0]];
+    REQUIRE(v.shape.size() == 4);
+    CHECK(v.shape[0] == -1);
+    CHECK(v.shape[1] == 3);
+    CHECK(v.shape[2] == 0);
+    CHECK(v.shape[3] == -1);
+  }
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
 }

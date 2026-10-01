@@ -44,8 +44,8 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   extension. SavedModel checkpoint weights (`variables/`) are reported as
   present but not decoded. What each format actually yields — graph, shapes,
   addressable weights — and where the gaps are is in
-  [`docs/format-support.md`](docs/format-support.md), which is checked against the
-  parsers on every test run.
+  [`docs/format-support.md`](docs/format-support.md); its support table is checked
+  against the parsers on every test run (the prose around it is not).
 - **Instant open:** memory-mapped I/O; structure parsed off the main thread; the
   window is interactive the moment the `mmap` succeeds.
 - **Compute-graph canvas:** a single custom-drawn region (no per-node widgets) with
