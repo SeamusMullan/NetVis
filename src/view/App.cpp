@@ -741,10 +741,7 @@ std::string basename_of(const std::string& path) {
 
 void App::open_file_dialog() {
   start_file_dialog(DialogKind::OpenModel, FileDialog::Mode::Open, "Open model",
-                    "",
-                    {"*.onnx", "*.tflite", "*.safetensors", "*.gguf", "*.pt",
-                     "*.pth", "*.bin", "*.pb"},
-                    "Model files");
+                    "", openable_patterns(), kOpenFilterDescription);
 }
 
 // Opens the system chooser and records what to do with the answer. The chooser

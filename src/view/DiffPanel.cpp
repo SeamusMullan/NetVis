@@ -933,9 +933,7 @@ void draw_diff_panel(App& app) {
       app.add_toast("No file chooser found - install zenity or kdialog", true);
     } else {
       add_dlg.start(FileDialog::Mode::Open, "Open comparison model", "",
-                    {"*.onnx", "*.tflite", "*.safetensors", "*.gguf", "*.pt",
-                     "*.pth", "*.bin", "*.pb"},
-                    "Model files");
+                    openable_patterns(), kOpenFilterDescription);
     }
   }
   // ready() CONSUMES the pick — it answers true exactly once — so the cap has to

@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace netvis {
@@ -55,6 +56,36 @@ inline std::string apply_default_extension(
 
 }  // namespace detail
 
+
+// The extensions the "open a model" choosers offer (App::open_file_dialog and the
+// DiffPanel comparison picker both build their filter from this table — do not
+// hand-maintain a second list). Lowercase, no dot. A new format adds its
+// extension HERE; tests/test_file_dialog.cpp fails if any extension the format
+// detector acts on (kExtensionFormats in parsers/Parser.h) is missing.
+//
+// "mlpackage" is not a detector extension: a CoreML bundle is a directory that
+// engine/ModelPath resolves to its inner model. macOS choosers treat a package as
+// a single file, so listing it lets the bundle be picked there; the GTK/Qt/Win32
+// choosers cannot select a directory, where drag-and-drop or the CLI argument
+// still open it.
+inline constexpr std::string_view kOpenableExtensions[] = {
+    "onnx", "tflite", "safetensors", "gguf", "pt",   "pth",       "bin",
+    "pb",   "xml",    "npz",         "keras", "h5",  "hdf5",      "mlmodel",
+    "mlpackage",      "pkl",         "pickle",
+};
+
+// First filter in the chooser, ahead of the "All files" fallback it appends.
+inline constexpr const char* kOpenFilterDescription = "All supported models";
+
+// kOpenableExtensions as chooser globs ("*.onnx", ...), in table order.
+inline std::vector<std::string> openable_patterns() {
+  std::vector<std::string> out;
+  out.reserve(sizeof(kOpenableExtensions) / sizeof(kOpenableExtensions[0]));
+  for (const std::string_view ext : kOpenableExtensions) {
+    out.push_back("*." + std::string(ext));
+  }
+  return out;
+}
 
 class FileDialog {
  public:
