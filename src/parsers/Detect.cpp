@@ -423,23 +423,13 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::ONNX;
   }
 
-  // Extension tiebreaker for ambiguous content.
+  // Extension tiebreaker for ambiguous content. Table-driven (kExtensionFormats
+  // in Parser.h) so the file chooser's openable list can be checked against it.
   if (!ext_hint.empty()) {
     reason = DetectReason::Extension;
-    if (ext_hint == "onnx") return Format::ONNX;
-    if (ext_hint == "tflite") return Format::TFLite;
-    if (ext_hint == "safetensors") return Format::SafeTensors;
-    if (ext_hint == "gguf") return Format::GGUF;
-    if (ext_hint == "xml") return Format::OpenVINO;
-    if (ext_hint == "npz") return Format::Npz;
-    if (ext_hint == "keras" || ext_hint == "h5" || ext_hint == "hdf5")
-      return Format::Keras;
-    if (ext_hint == "mlmodel") return Format::CoreML;
-    if (ext_hint == "pb") return Format::TensorFlow;
-    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
-      return Format::PyTorchZip;
+    for (const ExtensionFormat& e : kExtensionFormats) {
+      if (ext_hint == e.ext) return e.format;
     }
-    if (ext_hint == "pkl" || ext_hint == "pickle") return Format::PyTorchLegacy;
   }
 
   reason = DetectReason::None;

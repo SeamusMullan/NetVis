@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "core/JobSystem.h"
 #include "core/MappedFile.h"
@@ -37,6 +38,37 @@ enum class Format : uint8_t {
 };
 
 const char* format_name(Format f);
+
+// Every file extension (lowercased, no dot) detect_format() acts on, and the
+// Format it breaks an otherwise-ambiguous file toward (spec §5). This is the ONE
+// place the detector's extension knowledge lives: the extension tiebreak at the
+// end of detect_format() walks this table, and the file chooser's openable list
+// (view/FileDialog.h) is tested against it, so a format that parses can never be
+// unpickable from the GUI. Any extension detect_format() consults — including
+// the zip and .mlmodel tiebreaks earlier in the function — must be listed here
+// (tests/test_detect.cpp checks each entry routes as written). First match wins.
+struct ExtensionFormat {
+  std::string_view ext;
+  Format format;
+};
+inline constexpr ExtensionFormat kExtensionFormats[] = {
+    {"onnx", Format::ONNX},
+    {"tflite", Format::TFLite},
+    {"safetensors", Format::SafeTensors},
+    {"gguf", Format::GGUF},
+    {"xml", Format::OpenVINO},
+    {"npz", Format::Npz},
+    {"keras", Format::Keras},
+    {"h5", Format::Keras},
+    {"hdf5", Format::Keras},
+    {"mlmodel", Format::CoreML},
+    {"pb", Format::TensorFlow},
+    {"pt", Format::PyTorchZip},
+    {"pth", Format::PyTorchZip},
+    {"bin", Format::PyTorchZip},
+    {"pkl", Format::PyTorchLegacy},
+    {"pickle", Format::PyTorchLegacy},
+};
 
 // Detect the format from file content. `ext_hint` is a lowercased extension
 // (without dot), used only to break ties (spec §5). Returns Format::Unknown if

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -137,6 +138,32 @@ TEST_CASE("detect Keras HDF5 by superblock signature") {
   std::vector<uint8_t> b = {0x89, 'H', 'D', 'F', '\r', '\n', 0x1a, '\n'};
   b.resize(64, 0);
   CHECK(detect_bytes("h5", b, "h5") == Format::Keras);
+}
+
+// #135: kExtensionFormats (parsers/Parser.h) is the single source for the
+// detector's extension knowledge, and the file chooser's openable list is tested
+// against it. That is only a real guard if the table is the whole truth, so check
+// each entry actually routes the way it says on content no sniffer claims.
+TEST_CASE("detect: every kExtensionFormats entry routes ambiguous content") {
+  std::vector<uint8_t> junk = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
+  junk.resize(32, 0);
+  for (const ExtensionFormat& e : kExtensionFormats) {
+    INFO("extension: " << e.ext);
+    CHECK(detect_bytes("extmap", junk, std::string(e.ext)) == e.format);
+  }
+  // An extension outside the table must not claim anything.
+  CHECK(detect_bytes("extmap_none", junk, "txt") == Format::Unknown);
+}
+
+TEST_CASE("detect: kExtensionFormats has no dead (duplicate) entries") {
+  // First match wins, so a repeated extension would silently never apply.
+  const size_t n = std::size(kExtensionFormats);
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = i + 1; j < n; ++j) {
+      INFO("duplicate extension: " << kExtensionFormats[i].ext);
+      CHECK(kExtensionFormats[i].ext != kExtensionFormats[j].ext);
+    }
+  }
 }
 
 // --- #45: format-detection reason (confidence signal) -------------------------
