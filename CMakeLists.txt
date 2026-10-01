@@ -460,6 +460,12 @@ if(NETVIS_BUILD_TESTS)
     # plugins/sdk/netvis_plugin.h (the SDK<->C++ drift guard, #10 Increment D).
     target_include_directories(netvis_tests PRIVATE
       ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    # MSVC: doctest's per-assertion templates plus nlohmann::json can push one
+    # test TU past the default object-file section limit (fatal error C1128).
+    # /bigobj raises it; it only changes the .obj format, never the program.
+    if(MSVC)
+      target_compile_options(netvis_tests PRIVATE /bigobj)
+    endif()
 
     # Generate the tiny fixture models at build time (Python 3 stdlib only, no
     # pip) so `ctest` always has them, and run tests from the source root so the

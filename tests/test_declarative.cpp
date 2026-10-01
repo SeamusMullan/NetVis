@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 
 #include "engine/plugin/OpHandler.h"
@@ -190,9 +191,12 @@ TEST_CASE("declarative: attr access mirrors built-in getters") {
 
 namespace {
 std::string write_temp(const std::string& body) {
-  std::string path = std::string("/tmp/nv_manifest_") +
-                     std::to_string(body.size()) + "_" +
-                     std::to_string(body.empty() ? 0 : body[0]) + ".json";
+  // temp_directory_path(), not a literal "/tmp": on Windows "/tmp/x" means
+  // C:\tmp\x, a directory that does not exist, so the write would fail.
+  const std::string leaf = "nv_manifest_" + std::to_string(body.size()) + "_" +
+                           std::to_string(body.empty() ? 0 : body[0]) + ".json";
+  std::string path =
+      (std::filesystem::temp_directory_path() / leaf).string();
   std::ofstream f(path, std::ios::binary);
   f << body;
   f.close();
