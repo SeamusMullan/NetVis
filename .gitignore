@@ -24,3 +24,6 @@ docs/ai-logs/
 
 # Python bytecode from tools/
 __pycache__/
+
+# makensis writes the compile-check installer next to its script (packaging/windows/nsh-syntax-check.nsi)
+packaging/windows/nsh-syntax-check-installer.exe
