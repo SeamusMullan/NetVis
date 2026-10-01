@@ -15,13 +15,20 @@
         read returns nothing and the installer gives up with
         "Warning! PATH too long installer unable to modify PATH!".
       * It gates the edit on `IfFileExists "<dir>\*.*"` and dedupes against
-        `GetFullPathName /SHORT`. Both are unreliable on virtual drives (subst,
-        mounted VHD, mapped network drives) and on volumes with 8.3 name
-        generation disabled, where the edit is skipped with no message at all.
+        `GetFullPathName /SHORT`, and skips the edit with no message at all when
+        either cannot see the directory (the dedupe when GetShortPathName fails
+        outright). That is a suspected cause of the report that a virtual or
+        mapped drive "also causes issues", not a confirmed one: a drive letter
+        belongs to a logon session, and an elevated installer may not be in the
+        same session as the prompt that created it.
 
-    Neither limit exists here: the registry API returns the value whatever its
-    length, and nothing about this script cares which kind of volume the
-    directory lives on.
+    The registry API has no length limit, and this script does not depend on
+    either of those checks. It does not detect a subst or mapped drive, so the
+    entry it writes is only as durable as that drive mapping.
+
+    Only the entry being added or removed is touched: every other byte of PATH,
+    including empty fields, is written back exactly as it was read, and a
+    request that changes nothing writes nothing.
 
 .PARAMETER Action
     'add' or 'remove'.
@@ -30,7 +37,10 @@
     The directory to add to or remove from PATH.
 
 .PARAMETER Scope
-    'machine' (HKLM, all users) or 'user' (HKCU, current user only).
+    'machine' (HKLM, all users) or 'user' (HKCU). 'user' is the account this
+    process runs as: the installer is elevated, so with over-the-shoulder UAC
+    (a standard user typing an administrator's credentials) that is the
+    administrator's profile, not that of the person who started the installer.
 
 .PARAMETER SelfTest
     Run the string-manipulation unit tests and exit. Touches no registry key.
@@ -77,35 +87,52 @@ function Test-SamePathEntry {
     return [string]::Equals($na, $nb, [StringComparison]::OrdinalIgnoreCase)
 }
 
-# Split a raw PATH value into entries, dropping the empty fields that a
-# trailing or doubled ';' produces. An empty field in PATH means "the current
-# directory" to some resolvers, so preserving them is a security misfeature,
-# not fidelity.
+# Split a raw PATH value into its non-empty entries. Used only to LOOK for an
+# entry: it drops the empty fields a trailing or doubled ';' produces, so it must
+# never be used to rebuild the value that gets written back. Add and Remove below
+# edit the original string instead, so an unrelated part of the user's PATH -
+# empty fields included - is never rewritten by an install or an uninstall.
 function Split-PathValue {
     param([string]$Value)
     if ([string]::IsNullOrEmpty($Value)) { return @() }
     return @($Value -split ';' | Where-Object { $_.Trim().Length -gt 0 })
 }
 
-# Append $Directory unless an equivalent entry is already present. Appends
-# rather than prepends: PATH order is the user's, and an installer that jumps
-# the queue can shadow a tool the user deliberately put first.
+# Append $Directory unless an equivalent entry is already present, and leave the
+# rest of $Value byte-for-byte as it was. Appends rather than prepends: PATH
+# order is the user's, and an installer that jumps the queue can shadow a tool
+# the user deliberately put first. Joins with a single ';', adding none when
+# $Value already ends in one.
 function Add-EntryToPathValue {
     param([string]$Value, [string]$Directory)
-    $entries = @(Split-PathValue -Value $Value)
-    foreach ($e in $entries) {
+    foreach ($e in @(Split-PathValue -Value $Value)) {
         if (Test-SamePathEntry -A $e -B $Directory) { return $Value }
     }
-    return (@($entries) + $Directory) -join ';'
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Directory }
+    if ($Value.EndsWith(';')) { return $Value + $Directory }
+    return $Value + ';' + $Directory
 }
 
 # Drop every equivalent entry, not just the first: a PATH that accumulated the
-# directory twice (an older installer, a hand edit) must come out clean.
+# directory twice (an older installer, a hand edit) must come out clean. Splices
+# out only the matching fields. When none matches, $Value comes back unchanged -
+# including any empty fields - so the caller sees "nothing to do" and writes
+# nothing.
 function Remove-EntryFromPathValue {
     param([string]$Value, [string]$Directory)
-    $entries = @(Split-PathValue -Value $Value |
-        Where-Object { -not (Test-SamePathEntry -A $_ -B $Directory) })
-    return $entries -join ';'
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    $kept = New-Object System.Collections.ArrayList
+    $removed = $false
+    foreach ($field in ($Value -split ';')) {
+        if (($field.Trim().Length -gt 0) -and
+            (Test-SamePathEntry -A $field -B $Directory)) {
+            $removed = $true
+            continue
+        }
+        [void]$kept.Add($field)
+    }
+    if (-not $removed) { return $Value }
+    return ($kept -join ';')
 }
 
 # --- Registry access ---------------------------------------------------------
@@ -213,15 +240,25 @@ function Invoke-SelfTest {
         'C:\Windows;c:\netvis\bin\' `
         (Add-EntryToPathValue -Value 'C:\Windows;c:\netvis\bin\' -Directory 'C:\NetVis\bin')
 
-    Assert-Equal 'add drops empty fields' `
+    Assert-Equal 'add adds no second separator after a trailing ;' `
         'C:\Windows;C:\NetVis\bin' `
-        (Add-EntryToPathValue -Value 'C:\Windows;;' -Directory 'C:\NetVis\bin')
+        (Add-EntryToPathValue -Value 'C:\Windows;' -Directory 'C:\NetVis\bin')
+
+    Assert-Equal 'add leaves the rest of PATH byte-for-byte, empty fields included' `
+        'C:\a;;C:\b;C:\NetVis\bin' `
+        (Add-EntryToPathValue -Value 'C:\a;;C:\b' -Directory 'C:\NetVis\bin')
+
+    Assert-Equal 'add of a present entry returns PATH untouched' `
+        'C:\a;;C:\NetVis\bin;' `
+        (Add-EntryToPathValue -Value 'C:\a;;C:\NetVis\bin;' -Directory 'C:\NetVis\bin')
 
     Assert-Equal 'add preserves unexpanded variables' `
         '%SystemRoot%\system32;C:\NetVis\bin' `
         (Add-EntryToPathValue -Value '%SystemRoot%\system32' -Directory 'C:\NetVis\bin')
 
-    Assert-Equal 'add works on a virtual drive letter' `
+    # Not a test of virtual-drive behaviour: the string code cannot see what kind
+    # of volume a drive letter is. It only pins that no letter is special-cased.
+    Assert-Equal 'add treats a non-C: drive letter like any other directory' `
         'C:\Windows;X:\NetVis\bin' `
         (Add-EntryToPathValue -Value 'C:\Windows' -Directory 'X:\NetVis\bin')
 
@@ -236,6 +273,16 @@ function Invoke-SelfTest {
     Assert-Equal 'remove of an absent entry is a no-op' `
         'C:\Windows' `
         (Remove-EntryFromPathValue -Value 'C:\Windows' -Directory 'C:\NetVis\bin')
+
+    # The no-op must be byte-for-byte, empty fields and all: Invoke-PathUpdate
+    # writes the registry only when the returned value differs from what it read.
+    Assert-Equal 'remove of an absent entry returns PATH byte-for-byte' `
+        'C:\a;;C:\b;' `
+        (Remove-EntryFromPathValue -Value 'C:\a;;C:\b;' -Directory 'C:\NetVis\bin')
+
+    Assert-Equal 'remove splices out only the matching entry' `
+        'C:\a;;C:\b;' `
+        (Remove-EntryFromPathValue -Value 'C:\a;;C:\NetVis\bin;C:\b;' -Directory 'C:\NetVis\bin')
 
     Assert-Equal 'remove leaves no trailing separator' `
         'C:\Windows' `
