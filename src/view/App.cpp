@@ -571,6 +571,19 @@ void App::frame() {
         if (ImGui::MenuItem("Straight", nullptr, er == 2)) { er = 2; save_prefs(); }
         ImGui::EndMenu();
       }
+      // #158: what a plain scroll does. Persisted, shared by every tab (#151).
+      if (ImGui::BeginMenu("Scroll wheel")) {
+        WheelMode& wm = view().wheel_mode;
+        if (ImGui::MenuItem("Pan (Netron)", nullptr, wm == WheelMode::Pan)) {
+          wm = WheelMode::Pan;
+          save_prefs();
+        }
+        if (ImGui::MenuItem("Zoom", nullptr, wm == WheelMode::Zoom)) {
+          wm = WheelMode::Zoom;
+          save_prefs();
+        }
+        ImGui::EndMenu();
+      }
       ImGui::Separator();
       // #13/#16 (v0.8.1): op-type legend + saved-view bookmarks panels. Held in
       // the per-tab GraphNavState; ensure it exists so the toggle has a target.
@@ -588,6 +601,22 @@ void App::frame() {
         session().collapse_all();
       if (ImGui::MenuItem("Expand all blocks", "E"))
         session().expand_all();
+      ImGui::Separator();
+      // #158: the zoom commands Netron has in its View menu, plus Fit (which it
+      // lacks). The shortcut strings are display-only; handle_shortcuts owns the
+      // keys. Each sets a request the canvas consumes next frame, because only
+      // the canvas knows where the centre of the view is.
+      {
+        const bool has_graph = session().has_graph();
+        if (ImGui::MenuItem("Zoom in", "Shift+Up", false, has_graph))
+          view().request_zoom_steps += 1;
+        if (ImGui::MenuItem("Zoom out", "Shift+Down", false, has_graph))
+          view().request_zoom_steps -= 1;
+        if (ImGui::MenuItem("Actual size", "Shift+Backspace", false, has_graph))
+          view().request_actual_size = true;
+        if (ImGui::MenuItem("Fit to window", "F", false, has_graph))
+          view().request_fit = true;
+      }
       ImGui::Separator();
       // Graph navigation controls (v0.2.0): highlight/focus + category filter.
       if (ImGui::BeginMenu("Navigation")) {
@@ -694,6 +723,46 @@ void App::handle_shortcuts() {
   if (!typing && ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
     view().cam = Camera{};      // Home resets pan/zoom to identity.
     view().animating = false;
+  }
+  // #158 keyboard zoom/pan. These only set requests on the view; the canvas
+  // applies them next frame about its own centre. The arrow-based keys yield to
+  // the search overlay and the palette, which already use Up/Down to step their
+  // result lists (SearchBar.cpp, CommandPalette.cpp), and to Alt, whose
+  // Left/Right is the focus history above. Every one of them is skipped while
+  // typing, like every other single-key binding here.
+  {
+    const bool graph_keys = !typing && session().has_graph();
+    const bool arrows_free = graph_keys && !view().search_open &&
+                             !command_palette_open_ && !io.KeyAlt;
+    ViewState& v = view();
+    // Shift+Up / Shift+Down zoom, Shift+Backspace is actual size (Netron's keys).
+    if (arrows_free && io.KeyShift && !io.KeyCtrl && !io.KeySuper) {
+      if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) v.request_zoom_steps += 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) v.request_zoom_steps -= 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) v.request_actual_size = true;
+    }
+    // Ctrl (Command on macOS: ImGui swaps the two) with =, - and 0, plus the
+    // keypad. No existing binding uses these keys.
+    if (graph_keys && io.KeyCtrl && !io.KeyAlt) {
+      if (ImGui::IsKeyPressed(ImGuiKey_Equal, true) ||
+          ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, true))
+        v.request_zoom_steps += 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_Minus, true) ||
+          ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, true))
+        v.request_zoom_steps -= 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_0, false) ||
+          ImGui::IsKeyPressed(ImGuiKey_Keypad0, false))
+        v.request_actual_size = true;
+    }
+    // Plain arrows pan, 40 px per press or key repeat. No other modifier.
+    if (arrows_free && !io.KeyShift && !io.KeyCtrl && !io.KeySuper) {
+      const PanDelta a = arrow_pan(ImGui::IsKeyPressed(ImGuiKey_UpArrow, true),
+                                   ImGui::IsKeyPressed(ImGuiKey_DownArrow, true),
+                                   ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true),
+                                   ImGui::IsKeyPressed(ImGuiKey_RightArrow, true));
+      v.request_pan_x += a.dx;
+      v.request_pan_y += a.dy;
+    }
   }
   // #17 focus history: Alt+Left / Alt+Right step back/forward through visited
   // nodes (browser-style). Guarded so they no-op at the ends of the history.
