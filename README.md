@@ -39,11 +39,13 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   checkpoints (`.pt` / `.pth` / `.bin`), **OpenVINO IR** (`.xml` + `.bin`),
   **CoreML** (`.mlmodel`), **Keras** (`.h5` / `.keras`), **NumPy** (`.npz`),
   **TensorFlow** (frozen `.pb` GraphDef + `saved_model.pb` bundles, incl. the
-  FunctionDef library as drill-down subgraphs), and best-effort **TorchScript**
-  archive op listings. Zip-based formats are disambiguated by content, not
-  extension. SavedModel checkpoint weights (`variables/`) are reported as
-  present but not decoded. What each format actually yields — graph, shapes,
-  addressable weights — and where the gaps are is in
+  FunctionDef library as drill-down subgraphs), **Caffe** (`.prototxt` +
+  `.caffemodel`, current and legacy V1 schemas; a `.prototxt` picks up weights
+  from a `.caffemodel` beside it), and best-effort **TorchScript** archive op
+  listings. Zip-based formats are disambiguated by content, not extension.
+  SavedModel checkpoint weights (`variables/`) are reported as present but not
+  decoded. What each format actually yields — graph, shapes, addressable
+  weights — and where the gaps are is in
   [`docs/format-support.md`](docs/format-support.md); its support table is checked
   against the parsers on every test run (the prose around it is not).
 - **Instant open:** memory-mapped I/O; structure parsed off the main thread; the
