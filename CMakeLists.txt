@@ -534,14 +534,17 @@ if(NETVIS_BUILD_APP)
     # client resolve `netvis_mcp` by bare name after a normal install.
     #
     # ON draws the options page and records the choice in the uninstall registry
-    # key, but the template's AddToPath does NOT perform the edit — the two hooks
-    # below replace it (#149). The template reads PATH into an NSIS string, which
+    # key. The two hooks below take over the edit itself (#149); the template's own
+    # AddToPath is suppressed once they succeed and only runs as a fallback if the
+    # helper script fails. The template reads PATH into an NSIS string, which
     # a standard makensis build caps at 1024 characters, so past that it aborts
-    # with "Warning! PATH too long installer unable to modify PATH!"; and it gates
-    # the edit on `IfFileExists "<dir>\*.*"` plus a `GetFullPathName /SHORT`
-    # dedupe, both of which fail silently on virtual drives and on volumes with
-    # 8.3 names disabled. packaging/windows/netvis-path.ps1 edits the registry
-    # directly and has neither limit.
+    # with "Warning! PATH too long installer unable to modify PATH!". It also
+    # skips the edit silently when `IfFileExists "<dir>\*.*"` or the
+    # `GetFullPathName /SHORT` dedupe cannot see the install directory (the dedupe
+    # when GetShortPathName fails outright), which is a suspected cause of the
+    # "virtual drive" report -- an elevated installer may not see a subst or
+    # mapped drive made in another logon session. packaging/windows/netvis-path.ps1
+    # edits the registry directly and has none of these dependencies.
     set(CPACK_NSIS_MODIFY_PATH ON)
     # !include rather than an inline NSIS string: CPack round-trips these
     # variables through a generated CPackConfig.cmake, so an inlined snippet
