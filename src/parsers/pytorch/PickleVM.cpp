@@ -37,6 +37,37 @@ bool torch_storage_dtype(const std::string& storage_name, ir::DType& out_dtype,
   return false;
 }
 
+// ---- torch dtype globals (_rebuild_tensor_v3) ----------------------------------
+// torch >= 2.1 pickles tensors of the dtypes torch.storage._new_dtypes() lists
+// through _rebuild_tensor_v3: an UntypedStorage plus a trailing torch.<dtype>
+// global, because those dtypes have no legacy <Type>Storage class. Sizes are
+// itemsize bytes; float4_e2m1fn_x2 packs two FP4 E2M1 values (the MXFP4/NVFP4
+// element type) into each 1-byte element, so its shape counts byte pairs.
+bool torch_dtype_global(const std::string& name, ir::DType& out_dtype,
+                        uint32_t& out_elem_size, const char*& out_label) {
+  struct Ent { const char* name; ir::DType dt; uint32_t sz; };
+  static const Ent kTable[] = {
+      {"uint16", ir::DType::U16, 2},
+      {"uint32", ir::DType::U32, 4},
+      {"uint64", ir::DType::U64, 8},
+      {"float8_e4m3fn", ir::DType::Unknown, 1},
+      {"float8_e4m3fnuz", ir::DType::Unknown, 1},
+      {"float8_e5m2", ir::DType::Unknown, 1},
+      {"float8_e5m2fnuz", ir::DType::Unknown, 1},
+      {"float8_e8m0fnu", ir::DType::Unknown, 1},
+      {"float4_e2m1fn_x2", ir::DType::Unknown, 1},
+  };
+  for (const auto& e : kTable) {
+    if (name == e.name) {
+      out_dtype = e.dt;
+      out_elem_size = e.sz;
+      out_label = (e.dt == ir::DType::Unknown) ? e.name : nullptr;
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- stream readers ----------------------------------------------------------
 Result<uint8_t> PickleVM::rd_u8() {
   if (pos_ + 1 > size_) return err("eof reading u8", pos_);
@@ -128,10 +159,11 @@ Result<ValuePtr> PickleVM::resolve_global(const std::string& module,
   // Opaque and is NEVER executed.
   ir::DType dt;
   uint32_t esz;
+  const char* lbl;
   bool allow = false;
   if (module == "torch._utils" &&
       (name == "_rebuild_tensor_v2" || name == "_rebuild_tensor" ||
-       name == "_rebuild_parameter")) {
+       name == "_rebuild_tensor_v3" || name == "_rebuild_parameter")) {
     allow = true;
   } else if (module == "collections" && name == "OrderedDict") {
     allow = true;
@@ -140,6 +172,8 @@ Result<ValuePtr> PickleVM::resolve_global(const std::string& module,
   } else if ((module == "torch" || module == "torch.storage") &&
              torch_storage_dtype(name, dt, esz)) {
     allow = true;
+  } else if (module == "torch" && torch_dtype_global(name, dt, esz, lbl)) {
+    allow = true;  // a dtype NAME (v3 trailing arg), inert data
   }
   if (allow) {
     v->kind = Value::Kind::Global;
@@ -191,10 +225,13 @@ Result<ValuePtr> PickleVM::do_reduce(const ValuePtr& callable,
   }
 
   if (mod == "torch._utils" &&
-      (nm == "_rebuild_tensor_v2" || nm == "_rebuild_tensor")) {
+      (nm == "_rebuild_tensor_v2" || nm == "_rebuild_tensor" ||
+       nm == "_rebuild_tensor_v3")) {
     // args: (storage, storage_offset, size, stride, [requires_grad,
     //        backward_hooks], ...). storage is a Persistent value whose pid is
     //        ("storage", <StorageType global>, key, device, numel).
+    // v3 appends a torch.<dtype> global at args[6] and its storage type is
+    // UntypedStorage, so the dtype comes from that argument instead.
     auto tref = std::make_shared<Value>();
     tref->kind = Value::Kind::Tensor;
     ir::TensorRef& t = tref->tensor;
@@ -223,6 +260,12 @@ Result<ValuePtr> PickleVM::do_reduce(const ValuePtr& callable,
           have_storage = true;
         }
       }
+    }
+    if (nm == "_rebuild_tensor_v3" && args.size() >= 7 && args[6] &&
+        args[6]->kind == Value::Kind::Global && args[6]->module == "torch") {
+      const char* lbl = nullptr;
+      if (torch_dtype_global(args[6]->name, dtype, elem_size, lbl) && lbl)
+        tref->dtype_label = lbl;
     }
     t.dtype = dtype;
 

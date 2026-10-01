@@ -6,10 +6,11 @@
 // a real PARSED GGUF model rather than a hand-built ir::Model, because
 // preview_quant_block's first gate is `model->format_name == "GGUF"` — the
 // only honest way to exercise that is through the real parser. The fixture
-// carries three tensors: weight_f32 (not quantized), weight_q4k (a K-quant,
+// carries five tensors: weight_f32 (not quantized), weight_q4k (a K-quant,
 // refused by scope), weight_q4_0 (two hand-encoded blocks with KNOWN values,
 // block 1's scale doubled so a block_index mixup — always decoding block 0 —
-// would also be caught).
+// would also be caught), weight_mxfp4 (two blocks, same doubling trick) and
+// weight_nvfp4 (one 64-element block with four distinct sub-block scales).
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -68,10 +69,22 @@ TEST_CASE("#49 GGUF quant fixture: structural parse reads zero payload") {
   CHECK(ByteReader::payload_read_counter() == 0);
 
   CHECK_FALSE(model.has_graph);
-  REQUIRE(model.flat_tensors.size() == 3);
+  REQUIRE(model.flat_tensors.size() == 5);
   CHECK(find_flat(model, "weight_f32") != nullptr);
   CHECK(find_flat(model, "weight_q4k") != nullptr);
   CHECK(find_flat(model, "weight_q4_0") != nullptr);
+
+  // FP4 tensors land in the 4-bit bucket and keep their exact ggml name.
+  const ir::TensorRef* mx = find_flat(model, "weight_mxfp4");
+  const ir::TensorRef* nv = find_flat(model, "weight_nvfp4");
+  REQUIRE(mx != nullptr);
+  REQUIRE(nv != nullptr);
+  CHECK(mx->dtype == ir::DType::Q4);
+  CHECK(nv->dtype == ir::DType::Q4);
+  CHECK(model.str(mx->dtype_label) == "MXFP4");
+  CHECK(model.str(nv->dtype_label) == "NVFP4");
+  CHECK(mx->byte_len == 34);
+  CHECK(nv->byte_len == 36);
 }
 
 TEST_CASE("#49 preview_quant_block: Q4_0 block 0 matches the fixture's hand-encoded ramp") {
@@ -175,4 +188,55 @@ TEST_CASE("#49 preview_quant_block: a non-quantized tensor (F32) is refused as n
   const QuantBlockPreview& p = *pr;
   CHECK_FALSE(p.available);
   CHECK_FALSE(p.unavailable_reason.empty());
+}
+
+// OCP MX FP4 E2M1, code -> value (0x8 is -0). Same table as test_gguf_blocks.
+constexpr float kE2M1[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                             -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+TEST_CASE("preview_quant_block: MXFP4 block 1 decodes with its own E8M0 scale") {
+  MappedFile mf;
+  ir::Model model;
+  if (!load_fixture(mf, model)) return;
+  const ir::TensorRef* mx = find_flat(model, "weight_mxfp4");
+  REQUIRE(mx != nullptr);
+
+  auto pr = preview_quant_block(*mx, mf, 1, "", &model);
+  REQUIRE_MESSAGE(pr, "preview_quant_block returned an error");
+  const QuantBlockPreview& p = *pr;
+  REQUIRE(p.available);
+  CHECK(p.type_name == "MXFP4");
+  CHECK(p.total_blocks == 2);
+  CHECK(p.elem_count == 32);
+  CHECK(p.first_elem == 32);
+  // _mxfp4_block(128) in gen_fixtures.py: scale 2^(128-127) = 2.0; block 0's
+  // scale is 1.0, so decoding the wrong block would halve every value.
+  for (uint32_t j = 0; j < 16; ++j) {
+    CHECK(p.values[j] == kE2M1[j] * 2.0f);
+    CHECK(p.values[j + 16] == kE2M1[15 - j] * 2.0f);
+  }
+}
+
+TEST_CASE("preview_quant_block: NVFP4 fills all 64 slots with per-16 scales") {
+  MappedFile mf;
+  ir::Model model;
+  if (!load_fixture(mf, model)) return;
+  const ir::TensorRef* nv = find_flat(model, "weight_nvfp4");
+  REQUIRE(nv != nullptr);
+
+  auto pr = preview_quant_block(*nv, mf, 0, "", &model);
+  REQUIRE_MESSAGE(pr, "preview_quant_block returned an error");
+  const QuantBlockPreview& p = *pr;
+  REQUIRE(p.available);
+  CHECK(p.type_name == "NVFP4");
+  CHECK(p.total_blocks == 1);
+  REQUIRE(p.elem_count == 64);
+  // _nvfp4_block([0x38, 0x40, 0x30, 0x3C]): E4M3 1.0 / 2.0 / 0.5 / 1.5.
+  const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f};
+  for (uint32_t s = 0; s < 4; ++s) {
+    for (uint32_t j = 0; j < 8; ++j) {
+      CHECK(p.values[16 * s + j] == kE2M1[j] * scale[s]);
+      CHECK(p.values[16 * s + 8 + j] == kE2M1[15 - j] * scale[s]);
+    }
+  }
 }
