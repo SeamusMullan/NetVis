@@ -95,6 +95,14 @@ std::vector<std::string> WasmModule::unresolved_imports() const {
   return out;
 }
 
+bool WasmModule::has_export(const char* export_name) const {
+  if (!impl_ || !impl_->module || !export_name) return false;
+  // The very lookup m3_FindFunction performs (names recorded from the export
+  // section, imports skipped), without its side effects: no compile, no start
+  // function.
+  return v_FindFunction(impl_->module, export_name) != nullptr;
+}
+
 void* WasmModule::raw_module() const { return impl_ ? impl_->module : nullptr; }
 void* WasmModule::raw_runtime() const { return impl_ ? impl_->runtime : nullptr; }
 
@@ -117,9 +125,11 @@ RunResult WasmModule::call_i32(const char* export_name, int32_t* out_ret) {
       r.status = RunStatus::FuelExhausted; r.message = err; return r;  // start-section runaway
     }
     r.status = RunStatus::LoadError; r.message = err ? err : "export not found";
-    // wasm3 reports a name that no function answers to as functionLookupFailed (a
-    // compile failure inside the export is a different, specific error).
-    r.export_missing = !err || std::strcmp(err, m3Err_functionLookupFailed) == 0;
+    // Do NOT infer "absent" from the error: m3_FindFunction reports
+    // m3Err_functionLookupFailed both for a name nothing answers to and for a present
+    // export whose body fails to compile because it calls a function index that does
+    // not exist (m3_compile.c, Compile_Call). Ask the module whether the name is there.
+    r.export_missing = !has_export(export_name);
     return r;
   }
 
@@ -241,6 +251,7 @@ WasmModule::~WasmModule() = default;
 WasmModule::WasmModule(WasmModule&&) noexcept = default;
 WasmModule& WasmModule::operator=(WasmModule&&) noexcept = default;
 uint8_t* WasmModule::memory(uint32_t* out_size) { if (out_size) *out_size = 0; return nullptr; }
+bool WasmModule::has_export(const char*) const { return false; }
 void* WasmModule::raw_module() const { return nullptr; }
 void* WasmModule::raw_runtime() const { return nullptr; }
 std::vector<std::string> WasmModule::unresolved_imports() const { return {}; }

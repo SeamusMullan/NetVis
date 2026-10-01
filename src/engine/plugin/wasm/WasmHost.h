@@ -30,7 +30,9 @@ namespace netvis::plugin::wasm {
 // ABI v1 pass: the pass facet shipped in v0.6.0 before this export existed, and the
 // compatibility promise is that a plugin built against v1 keeps loading. That is the
 // one place the pass facet differs from the op and parser facets, which require the
-// export (they have no pre-negotiation plugins to protect).
+// export (they have no pre-negotiation plugins to protect). "Does not" means the
+// module has no such export: one that is present but fails (traps, will not compile,
+// runs out of the ABI probe's step budget) is refused, never taken for a v1 pass.
 class WasmPassPlugin final : public PassPlugin {
  public:
   WasmPassPlugin(std::string name, std::vector<uint8_t> image);

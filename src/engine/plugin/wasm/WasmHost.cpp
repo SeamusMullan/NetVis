@@ -116,15 +116,18 @@ void link_capabilities(IM3Module mod, PassHostCtx* ctx) {
 // The pass facet's ABI declaration. `netvis_pass_abi_version` is OPTIONAL here: a pass
 // built before the export existed (the facet shipped in v0.6.0) simply lacks it and is
 // ABI v1 by definition, so absence must not refuse it. Present-but-wrong, or present
-// and failing, is a real mismatch.
+// and failing (traps, will not compile, runs out of steps), is a real mismatch: only
+// the module's own export names say "absent", never the way a call to it failed.
 AbiDeclaration read_pass_abi(WasmModule& mod) {
-  AbiDeclaration d = read_abi_declaration(mod, "netvis_pass_abi_version");
-  if (!d.declared && d.export_missing) {
+  if (!mod.has_export("netvis_pass_abi_version")) {
+    AbiDeclaration d;
     d.declared = true;
+    d.export_missing = true;
     d.version = kPassPluginAbiVersion;
     d.message = "no netvis_pass_abi_version export: taken to be a pre-negotiation ABI v1 pass";
+    return d;
   }
-  return d;
+  return read_abi_declaration(mod, "netvis_pass_abi_version");
 }
 
 }  // namespace
@@ -136,7 +139,9 @@ WasmPassPlugin::WasmPassPlugin(std::string name, std::vector<uint8_t> image)
 
   std::lock_guard<std::mutex> guard(eng.lock());
   PassHostCtx hc;   // no model, no sink: only the version export is called
-  SandboxLimits lim;
+  // Runs on the thread that loads plugins (the UI thread): the small, dedicated probe
+  // budget, not the 200M-step run budget. The memory cap stays the facet's own.
+  const SandboxLimits lim = abi_probe_limits(SandboxLimits{}.max_memory_pages);
   RunResult lerr;
   WasmModule mod = eng.load(image_, lim, &hc, &lerr);
   if (!mod.loaded()) { probe_.message = lerr.message; return; }
@@ -157,25 +162,28 @@ PassResult WasmPassPlugin::run(const ir::Model& model, uint32_t graph_index,
   hc.model = &model;
   hc.graph_index = graph_index;
   hc.report = &report;
-  hc.out = &out;
+  // hc.out stays null until the gates below pass: the ABI export is guest code too,
+  // and a metric it emits while a module is being judged must not survive a refusal.
 
   SandboxLimits lim;
   RunResult lerr;
   WasmModule mod = WasmEngine::instance().load(image_, lim, &hc, &lerr);
-  if (!mod.loaded()) return out;   // honest: a bad plugin yields no metrics
+  if (!mod.loaded()) return PassResult{};   // honest: a bad plugin yields no metrics
 
   // Link the capability imports before the entry call.
   link_capabilities(static_cast<IM3Module>(mod.raw_module()), &hc);
 
   // Refuse a module this host cannot honour: an import nothing answers, or a
   // declared ABI version that is not ours. Metrics a pass produced under a different
-  // ABI would be shown as if they meant what v1 metrics mean.
-  if (!mod.unresolved_imports().empty()) return out;
+  // ABI would be shown as if they meant what v1 metrics mean, so a refusal returns an
+  // empty result (docs/plugin-abi.md: "run() yields no metrics").
+  if (!mod.unresolved_imports().empty()) return PassResult{};
   {
     const AbiDeclaration abi = read_pass_abi(mod);
-    if (!abi.declared || abi.version != kPassPluginAbiVersion) return out;
+    if (!abi.declared || abi.version != kPassPluginAbiVersion) return PassResult{};
   }
 
+  hc.out = &out;   // from here on, and only here, `run` may emit metrics
   int32_t ret = 0;
   RunResult rr = mod.call_i32("run", &ret);
   (void)rr;  // trap/fuel-exhaustion simply yields whatever metrics were emitted.

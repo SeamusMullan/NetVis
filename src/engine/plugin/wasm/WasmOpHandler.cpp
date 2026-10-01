@@ -66,6 +66,9 @@ constexpr uint64_t kOpMaxSteps = 2'000'000;
 // A facet's budget may be below the SDK's ceiling (NV_MAX_*), never above it.
 static_assert(kOpMaxPages <= caps::kCeilingPages, "op budget exceeds NV_MAX_MEMORY_PAGES");
 static_assert(kOpMaxSteps <= caps::kCeilingSteps, "op budget exceeds NV_MAX_STEPS");
+// The ABI probe (probe_op_module) runs under kAbiProbeStepBudget, far below this.
+static_assert(kAbiProbeStepBudget * 10 <= kOpMaxSteps,
+              "the ABI probe budget must stay far below the op run budget");
 
 // Threaded to every op import via IM3ImportContext::userdata. Borrows the ctx for
 // one invocation; captures the guest's pushed results.
@@ -385,24 +388,29 @@ m3ApiRawFunction(op_set_flops) {
 }
 // void op_set_output_shape(i32 slot, i32 dims_ptr, i32 rank, i32 dtype)
 //
-// A rank above NV_MAX_RANK DROPS the output: the shape stays unknown. It must not be
-// clamped to the first NV_MAX_RANK dims - that records a truncated, lower-rank shape
-// as a known one, which is a fabricated shape (the honesty rule), and it is exactly
-// what a plugin built against a LATER v1 header with a raised NV_MAX_RANK would hit
-// on this host. The parser facet refuses the same overflow (read_dims).
+// A rank above NV_MAX_RANK leaves the shape UNKNOWN: the entry keeps the slot and the
+// dtype and carries an empty shape, which is how ShapeResult says "do not set a shape
+// for this slot". It must not be clamped to the first NV_MAX_RANK dims - that records
+// a truncated, lower-rank shape as a known one, which is a fabricated shape (the
+// honesty rule), and it is exactly what a plugin built against a LATER v1 header with
+// a raised NV_MAX_RANK would hit on this host. The dtype is not truncated by the
+// overflow, so it is still carried. The parser facet refuses the same overflow
+// (read_dims).
 m3ApiRawFunction(op_set_output_shape) {
   m3ApiGetArg(int32_t, slot);
   m3ApiGetArgMem(int64_t*, dims);
   m3ApiGetArg(int32_t, rank);
   m3ApiGetArg(int32_t, dtype);
   OpHostCtx* h = octx(_ctx);
-  if (h && slot >= 0 && rank >= 0 && rank <= caps::kMaxRank) {
-    const int32_t r = rank;   // already within NV_MAX_RANK: bounds-check this exact count (§A.2)
+  if (h && slot >= 0 && rank >= 0) {
+    const int32_t r = rank;
     ShapeResult::Out out;
     out.slot = static_cast<uint32_t>(slot);
     if (dtype >= 0 && dtype <= static_cast<int32_t>(ir::DType::Unknown))
       out.dtype = static_cast<ir::DType>(dtype);
-    if (r > 0 && dims) {
+    // Over the cap: the dims are neither read nor recorded; the shape stays empty.
+    // Within it, bounds-check this exact count against guest memory (§A.2).
+    if (r > 0 && r <= caps::kMaxRank && dims) {
       if (!m3ApiIsNullPtr(dims) &&
           ((uint64_t)(uintptr_t)(dims) + static_cast<uint64_t>(r) * 8u) <=
               ((uint64_t)(uintptr_t)(_mem) + m3_GetMemorySize(runtime))) {
@@ -519,7 +527,10 @@ WasmAbiProbe probe_op_module(const std::vector<uint8_t>& image) {
 
   std::lock_guard<std::mutex> guard(eng.lock());   // §0.3, same as invoke_facet
   OpHostCtx hc;   // ctx == nullptr: every read import answers its "unresolved" value
-  SandboxLimits lim{kOpMaxPages, kOpMaxSteps};
+  // The probe runs on the thread that loads plugins (the UI thread), so it gets the
+  // small, dedicated probe budget, not the op run budget: a module whose start
+  // section never ends must not freeze start-up.
+  const SandboxLimits lim = abi_probe_limits(kOpMaxPages);
   RunResult lerr;
   WasmModule mod = eng.load(image, lim, &hc, &lerr);
   if (!mod.loaded()) { p.message = lerr.message; return p; }

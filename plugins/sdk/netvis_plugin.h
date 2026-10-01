@@ -58,7 +58,11 @@ typedef uint32_t nv_strid_t;   /* interned string id (StringId::id) */
  * host enforces. NV_MAX_MEMORY_PAGES / NV_MAX_STEPS are the CEILING a plugin may
  * rely on: parser parse() and a pass run() get all of it, the op-handler facet
  * gets 64 pages / 2,000,000 steps per call, and a parser's can_parse() sniff gets
- * 4 pages / 500,000 steps. A facet is never granted more than the ceiling. */
+ * 4 pages / 500,000 steps. A facet is never granted more than the ceiling.
+ * Loading a plugin is budgeted separately and far smaller: the module's start
+ * section and its netvis_<facet>_abi_version export must each finish within
+ * 50,000 steps or the plugin is refused (docs/plugin-abi.md, "ABI probe budget");
+ * keep start sections trivial and do real setup in the entry points. */
 #define NV_MAX_MEMORY_PAGES 256u        /* 16 MiB linear-memory cap           */
 #define NV_MAX_STEPS        200000000ull/* fuel: yield-check decrements       */
 #define NV_NULL_GUARD_OFF   8u          /* offsets < 8 are the null guard      */

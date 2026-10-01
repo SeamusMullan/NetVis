@@ -69,6 +69,9 @@ constexpr uint32_t kSniffMaxPages = 4;
 constexpr uint64_t kSniffMaxSteps = 500'000;
 static_assert(kSniffMaxPages <= caps::kCeilingPages, "sniff budget exceeds NV_MAX_MEMORY_PAGES");
 static_assert(kSniffMaxSteps <= caps::kCeilingSteps, "sniff budget exceeds NV_MAX_STEPS");
+// The ABI probe (probe_parser_module) runs under kAbiProbeStepBudget, far below this.
+static_assert(kAbiProbeStepBudget * 10 <= kSniffMaxSteps,
+              "the ABI probe budget must stay far below the sniff budget");
 
 // A recorded tensor byte range (a weight). host_read_range must never return bytes
 // overlapping one of these, and no rendered string's source range may overlap one.
@@ -554,7 +557,9 @@ WasmAbiProbe probe_parser_module(const std::vector<uint8_t>& image) {
 
   std::lock_guard<std::mutex> guard(eng.lock());
   ParseHostCtx hc;   // no file, no model: only the version export is called
-  SandboxLimits lim{kSniffMaxPages, kSniffMaxSteps};
+  // Runs on the thread that loads plugins (the UI thread): the small, dedicated probe
+  // budget, not the sniff or parse budget.
+  const SandboxLimits lim = abi_probe_limits(kSniffMaxPages);
   RunResult lerr;
   WasmModule mod = eng.load(image, lim, &hc, &lerr);
   if (!mod.loaded()) { p.message = lerr.message; return p; }

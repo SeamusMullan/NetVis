@@ -37,6 +37,8 @@ NetVis never eagerly decodes weights; a plugin must not be able to change that.
   force a giant allocation.
 - **Fuel/step cap** via a strong `m3_Yield` override + a loop-backedge patch: a
   runaway loop or recursion is trapped, the plugin disabled, the app survives.
+- **ABI probe budget**: loading a plugin runs a little guest code (see **ABI probe
+  budget** below), so that load gets its own, much smaller step budget.
 - **Null-guard** offset 8 — offsets `< NV_NULL_GUARD_OFF` are treated as null.
 - Exports are validated to be `() -> i32` (or `() -> ()`) before the call; a
   wrong-signature or missing export is a clean load error, never UB.
@@ -51,6 +53,7 @@ NetVis never eagerly decodes weights; a plugin must not be able to change that.
 | Parser `netvis_parse`, pass `run` | `NV_MAX_MEMORY_PAGES` | `NV_MAX_STEPS` |
 | Parser `netvis_can_parse` (the sniff) | 4 pages | 500,000 |
 | Op handler (every `netvis_op_*` call, memoized per op-type) | 64 pages | 2,000,000 |
+| **ABI probe** (loading a plugin: start section + `netvis_<facet>_abi_version`) | the facet's own (op 64, parser 4, pass 256) | **50,000** |
 
 A facet may be granted less than the ceiling, never more. The marshalling caps
 (`NV_MAX_RANK`, `NV_MAX_NODE_IO`, `NV_MAX_ATTR_LEN`, `NV_MAX_INTERN_LEN`,
@@ -59,6 +62,31 @@ facet sections below. The host does not keep its own copies of any of these: it 
 them from the header (`src/engine/plugin/wasm/SdkCaps.h`) and `static_assert`s every
 per-facet budget against the ceiling, so a cap cannot be edited in one place and left
 behind in the other.
+
+### ABI probe budget
+
+Before anything is registered, the host loads every WASM plugin once to ask which ABI
+it was built for: it instantiates the module, which runs its **start section** (the
+wasm start function, if it has one), and then calls its `netvis_<facet>_abi_version`
+export. That load happens wherever plugins are loaded — at start-up and each time a
+plugin is toggled in the Plugins panel — so it must not be able to hold the app up. It
+therefore runs under its own step budget, `kAbiProbeStepBudget` =
+**50,000 steps**, far below the parse/run and sniff budgets above. A step is one
+function call or one loop iteration.
+
+**The module's start section and its ABI-version export must each finish within that
+budget.** A version read is a constant function and a toolchain-built start section is
+a handful of calls, so neither comes close; a module whose start section loops, or that
+does real work there, is refused — not registered — with this reason in the plugin
+load diagnostics (the Plugins panel's error text):
+
+> module exceeded the ABI probe budget (50000 steps): its start section and
+> `netvis_op_abi_version` must each finish within it
+
+Put real initialisation in the entry points (`netvis_op_*`, `netvis_parse`, `run`),
+which run under the facet budgets above, not in the start section. (A pass that does
+not export the optional `netvis_pass_abi_version` has nothing for the probe to call, so
+its start section first runs in `run()`, under the pass's own budget.)
 
 ## Compatibility promise (ABI v1)
 
@@ -108,7 +136,7 @@ calls it.
 | Adding a host import | An ABI v1 plugin does not import it. A plugin that does simply will not load on an older host — it is refused with the import named (**Link**, below), the author's choice made at build time. |
 | Adding an optional export the host probes for | Absent export → the host falls back exactly as it does today (honest-unknown). |
 | Adding a defaulted virtual to a C++ handler interface | `OpHandler::color/flops/infer_shape` are already defaulted; a handler that does not implement a newly added one is not broken by it. |
-| Raising a cap (`NV_MAX_*`) | A plugin built against the old header still marshals within the old, smaller bound. A plugin built against the *raised* header and run on an older host is not refused — it declares v1 — but the older host never truncates or guesses: the op facet drops an output shape whose rank exceeds its cap (the shape stays unknown), and the parser facet's calls reject the over-cap value (`host_add_value` / `host_add_node` return -1; `host_record_tensor` records the tensor with an unknown shape). |
+| Raising a cap (`NV_MAX_*`) | A plugin built against the old header still marshals within the old, smaller bound. A plugin built against the *raised* header and run on an older host is not refused — it declares v1 — but the older host never truncates or guesses: the op facet records an output whose rank exceeds its cap with its dtype and no shape (the shape stays unknown), and the parser facet's calls reject the over-cap value (`host_add_value` / `host_add_node` return -1; `host_record_tensor` records the tensor with an unknown shape). |
 | Anything behind `#if defined(__wasm__)` that is not a name, a signature or a number — the bump allocator's body, an attribute spelling | Guest-side convenience, not wire format. Only the helper names and `NV_ARENA_BYTES` are frozen. |
 
 Each of these still edits the freeze file. That is the point: the edit is where
@@ -165,7 +193,14 @@ plugin meets them:
      export existed, and the promise above forbids refusing a v1 plugin for lacking
      something v1 never asked for, so a pass with no `netvis_pass_abi_version` is an
      ABI v1 pass. A pass that *does* export it must return the host's version; any
-     other value is refused and `run()` yields no metrics.
+     other value is refused and `run()` yields no metrics — not even one the export
+     itself emitted while the module was being judged. "Does not export it" is read
+     off the module's export names: an export that is present but fails (it traps, it
+     will not compile, it overruns the probe budget) is refused, never taken for the
+     absent-export case.
+
+   The whole probe runs under the **ABI probe budget** above; a module that overruns
+   it is refused with that reason.
 3. **Link** — after linking, every function import the module declares must be bound.
    wasm3 leaves an import unbound when the host has no function of that name *and*
    when the host has one but the guest declared a different signature (it reports
@@ -193,6 +228,13 @@ that a gate which refuses everything cannot pass:
   future version, a declared v1, and a pre-negotiation module with no export (which
   must keep running). A WASM parser with a missing export is covered by its own
   fixture.
+- **ABI probe budget**: for each facet, a start section that never ends, an ABI export
+  that never returns, and a start section that finishes but needs far more steps than
+  the budget — each refused with the budget named (and, for the op handler, shown
+  through `discover_and_load_plugins`), next to a control whose short start section is
+  admitted. A pass's ABI export that emits a metric before returning an unsupported
+  version leaves `run()` with no metrics, and one whose export is present but broken
+  is refused rather than run as v1.
 - **Link**: op handler — a real import name with the wrong signature, an import the
   host has no function for, and `op_input_const_ints` declared with the header's
   signature (which the host used to reject). The parser and pass adapters run the same
@@ -221,10 +263,11 @@ initializer elem-count/byte-len/dtype, attrs, the one guarded `op_input_const_in
 Pushes its verdict via out-imports (`op_set_category/flops/output_shape/color`). The
 host **clamps** a returned category to a valid `OpCategory` (a hostile `9999` →
 `Other`) and forces opaque color, so no invalid value reaches the view. A shape is
-never clamped: `op_set_output_shape` with a rank above `NV_MAX_RANK` drops that
-output (the shape stays unknown) instead of recording a truncated one as known. Per
-§A.1 a WASM handler runs only on the worker cost/shape pass (memoized per op-type);
-the render thread reads the cached scalar — the sandbox is never entered per frame.
+never clamped: `op_set_output_shape` with a rank above `NV_MAX_RANK` records that
+output with its dtype and no shape (the shape stays unknown) instead of recording a
+truncated one as known. Per §A.1 a WASM handler runs only on the worker cost/shape
+pass (memoized per op-type); the render thread reads the cached scalar — the sandbox
+is never entered per frame.
 
 ## Parser facet (module `"netvis"`)
 
@@ -241,7 +284,7 @@ plugin parser is tried only for a file no built-in claimed.
 Export `run` (`() -> i32`). Reads `host_node_count` / `host_total_flops` /
 `host_total_params`; emits scalars via `host_emit_metric`. May export
 `netvis_pass_abi_version` (see **How a mismatch is refused**); a pass that does not is
-ABI v1.
+ABI v1, while one that does and fails it is refused.
 
 ## Worked examples
 

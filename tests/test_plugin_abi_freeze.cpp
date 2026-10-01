@@ -26,7 +26,10 @@
 //      and discover_and_load_plugins), for a plugin from the future, one that
 //      declares no version, one the host cannot link, and one with a bad manifest.
 //      Each refusal case sits next to a matching-plugin control, so a gate that
-//      refuses everything cannot pass.
+//      refuses everything cannot pass. The same goes for the ABI probe's own bound
+//      (a module whose start section never ends is refused after a small step
+//      budget, with that reason) and for the details of the pass gate (a refused
+//      pass yields no metrics; a broken ABI export is refused, not taken for v1).
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -36,6 +39,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -1037,9 +1041,9 @@ TEST_CASE("ABI v1: a module whose imports the host cannot bind is refused") {
 }
 
 // ===========================================================================
-// 7. Shape honesty: a rank above NV_MAX_RANK is dropped, never truncated.
+// 7. Shape honesty: a rank above NV_MAX_RANK stays unknown, never truncated.
 // ===========================================================================
-TEST_CASE("ABI v1: op_set_output_shape drops a rank above NV_MAX_RANK instead of truncating") {
+TEST_CASE("ABI v1: op_set_output_shape leaves a rank above NV_MAX_RANK unknown instead of truncating") {
   if (!wasm_available()) return;
 
   ir::Model model = make_one_node("MyShapeOp");
@@ -1059,15 +1063,21 @@ TEST_CASE("ABI v1: op_set_output_shape drops a rank above NV_MAX_RANK instead of
     CHECK(sr.outputs[0].dtype == ir::DType::F32);
   }
 
-  SUBCASE("rank 9, one over the cap: no output at all (the shape stays unknown)") {
+  SUBCASE("rank 9, one over the cap: the output keeps its dtype and no shape (unknown)") {
     // A plugin built against a later v1 header with a raised NV_MAX_RANK reaches this
     // host. The old host kept the first eight dims and reported a known rank-8 shape:
-    // a fabricated one. It must be honest-unknown instead.
+    // a fabricated one. It must be honest-unknown instead - and an empty shape is how
+    // ShapeResult spells that ("don't set a shape for this slot"), while the dtype,
+    // which the overflow does not touch, is still carried.
     auto image = load_image("plugin_ophandler_shape_r9.wasm");
     REQUIRE(image != nullptr);
     wasm::WasmOpHandler h("shape-r9", image);
     REQUIRE(h.api_version() == kOpHandlerAbiVersion);
-    CHECK(h.infer_shape(ctx).outputs.empty());
+    const ShapeResult sr = h.infer_shape(ctx);
+    REQUIRE(sr.outputs.size() == 1);
+    CHECK(sr.outputs[0].slot == 0);
+    CHECK(sr.outputs[0].shape.empty());              // not truncated to eight dims
+    CHECK(sr.outputs[0].dtype == ir::DType::F32);    // the declared dtype survives
   }
 }
 
@@ -1171,6 +1181,51 @@ TEST_CASE("ABI v1: a WASM pass plugin is gated on the ABI it declares") {
     CHECK(reg.snapshot()->passes.count("ok-pass") == 1);
   }
 
+  SUBCASE("a refused pass yields no metrics even when its ABI export emitted one") {
+    // The ABI export is guest code, and it can call host_emit_metric. The refusal path
+    // used to return the metrics collected so far, so a module declaring a future ABI
+    // that emitted one while being judged still showed it - the opposite of the
+    // documented "run() yields no metrics".
+    wasm::WasmPassPlugin pass("emitting-future-pass",
+                              read_bytes("tests/fixtures/plugin_pass_abi_emits_future.wasm"));
+    CHECK(pass.api_version() == 2);
+    CHECK(pass.run(m, 0, report).metrics.empty());
+  }
+
+  SUBCASE("control: a pass declaring v1 reports run()'s metric, and only that one") {
+    // Same module shape as above but declaring the host's ABI: it runs, so a refusal
+    // that dropped everything could not pass. The metric its ABI export emitted while
+    // being judged (7) is not a metric; run()'s (2 * 21) is.
+    wasm::WasmPassPlugin pass("emitting-v1-pass",
+                              read_bytes("tests/fixtures/plugin_pass_abi_emits_v1.wasm"));
+    CHECK(pass.api_version() == kPassPluginAbiVersion);
+    const PassResult res = pass.run(m, 0, report);
+    REQUIRE(res.metrics.size() == 1);
+    CHECK(res.metrics[0].name == "double_flops");
+    CHECK(res.metrics[0].value == doctest::Approx(42.0));
+  }
+
+  SUBCASE("a pass whose ABI export is present but broken is refused, not taken for v1") {
+    // netvis_pass_abi_version exists but its body calls function index 99, which the
+    // module does not have. wasm3 reports that as "function lookup failed" - the very
+    // error it gives for a name nothing answers to - so the export used to be read as
+    // absent and the module run as a pre-negotiation v1 pass. If it were, run() below
+    // would report double_flops = 42.
+    wasm::WasmPassPlugin pass("broken-abi-pass",
+                              read_bytes("tests/fixtures/plugin_pass_abi_broken.wasm"));
+    CHECK(pass.probe().loaded);
+    CHECK_FALSE(pass.probe().abi.declared);
+    CHECK_FALSE(pass.probe().abi.export_missing);   // present, not absent
+    CHECK(pass.api_version() == 0);
+    const std::string why =
+        pass.probe().refusal(kPassPluginAbiVersion, "netvis_pass_abi_version");
+    CHECK_MESSAGE(why.find("present but failed") != std::string::npos, "refusal said: " << why);
+    CHECK(pass.run(m, 0, report).metrics.empty());
+    reg.register_pass(std::make_unique<wasm::WasmPassPlugin>(
+        "broken-abi-pass", read_bytes("tests/fixtures/plugin_pass_abi_broken.wasm")));
+    CHECK(reg.snapshot()->passes.count("broken-abi-pass") == 0);
+  }
+
   SUBCASE("a pass that predates the export (the v0.6.0 shape) is ABI v1 and keeps running") {
     // The pass facet shipped before netvis_pass_abi_version existed. Refusing a
     // module for lacking it would break every shipped pass, which the ABI v1
@@ -1184,6 +1239,183 @@ TEST_CASE("ABI v1: a WASM pass plugin is gated on the ABI it declares") {
     reg.register_pass(std::make_unique<wasm::WasmPassPlugin>(
         "legacy-pass", read_bytes("tests/fixtures/plugin_pass.wasm")));
     CHECK(reg.snapshot()->passes.count("legacy-pass") == 1);
+  }
+
+  reg.reset_to_builtins();
+}
+
+// ===========================================================================
+// 9b. "Absent" is decided by the module's export names, not by an error string.
+// ===========================================================================
+TEST_CASE("ABI v1: an export that is present but fails is not reported as absent") {
+  if (!wasm_available()) return;
+
+  wasm::WasmEngine& eng = wasm::WasmEngine::instance();
+  std::lock_guard<std::mutex> guard(eng.lock());
+  auto load = [&](const char* fixture) {
+    wasm::RunResult lerr;
+    wasm::WasmModule mod = eng.load(read_bytes(std::string("tests/fixtures/") + fixture),
+                                    wasm::SandboxLimits{}, nullptr, &lerr);
+    REQUIRE_MESSAGE(mod.loaded(), fixture << ": " << lerr.message);
+    return mod;
+  };
+
+  SUBCASE("a pass with no ABI export: absent") {
+    wasm::WasmModule mod = load("plugin_pass.wasm");
+    CHECK(mod.has_export("run"));
+    CHECK_FALSE(mod.has_export("netvis_pass_abi_version"));
+    int32_t v = -1;
+    const wasm::RunResult r = mod.call_i32("netvis_pass_abi_version", &v);
+    CHECK(r.status == wasm::RunStatus::LoadError);
+    CHECK(r.export_missing);
+  }
+
+  SUBCASE("a pass whose ABI export calls a function that does not exist: present") {
+    wasm::WasmModule mod = load("plugin_pass_abi_broken.wasm");
+    CHECK(mod.has_export("netvis_pass_abi_version"));
+    int32_t v = -1;
+    const wasm::RunResult r = mod.call_i32("netvis_pass_abi_version", &v);
+    CHECK(r.status == wasm::RunStatus::LoadError);   // it fails ...
+    CHECK_FALSE(r.export_missing);                   // ... but it is there
+    // The same call for a name that really is absent, to show the two differ.
+    CHECK(mod.call_i32("netvis_no_such_export", &v).export_missing);
+  }
+
+  SUBCASE("control: a working ABI export is present and returns") {
+    wasm::WasmModule mod = load("plugin_pass_abi1.wasm");
+    CHECK(mod.has_export("netvis_pass_abi_version"));
+    int32_t v = -1;
+    CHECK(mod.call_i32("netvis_pass_abi_version", &v).status == wasm::RunStatus::Ok);
+    CHECK(v == 1);
+  }
+}
+
+// ===========================================================================
+// 9c. The ABI probe is bounded: loading a plugin never runs guest code for long.
+// ===========================================================================
+// The probe runs wherever plugins are loaded - the UI thread, at start-up and on
+// every Plugins-panel toggle - and it executes guest code: wasm3 runs the module's
+// start section inside the first function lookup, then the ABI export runs. It used
+// to be bounded only by the budget of the work the module is later trusted with
+// (500,000 steps for the parser sniff, 2,000,000 for an op handler, 200,000,000 for a
+// pass), so a hostile start section froze start-up for as long as that lasted. The
+// fixtures below never finish, or need far more steps than a version read can
+// justify; each must be refused with the budget named, and its control (a short start
+// section) must still be admitted so the budget is not simply refusing everything.
+// No timing is asserted: a probe that ignored the budget would not return at all.
+TEST_CASE("ABI v1: a module that cannot answer the ABI question within the probe budget is refused") {
+  if (!wasm_available()) return;
+
+  Registry& reg = Registry::instance();
+  reg.reset_to_builtins();
+  const std::string current = R"("api_version": 1,)";
+  const std::string reason = "ABI probe budget";
+
+  // The three ways to blow the budget, per facet. start_long finishes on its own
+  // (1,000,000 iterations) and is far below every run budget: it is refused because
+  // of the probe's budget, not because it is infinite.
+  const char* const kVariants[] = {"start_loop", "export_loop", "start_long"};
+
+  // The budget is small, shared, and far below what any facet runs under (the
+  // static_asserts in WasmRuntime.h / the adapters hold the margin; this holds the
+  // number the docs promise).
+  CHECK(wasm::kAbiProbeStepBudget == 50'000);
+
+  SUBCASE("op handler: load_wasm_op_plugin refuses it and the built-in answer stands") {
+    for (const char* v : kVariants) {
+      const std::string fixture = std::string("plugin_probe_op_") + v + ".wasm";
+      CAPTURE(fixture);
+      PluginDir pd("probe_op", op_manifest(current), fixture);
+      const std::string why = wasm::load_wasm_op_plugin(pd.manifest);
+      CHECK_MESSAGE(why.find(reason) != std::string::npos, "loader said: " << why);
+      CHECK(reg.resolve_op("matmul").origin == Origin::Builtin);
+
+      auto image = load_image(fixture);
+      REQUIRE(image != nullptr);
+      const wasm::WasmAbiProbe probe = wasm::probe_op_module(*image);
+      CHECK(probe.loaded);
+      CHECK(probe.abi.fuel_exhausted);
+      CHECK_FALSE(probe.compatible(kOpHandlerAbiVersion));
+    }
+  }
+
+  SUBCASE("op handler: the reason reaches the Plugins panel through discovery") {
+    const fs::path root = fs::temp_directory_path() / "nv_abi_freeze_probe_discovery";
+    fs::remove_all(root);
+    fs::create_directories(root / "hostile");
+    std::ofstream(root / "hostile" / "plugin.json") << op_manifest(current);
+    const std::vector<uint8_t> bytes =
+        read_bytes("tests/fixtures/plugin_probe_op_start_loop.wasm");
+    {
+      std::ofstream wf((root / "hostile" / "plugin.wasm").string(), std::ios::binary);
+      wf.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto manifests = discover_and_load_plugins(
+        [](std::string_view, PluginKind) { return true; }, root.string());
+    REQUIRE(manifests.size() == 1);
+    CHECK(manifests[0].enabled);
+    CHECK_FALSE(manifests[0].registered);
+    CHECK_MESSAGE(manifests[0].error.find(reason) != std::string::npos,
+                  "panel error: " << manifests[0].error);
+    CHECK(reg.resolve_op("matmul").origin == Origin::Builtin);
+    fs::remove_all(root);
+  }
+
+  SUBCASE("op handler control: a short start section is admitted") {
+    PluginDir pd("probe_op_ok", op_manifest(current), "plugin_probe_op_start_short.wasm");
+    CHECK(wasm::load_wasm_op_plugin(pd.manifest).empty());
+    CHECK(reg.resolve_op("matmul").origin == Origin::Wasm);
+  }
+
+  SUBCASE("parser: load_wasm_parser_plugin refuses it and registers nothing") {
+    const size_t before = reg.snapshot()->parsers.size();
+    for (const char* v : kVariants) {
+      const std::string fixture = std::string("plugin_probe_parser_") + v + ".wasm";
+      CAPTURE(fixture);
+      PluginDir pd("probe_parser", parser_manifest(current), fixture);
+      const std::string why = wasm::load_wasm_parser_plugin(pd.manifest);
+      CHECK_MESSAGE(why.find(reason) != std::string::npos, "loader said: " << why);
+      CHECK(reg.snapshot()->parsers.size() == before);
+    }
+  }
+
+  SUBCASE("parser control: a short start section is admitted") {
+    const size_t before = reg.snapshot()->parsers.size();
+    PluginDir pd("probe_parser_ok", parser_manifest(current),
+                 "plugin_probe_parser_start_short.wasm");
+    CHECK(wasm::load_wasm_parser_plugin(pd.manifest).empty());
+    CHECK(reg.snapshot()->parsers.size() == before + 1);
+  }
+
+  SUBCASE("pass: the adapter's probe refuses it, so the Registry never admits it") {
+    // Not run(): a refused pass is never registered, and run() re-checks the module
+    // under the pass's own (full) budget by design.
+    for (const char* v : kVariants) {
+      const std::string fixture = std::string("plugin_probe_pass_") + v + ".wasm";
+      CAPTURE(fixture);
+      wasm::WasmPassPlugin pass("probe-pass", read_bytes("tests/fixtures/" + fixture));
+      CHECK(pass.probe().loaded);
+      CHECK(pass.probe().abi.fuel_exhausted);
+      CHECK(pass.api_version() == 0);
+      const std::string why =
+          pass.probe().refusal(kPassPluginAbiVersion, "netvis_pass_abi_version");
+      CHECK_MESSAGE(why.find(reason) != std::string::npos, "refusal said: " << why);
+      reg.register_pass(std::make_unique<wasm::WasmPassPlugin>(
+          "probe-pass", read_bytes("tests/fixtures/" + fixture)));
+      CHECK(reg.snapshot()->passes.count("probe-pass") == 0);
+    }
+  }
+
+  SUBCASE("pass control: a short start section is admitted") {
+    wasm::WasmPassPlugin pass("probe-pass-ok",
+                              read_bytes("tests/fixtures/plugin_probe_pass_start_short.wasm"));
+    CHECK(pass.api_version() == kPassPluginAbiVersion);
+    CHECK(pass.probe().abi.declared);
+    CHECK(pass.probe().refusal(kPassPluginAbiVersion, "netvis_pass_abi_version").empty());
+    reg.register_pass(std::make_unique<wasm::WasmPassPlugin>(
+        "probe-pass-ok", read_bytes("tests/fixtures/plugin_probe_pass_start_short.wasm")));
+    CHECK(reg.snapshot()->passes.count("probe-pass-ok") == 1);
   }
 
   reg.reset_to_builtins();

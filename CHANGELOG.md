@@ -25,6 +25,13 @@ This file starts at the relicensing; earlier history is in the git tags and GitH
   v1, because that facet shipped before the export existed); and every import a
   module declares must bind, with the unbound one named. WASM adapters now report the
   version their module declared, so the Registry's own version check applies to them.
+  That load-time probe runs guest code (the module's start section, then its
+  ABI-version export) wherever plugins are loaded, so it has its own 50,000-step
+  budget, far below the run budgets: a module whose start section or ABI export does
+  not finish within it is refused, with the budget named in the Plugins panel, instead
+  of freezing start-up for as long as the module's run budget lasts. A pass whose ABI
+  export is present but broken is refused rather than taken for a pre-negotiation v1
+  pass, and a refused pass reports no metrics.
   Negotiation is tested for the manifest (all three loaders), the module (op, parser
   and pass), the link step (op handlers), and the Registry (all three kinds), each next
   to a matching-plugin control, plus end to end through `load_wasm_op_plugin` ->
@@ -33,9 +40,9 @@ This file starts at the relicensing; earlier history is in the git tags and GitH
   parameters while the SDK header declares three, so wasm3 rejected every SDK-built
   plugin's import and the call never worked. Fixed `op_set_output_shape` clamping a
   rank above `NV_MAX_RANK` to its first 8 dims and recording that as a known shape; it
-  now drops the output, so the shape stays unknown. The WASM adapters take their
-  marshalling and sandbox caps from the SDK header instead of keeping their own
-  copies.
+  now records the output with its dtype and no shape, so the shape stays unknown. The
+  WASM adapters take their marshalling and sandbox caps from the SDK header instead of
+  keeping their own copies.
 - Native Wayland support on Linux. The GLFW Wayland backend is now built whenever its dev packages are present (`NETVIS_GLFW_WAYLAND=AUTO`, the new default) and is always built for release packages; the X11 backend stays in the same binary as a fallback. `NETVIS_PLATFORM=x11|wayland` forces a backend at runtime. A `netvis.desktop` entry is installed so Wayland compositors show the app icon, and GLFW errors are now reported on stderr instead of the app exiting silently.
 - MXFP4 and NVFP4 support. GGUF `MXFP4` (ggml type 39) and `NVFP4` (type 40) tensors are recognised, labelled by name, and decodable in the weight inspector's one-block preview (the preview now shows up to 64 values, the NVFP4 block size). SafeTensors `F4`/`F8_E8M0`/`F8_E4M3`/…, ONNX `FLOAT4E2M1`/`FLOAT8E8M0`/`FLOAT8E4M3FN`/…, and PyTorch `float4_e2m1fn_x2`/`float8_*` tensors (saved via `_rebuild_tensor_v3`, which torch uses for these dtypes) now show their exact element type instead of `?`.
 - **Fixed: the Windows installer could not modify PATH on a machine with a long PATH** (#149). CPack's stock NSIS
