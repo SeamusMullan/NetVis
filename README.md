@@ -46,7 +46,10 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
 - **Instant open:** memory-mapped I/O; structure parsed off the main thread; the
   window is interactive the moment the `mmap` succeeds.
 - **Compute-graph canvas:** a single custom-drawn region (no per-node widgets) with
-  viewport culling, level-of-detail tiers, pan/zoom, selection, and a minimap.
+  viewport culling, level-of-detail tiers, Netron-style pan/zoom (scroll or a
+  two-finger swipe pans, Ctrl/Cmd+scroll or a pinch zooms at the pointer;
+  scroll-to-zoom is one preference away, see
+  [canvas controls](docs/canvas-controls.md)), selection, and a minimap.
   Draw cost is O(visible), not O(total).
 - **Collapse tree:** repeated blocks (e.g. 32 identical decoder layers) are detected
   and collapsed into `×N` super-nodes, so even 100k-node graphs lay out in
