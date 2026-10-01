@@ -352,6 +352,43 @@ TEST_CASE("OpCategory: gap-fill samples") {
   CHECK(categorize_op("Result") == OpCategory::IO);
 }
 
+// #138/#109: Caffe display names. Unvetted Caffe layers keep their own names
+// (or a `Caffe` prefix) and these keys colour them; none may land in a category
+// whose CostModel rule would invent FLOPs without an output shape.
+TEST_CASE("OpCategory: Caffe display names") {
+  CHECK(categorize_op("Convolution") == OpCategory::Conv);
+  CHECK(categorize_op("Deconvolution") == OpCategory::Conv);
+  CHECK(categorize_op("InnerProduct") == OpCategory::MatMul);
+  CHECK(categorize_op("Pooling") == OpCategory::Pool);
+  CHECK(categorize_op("SPP") == OpCategory::Pool);
+  CHECK(categorize_op("LRN") == OpCategory::Norm);
+  CHECK(categorize_op("MeanVarianceNormalization") == OpCategory::Norm);
+  CHECK(categorize_op("Scale") == OpCategory::Elementwise);
+  CHECK(categorize_op("Bias") == OpCategory::Elementwise);
+  CHECK(categorize_op("Power") == OpCategory::Elementwise);
+  CHECK(categorize_op("Eltwise") == OpCategory::Elementwise);
+  CHECK(categorize_op("Threshold") == OpCategory::Activation);
+  CHECK(categorize_op("Crop") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeSplit") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeSlice") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeFlatten") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeReshape") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeTile") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeLSTM") == OpCategory::Recurrent);
+  CHECK(categorize_op("CaffeRNN") == OpCategory::Recurrent);
+  CHECK(categorize_op("CaffeParameter") == OpCategory::Tensor);
+  CHECK(categorize_op("Input") == OpCategory::IO);
+  CHECK(categorize_op("Data") == OpCategory::IO);
+  CHECK(categorize_op("ImageData") == OpCategory::IO);
+  CHECK(categorize_op("MemoryData") == OpCategory::IO);
+  CHECK(categorize_op("HDF5Data") == OpCategory::IO);
+  CHECK(categorize_op("WindowData") == OpCategory::IO);
+  CHECK(categorize_op("DummyData") == OpCategory::IO);
+  // Reduce counts |input|, which would give these FLOPs with no output shape.
+  CHECK(categorize_op("Reduction") == OpCategory::Other);
+  CHECK(categorize_op("CaffeArgMax") == OpCategory::Other);
+}
+
 TEST_CASE("OpCategory: category_name is non-empty for every category") {
   // Exhaustive over Conv..Other (Other is last). category_name must return a
   // stable non-empty label for each, including the three new v0.4.0 ones.
