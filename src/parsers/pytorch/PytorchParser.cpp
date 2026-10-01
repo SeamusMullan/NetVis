@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "ir/IR.h"
 #include "parsers/Parser.h"
 #include "parsers/pytorch/PickleVM.h"
+#include "parsers/pytorch/TorchScriptIR.h"
 
 #include "miniz.h"
 
@@ -150,67 +152,74 @@ void scan_torchscript_code(const uint8_t* data, size_t len, OpInventory& inv) {
 }
 
 // --- state_dict walking -------------------------------------------------------
-// Recursively collect (name -> TensorRef) from the unpickled value tree. Keys
-// are joined with '.' so nested modules read like "encoder.layers.0.weight".
+// Collect (name -> TensorRef) from the unpickled value tree. Keys are joined
+// with '.' so nested modules read like "encoder.layers.0.weight".
+//
+// The traversal is ts::for_each_tensor, the one ModuleEnv also uses for
+// canonical tensor names, so a parameter has the same name in the tensor table
+// and in a graph. It descends dicts, lists, tuples and -- #137 -- TorchScript
+// objects (their recorded BUILD state, in slot order): torch.jit.save and .ptl
+// archives pickle the module itself, not a state_dict.
 //
 // SECURITY: the pickle VM's memo (BINGET/DUP) lets a hostile file build a value
 // graph that is cyclic (a list containing itself) or a shared DAG with
 // exponentially many root-to-leaf paths (~n opcodes → 2^n paths). A naive
-// recursion would stack-overflow or hang. We guard both: a `visited` set keyed
-// on Value identity visits each shared node at most once (collapsing the DAG and
-// breaking cycles), and a depth cap bounds pathological nesting. Malformed input
-// therefore yields a partial/empty result, never a crash.
-constexpr int kMaxCollectDepth = 256;
-
-void collect_tensors(const ValuePtr& v, const std::string& prefix,
-                     ir::Model& model,
-                     std::unordered_set<const Value*>& visited, int depth) {
-  if (!v || depth > kMaxCollectDepth) return;
-  // Only containers can recurse / be shared; gating them on `visited` breaks
-  // cycles and dedups shared subtrees without suppressing repeated leaf tensors.
-  if (v->kind == Value::Kind::Dict || v->kind == Value::Kind::List ||
-      v->kind == Value::Kind::Tuple) {
-    if (!visited.insert(v.get()).second) return;  // already expanded this node
-  }
-  switch (v->kind) {
-    case Value::Kind::Tensor: {
-      ir::TensorRef t = v->tensor;
-      t.name = model.intern(prefix);
-      if (!v->dtype_label.empty()) t.dtype_label = model.intern(v->dtype_label);
-      model.flat_tensors.push_back(std::move(t));
-      break;
-    }
-    case Value::Kind::Dict: {
-      for (const auto& kv : v->pairs) {
-        std::string key;
-        if (kv.first && kv.first->kind == Value::Kind::Str)
-          key = kv.first->s;
-        else if (kv.first && kv.first->kind == Value::Kind::Int)
-          key = std::to_string(kv.first->i);
-        std::string child = prefix.empty() ? key : prefix + "." + key;
-        collect_tensors(kv.second, child, model, visited, depth + 1);
-      }
-      break;
-    }
-    case Value::Kind::List:
-    case Value::Kind::Tuple: {
-      for (size_t k = 0; k < v->items.size(); ++k) {
-        std::string child =
-            prefix.empty() ? std::to_string(k) : prefix + "." + std::to_string(k);
-        collect_tensors(v->items[k], child, model, visited, depth + 1);
-      }
-      break;
-    }
-    default:
-      break;
-  }
+// recursion would stack-overflow or hang. The traversal guards both: a `visited`
+// set keyed on Value identity expands each shared container/object at most once
+// (collapsing the DAG and breaking cycles), and a depth cap bounds pathological
+// nesting. Malformed input therefore yields a partial/empty result, never a
+// crash.
+void collect_tensors(const ValuePtr& v, ir::Model& model) {
+  ts::for_each_tensor(v, [&model](const std::string& path, const Value& tv) {
+    ir::TensorRef t = tv.tensor;
+    t.name = model.intern(path);
+    if (!tv.dtype_label.empty()) t.dtype_label = model.intern(tv.dtype_label);
+    model.flat_tensors.push_back(std::move(t));
+  });
 }
 
-// Convenience overload: start a fresh traversal.
-void collect_tensors(const ValuePtr& v, const std::string& prefix,
-                     ir::Model& model) {
-  std::unordered_set<const Value*> visited;
-  collect_tensors(v, prefix, model, visited, 0);
+// --- storage record maps --------------------------------------------------------
+// key -> payload location for every record directly under `dir` ("<prefix>data/",
+// "<prefix>constants/", "<prefix>bytecode/"). Offsets come from local file
+// headers; payload bytes are NEVER decompressed or extracted.
+struct StorageEntry {
+  uint64_t offset;
+  uint64_t len;
+};
+using StorageMap = std::map<std::string, StorageEntry>;
+
+std::shared_ptr<StorageMap> build_storage_map(mz_zip_archive& zip,
+                                              const uint8_t* base, uint64_t size,
+                                              const std::string& dir) {
+  auto key_map = std::make_shared<StorageMap>();
+  mz_uint num = mz_zip_reader_get_num_files(&zip);
+  for (mz_uint i = 0; i < num; ++i) {
+    mz_zip_archive_file_stat st;
+    if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+    if (st.m_is_directory) continue;
+    std::string name = st.m_filename;
+    if (name.rfind(dir, 0) != 0) continue;
+    std::string key = name.substr(dir.size());
+    if (key.empty() || key.find('/') != std::string::npos) continue;
+    uint64_t off = 0;
+    if (!payload_offset_from_local_header(base, size, st.m_local_header_ofs, off))
+      continue;
+    (*key_map)[key] = {off, st.m_uncomp_size};
+  }
+  return key_map;
+}
+
+StorageResolver make_resolver(std::shared_ptr<StorageMap> key_map) {
+  StorageResolver resolver;
+  resolver.resolve = [key_map = std::move(key_map)](
+                         const std::string& key, uint64_t& o, uint64_t& l) -> bool {
+    auto it = key_map->find(key);
+    if (it == key_map->end()) return false;
+    o = it->second.offset;
+    l = it->second.len;
+    return true;
+  };
+  return resolver;
 }
 
 // If the top-level dict has a "state_dict" entry, descend into it; otherwise
@@ -291,35 +300,9 @@ Result<ir::Model> parse_zip(const MappedFile& file, ProgressSink& progress) {
     ~MemGuard() { if (p) mz_free(p); }
   } memg{pkl_mem};
 
-  // Build a storage-key -> (offset,len) resolver by scanning central-dir
-  // entries under <prefix>data/. We record local-header-derived payload
-  // offsets; NEVER decompress/extract payload bytes.
-  struct StorageEntry { uint64_t offset; uint64_t len; };
-  auto key_map = std::make_shared<std::map<std::string, StorageEntry>>();
-  std::string data_dir = prefix + "data/";
-  for (mz_uint i = 0; i < num; ++i) {
-    mz_zip_archive_file_stat st;
-    if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
-    if (st.m_is_directory) continue;
-    std::string name = st.m_filename;
-    if (name.rfind(data_dir, 0) != 0) continue;
-    std::string key = name.substr(data_dir.size());
-    if (key.empty() || key.find('/') != std::string::npos) continue;
-    uint64_t off = 0;
-    if (!payload_offset_from_local_header(base, size, st.m_local_header_ofs, off))
-      continue;
-    (*key_map)[key] = {off, st.m_uncomp_size};
-  }
-
-  StorageResolver resolver;
-  resolver.resolve = [key_map](const std::string& key, uint64_t& o,
-                               uint64_t& l) -> bool {
-    auto it = key_map->find(key);
-    if (it == key_map->end()) return false;
-    o = it->second.offset;
-    l = it->second.len;
-    return true;
-  };
+  // Storage-key -> (offset,len) resolver for <prefix>data/ records.
+  StorageResolver resolver =
+      make_resolver(build_storage_map(zip, base, size, prefix + "data/"));
 
   progress.set(0.6f, "interpreting");
   PickleVM vm(reinterpret_cast<const uint8_t*>(pkl_mem), pkl_size, resolver);
@@ -331,7 +314,7 @@ Result<ir::Model> parse_zip(const MappedFile& file, ProgressSink& progress) {
   model.has_graph = false;
 
   ValuePtr sd = find_state_dict(*top_r);
-  collect_tensors(sd, "", model);
+  collect_tensors(sd, model);
 
   if (has_constants || has_code) {
     // TorchScript archive: scan code entries for best-effort op/method listing
@@ -418,7 +401,7 @@ Result<ir::Model> parse_legacy(const MappedFile& file, ProgressSink& progress) {
   model.has_graph = false;
 
   ValuePtr sd = find_state_dict(*top_r);
-  collect_tensors(sd, "", model);
+  collect_tensors(sd, model);
 
   model.metadata.emplace_back(
       model.intern("legacy"),

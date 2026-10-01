@@ -350,3 +350,79 @@ TEST_CASE("pickle VM #137: values carry the offset of the opcode that made them"
   CHECK((*r)->kind == Value::Kind::Int);
   CHECK((*r)->src_pos == 2);
 }
+
+namespace {
+
+// A pickled module object `<module>.M` whose state has one attribute "w" that
+// is a _rebuild_tensor_v2 tensor (the shape torch.jit.save writes for modules).
+std::vector<uint8_t> object_with_tensor(const std::string& module) {
+  std::vector<uint8_t> b;
+  proto2(b);
+  global_(b, module, "M");
+  op(b, ')');          // EMPTY_TUPLE
+  opb(b, 0x81);        // NEWOBJ
+  op(b, '}');          // EMPTY_DICT
+  op(b, '(');          // MARK (state items)
+  binunicode(b, "w");
+  global_(b, "torch._utils", "_rebuild_tensor_v2");
+  op(b, '(');          // MARK (rebuild args)
+  op(b, '(');          // MARK (storage pid)
+  binunicode(b, "storage");
+  global_(b, "torch", "FloatStorage");
+  binunicode(b, "0");
+  binunicode(b, "cpu");
+  binint1(b, 2);
+  op(b, 't');
+  op(b, 'Q');          // BINPERSID
+  binint1(b, 0);       // storage_offset
+  op(b, '(');
+  binint1(b, 2);
+  op(b, 't');          // size (2,)
+  op(b, '(');
+  binint1(b, 1);
+  op(b, 't');          // stride (1,)
+  opb(b, 0x89);        // requires_grad False
+  global_(b, "collections", "OrderedDict");
+  op(b, ')');
+  op(b, 'R');          // backward_hooks
+  op(b, 't');
+  op(b, 'R');          // the tensor
+  op(b, 'u');          // SETITEMS
+  op(b, 'b');          // BUILD
+  op(b, '.');
+  return b;
+}
+
+}  // namespace
+
+TEST_CASE("pickle VM #137: __torch__ object state lists its parameters") {
+  std::string path = write_temp("ts_obj", object_with_tensor("__torch__"));
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);
+  ProgressSink progress;
+  auto res = pytorch::parse_legacy(*mf, progress);
+  REQUIRE(res);
+  bool found = false;
+  for (const auto& t : res->flat_tensors) {
+    if (res->str(t.name) == "w") {
+      found = true;
+      CHECK(t.dtype == ir::DType::F32);
+      CHECK(t.shape.size() == 1);
+    }
+  }
+  CHECK(found);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("pickle VM #137: non-TorchScript objects are still not descended") {
+  // A Python full-module pickle (module "mymod") stays an inert placeholder:
+  // unchanged behavior, no tensors are claimed from it.
+  std::string path = write_temp("py_obj", object_with_tensor("mymod"));
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);
+  ProgressSink progress;
+  auto res = pytorch::parse_legacy(*mf, progress);
+  REQUIRE(res);
+  CHECK(res->flat_tensors.empty());
+  std::filesystem::remove(path);
+}
