@@ -18,7 +18,9 @@
 //
 // SCOPE OF DEQUANT SUPPORT — deliberately narrow. The five legacy layouts below
 // (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) are simple, stable, and fully specified: a scale (+
-// optional min) followed by packed integers, 32 elements per block. The K-quants
+// optional min) followed by packed integers, 32 elements per block. The two FP4
+// microscaling layouts (MXFP4, NVFP4) are just as flat — a power-of-two / FP8
+// block scale followed by packed E2M1 nibbles — so they decode too. The K-quants
 // (Q2_K..Q8_K) and the IQ* family use 256-element super-blocks with hierarchical
 // scales and, for IQ*, codebook lookups; they are NOT supported here and report
 // an honest reason rather than a guess. That is the honesty rule the whole
@@ -65,6 +67,8 @@ enum class GgmlType : uint32_t {
   F64 = 28,
   IQ1_M = 29,
   BF16 = 30,
+  MXFP4 = 39,  // OCP MX: E8M0 scale + 32 E2M1 nibbles (gpt-oss)
+  NVFP4 = 40,  // NVIDIA: four UE4M3 scales, one per 16 of 64 E2M1 nibbles
 };
 
 // The exact human name for a ggml type id ("Q4_K", "IQ2_XXS", "F16", ...).
@@ -80,10 +84,10 @@ bool ggml_is_quantized(uint32_t type_id);
 // Block geometry for a ggml type.
 //
 // elems_per_block / block_bytes are 0 when the type is unknown to this build or
-// is not block-based. dequant_supported is true only for the five legacy layouts
-// this file can actually decode; for every other quantized type the geometry may
-// still be reported (so the caller can say "block 3 of 1024") while decoding is
-// refused.
+// is not block-based. dequant_supported is true only for the legacy + FP4
+// layouts this file can actually decode; for every other quantized type the
+// geometry may still be reported (so the caller can say "block 3 of 1024")
+// while decoding is refused.
 struct GgmlBlockLayout {
   uint32_t elems_per_block = 0;
   uint32_t block_bytes = 0;
@@ -95,8 +99,9 @@ GgmlBlockLayout ggml_block_layout(uint32_t type_id);
 
 // The largest elems_per_block across every type with dequant_supported == true.
 // Callers size their output buffer with this, so no allocation is ever needed.
-// A static_assert in the .cpp pins the table to this bound.
-constexpr uint32_t kMaxDequantBlockElems = 32;
+// A static_assert in the .cpp pins the table to this bound. NVFP4's 64-element
+// block is the widest.
+constexpr uint32_t kMaxDequantBlockElems = 64;
 
 // Why a block could not be decoded. Ordered so the caller can branch, but each
 // value also maps to a fixed human string via dequant_status_message().

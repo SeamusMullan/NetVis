@@ -529,8 +529,9 @@ void draw_weight_inspector(App& app) {
         "This tensor uses a quantized block format (e.g. GGUF Q4/Q8). NetVis "
         "does not dequantize it as a whole -- below is an optional, "
         "read-only preview of ONE decoded block (up to %u values) for the "
-        "legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0); K-quants and IQ* "
-        "formats report why they can't be previewed instead of guessing.",
+        "legacy GGUF layouts (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the FP4 "
+        "microscaling layouts (MXFP4/NVFP4); K-quants and IQ* formats report "
+        "why they can't be previewed instead of guessing.",
         kQuantPreviewMaxElems);
 
     // #49: opt-in BY CONTRACT, not merely by convention -- default off, and
@@ -538,6 +539,16 @@ void draw_weight_inspector(App& app) {
     ImGui::Checkbox("Preview one block", &app.view().inspector_quant_preview);
     if (app.view().inspector_quant_preview) draw_quant_preview(app, d);
 
+    ImGui::End();
+    return;
+  }
+
+  // An element type NetVis can't decode (FP4/FP8 and other labeled types from
+  // non-GGUF formats): a table of zeros and an empty histogram would look like
+  // a broken tensor, so say why there is nothing to show instead.
+  const std::string no_stats = stats_unavailable_reason(t, model);
+  if (!no_stats.empty()) {
+    ImGui::TextWrapped("%s", no_stats.c_str());
     ImGui::End();
     return;
   }
