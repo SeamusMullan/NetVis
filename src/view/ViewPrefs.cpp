@@ -83,6 +83,7 @@ void save_view_prefs(const ViewPrefs& p) {
   // #11: per-plugin enable overrides (empty object if the user changed nothing).
   j["plugins"] = p.plugins.to_json();
   j["edge_routing"] = p.edge_routing;  // #22 (v0.9.0)
+  j["wheel_mode"] = wheel_mode_name(p.wheel_mode);  // #158
   // v0.9.4: the settings a user sets once and expects to survive a restart. The
   // WINDOW toggles (show_preferences/show_shortcuts/show_about) are deliberately
   // NOT here — a settings window that reopens itself every launch is a nuisance,
@@ -106,6 +107,13 @@ void save_view_prefs(const ViewPrefs& p) {
 }
 
 ViewPrefs load_view_prefs(const ViewPrefs& base) {
+  return load_view_prefs(base, nullptr);
+}
+
+ViewPrefs load_view_prefs(const ViewPrefs& base, ViewPrefsLoadInfo* info) {
+  // Reported through locals and published once at the end, so every early return
+  // and the catch below leave `info` at "nothing read".
+  if (info) *info = ViewPrefsLoadInfo{};
   ViewPrefs p = base;
   std::ifstream f(view_prefs_file_path());
   if (!f) return p;
@@ -113,6 +121,8 @@ ViewPrefs load_view_prefs(const ViewPrefs& base) {
     nlohmann::json j;
     f >> j;
     if (!j.is_object()) return base;
+    ViewPrefsLoadInfo seen;
+    seen.file_read = true;
 
     read_bool(j, "dark_theme", p.dark_theme);
     read_bool(j, "show_minimap", p.show_minimap);
@@ -152,6 +162,15 @@ ViewPrefs load_view_prefs(const ViewPrefs& base) {
       const int er = j["edge_routing"].get<int>();
       if (er >= 0 && er <= 2) p.edge_routing = er;
     }
+    // #158: only an exact "pan" / "zoom" string counts. Anything else (a number,
+    // null, "Zoom", "scroll") keeps the base and is reported as absent.
+    if (j.contains("wheel_mode") && j["wheel_mode"].is_string()) {
+      WheelMode wm = p.wheel_mode;
+      if (wheel_mode_from_name(j["wheel_mode"].get<std::string>(), wm)) {
+        p.wheel_mode = wm;
+        seen.wheel_mode_present = true;
+      }
+    }
     // CLAMPED on load, not merely on edit. A persisted 0, a negative, or a NaN
     // would render an unusable window — and the setting that caused it lives
     // inside that window, so the user could not reach it to undo the damage.
@@ -175,6 +194,7 @@ ViewPrefs load_view_prefs(const ViewPrefs& base) {
                                           e["ridge"].get<double>());
       }
     }
+    if (info) *info = seen;
     return p;
   } catch (...) {
     // Corrupt prefs -> keep what the caller already had. Returning `base` rather

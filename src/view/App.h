@@ -307,6 +307,23 @@ struct ViewState {
   // does not immediately record the result as a new history entry (which would
   // make redo unreachable after a single undo).
   bool suppress_history = false;
+
+  // --- #158 additions (APPEND-ONLY) ------------------------------------------
+  // What a plain scroll does on the canvas: pan (Netron's default) or zoom (every
+  // release before #158). PERSISTED as a user preference ("wheel_mode" in
+  // view_prefs.json) and mirrored into every tab by save_prefs (#151), like the
+  // other persisted settings above.
+  WheelMode wheel_mode = WheelMode::Pan;
+
+  // Transient canvas requests, set by the keyboard, the View menu or the command
+  // palette and consumed (and cleared) by draw_graph_canvas on the next frame —
+  // the same pattern as request_fit, and for the same reason: only the canvas
+  // knows its own size, and so where the centre of the view is. NOT persisted and
+  // not part of a ViewSnapshot.
+  int request_zoom_steps = 0;         // +n = n Shift+Up steps, -n = n Shift+Down
+  bool request_actual_size = false;   // zoom to 100% about the canvas centre
+  float request_pan_x = 0.0f;         // screen px, added to cam.pan
+  float request_pan_y = 0.0f;
 };
 
 // Pre-baked font sizes for LOD text (spec §8.1: switch to no-text LOD rather
@@ -436,6 +453,13 @@ class App {
   std::vector<Toast>& toasts() { return toasts_; }
   GLFWwindow* window() const { return window_; }
 
+  // #158: the pinch gesture accumulated since the last poll, as a log-scale zoom
+  // (see accumulate_pinch_log). Sampled once per frame in run(), right after
+  // glfwPollEvents, whether or not a canvas draws, so a pinch over the tensor
+  // table can never be applied to a graph later. 0 on every platform without the
+  // macOS bridge.
+  float frame_pinch_log() const { return frame_pinch_log_; }
+
   // Fixed op-category palette (dark-first, spec §8.1). Returns header color.
   static ImU32 category_color(OpCategory c, bool dark);
 
@@ -498,6 +522,7 @@ class App {
   std::vector<Toast> toasts_;
   std::vector<std::string> recent_;
   plugin::PluginEnableSet plugin_enabled_;   // #11: persisted per-plugin enable state
+  float frame_pinch_log_ = 0.0f;             // #158: this frame's pinch (see frame_pinch_log())
 
   // The native file chooser runs out-of-process and is polled per frame (see
   // FileDialog.h) — a blocking chooser stopped glfwPollEvents and the WM greyed
@@ -543,6 +568,11 @@ void draw_weight_inspector(App& app);   // WeightInspector.cpp
 void draw_search_bar(App& app);         // SearchBar.cpp (Ctrl+F overlay)
 void draw_search_results_panel(App& app); // SearchBar.cpp (#53 persistent panel)
 void draw_minimap(App& app);            // Minimap.cpp (drawn inside canvas)
+// #158: the minimap's screen rect, so the canvas can tell a press that belongs to
+// the minimap from one that should pan or select. One geometry, shared with
+// draw_minimap. Must be called inside the canvas child window, as both callers
+// are. False when the minimap is hidden or there is no layout.
+bool minimap_rect(App& app, ImVec2& out_min, ImVec2& out_max);  // Minimap.cpp
 void draw_tensor_table(App& app);       // TensorTable.cpp (has_graph == false)
 void draw_status_bar(App& app);         // StatusBar.cpp
 void draw_toasts(App& app);             // StatusBar.cpp

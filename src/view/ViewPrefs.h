@@ -12,7 +12,11 @@
 // WHAT IS IN HERE is exactly what view_prefs.json already persisted before #151 —
 // no more. That file is the pre-existing definition of "preference", and widening
 // it silently would change what survives a restart, which is a different decision
-// from the one this issue asks for. Deliberately ABSENT, each for its own reason:
+// from the one this issue asks for. The one deliberate addition since is
+// `wheel_mode` (#158): whether the scroll wheel pans or zooms the canvas. It is
+// the first key added since #151, and it is a preference rather than per-model
+// state because it describes the user's hardware and habits, not the model in
+// front of them. Deliberately ABSENT, each for its own reason:
 //   - camera, selection, search/table/attr filters, nav state, collapse: per-MODEL
 //     view state. Indices and queries mean nothing against a different graph.
 //   - show_critical_path: App.h calls it a transient analysis overlay, and it is.
@@ -37,6 +41,7 @@
 
 #include "engine/HeatmapGradient.h"
 #include "engine/plugin/PluginPrefs.h"
+#include "view/CanvasInput.h"  // WheelMode (#158); ImGui-free
 
 namespace netvis {
 
@@ -56,6 +61,8 @@ struct ViewPrefs {
   HeatmapMetric heatmap_metric = HeatmapMetric::Flops;
   HeatmapGradient heatmap_gradient;
   int edge_routing = 0;
+  // #158: what a plain scroll does. Pan is the Netron default.
+  WheelMode wheel_mode = WheelMode::Pan;
   bool accessible_palette = false;
   float ui_scale = 1.0f;
   bool restore_session = false;
@@ -75,12 +82,28 @@ std::string view_prefs_file_path();
 // to persist a preference must never interrupt the user.
 void save_view_prefs(const ViewPrefs& p);
 
+// What load_view_prefs() learned about the file itself, beyond the values. Used by
+// App::load_prefs for the one-time #158 upgrade notice: a file that exists and
+// parsed, but has no `wheel_mode`, was written by a release where the wheel always
+// zoomed, and that user deserves to be told the default changed.
+struct ViewPrefsLoadInfo {
+  // The file was opened AND parsed as a JSON object. False for a missing,
+  // unreadable, malformed or non-object file (a fresh install is not an upgrade).
+  bool file_read = false;
+  // `wheel_mode` was a string that wheel_mode_from_name() accepts. A wrong-typed,
+  // unknown or wrong-case value is reported as absent, so it is rewritten too.
+  bool wheel_mode_present = false;
+};
+
 // Read view_prefs.json OVER `base`. Every key that is absent, of the wrong type,
 // or out of range leaves the corresponding field of `base` untouched — so an
 // older prefs file written before a key existed loads as "keep the current
 // default" rather than as a zeroed field, and a corrupt file degrades to `base`
 // entirely instead of throwing across the view/engine boundary.
 ViewPrefs load_view_prefs(const ViewPrefs& base);
+// Same, and reports what it found in `info` (may be null). There is deliberately
+// no default argument: `load_view_prefs()` below must stay unambiguous.
+ViewPrefs load_view_prefs(const ViewPrefs& base, ViewPrefsLoadInfo* info);
 inline ViewPrefs load_view_prefs() { return load_view_prefs(ViewPrefs{}); }
 
 }  // namespace netvis

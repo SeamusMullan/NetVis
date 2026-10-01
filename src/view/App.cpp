@@ -815,6 +815,7 @@ ViewPrefs prefs_from_view(const ViewState& vs) {
   p.heatmap_metric = vs.heatmap_metric;
   p.heatmap_gradient = vs.heatmap_gradient;
   p.edge_routing = vs.edge_routing;
+  p.wheel_mode = vs.wheel_mode;  // #158
   p.accessible_palette = vs.accessible_palette;
   p.ui_scale = vs.ui_scale;
   p.restore_session = vs.restore_session;
@@ -836,6 +837,7 @@ void apply_prefs_to_view(const ViewPrefs& p, ViewState& vs) {
   vs.heatmap_metric = p.heatmap_metric;
   vs.heatmap_gradient = p.heatmap_gradient;
   vs.edge_routing = p.edge_routing;
+  vs.wheel_mode = p.wheel_mode;  // #158
   vs.accessible_palette = p.accessible_palette;
   vs.ui_scale = p.ui_scale;
   vs.restore_session = p.restore_session;
@@ -1554,9 +1556,22 @@ void App::load_prefs() {
   // them is ever consulted at runtime.
   ViewPrefs base = prefs_from_view(view());
   base.plugins = plugin_enabled_;
-  const ViewPrefs p = load_view_prefs(base);
+  ViewPrefsLoadInfo info;
+  const ViewPrefs p = load_view_prefs(base, &info);
   apply_prefs_to_view(p, view());
   plugin_enabled_ = p.plugins;
+  // #158: a prefs file that parsed but has no "wheel_mode" was written by a
+  // release where the wheel always zoomed. The default is now Pan, so say so once.
+  // A fresh install (no file) never sees this, and the save below writes
+  // "wheel_mode" so the notice appears exactly once.
+  if (info.file_read && !info.wheel_mode_present) {
+    add_toast("Scrolling now pans the graph, like Netron. Zoom with Ctrl+scroll "
+              "(Cmd+scroll on macOS). View > Scroll wheel > Zoom restores the old "
+              "behaviour.",
+              false);
+    toasts_.back().ttl = 15.0f;
+    save_prefs();
+  }
 }
 
 void App::reload_plugins() {

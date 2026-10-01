@@ -71,6 +71,7 @@ ViewPrefs all_non_default() {
   gradient_set_preset(p.heatmap_gradient, GradientPreset::Magma);
   p.heatmap_gradient.reverse = true;
   p.edge_routing = 2;
+  p.wheel_mode = WheelMode::Zoom;  // #158: the default is Pan
   p.accessible_palette = true;
   p.ui_scale = 1.25f;
   p.restore_session = true;
@@ -98,6 +99,7 @@ TEST_CASE("ViewPrefs: save then load round-trips every persisted preference") {
   CHECK(out.heatmap_gradient.preset == GradientPreset::Magma);
   CHECK(out.heatmap_gradient.reverse == true);
   CHECK(out.edge_routing == 2);
+  CHECK(out.wheel_mode == WheelMode::Zoom);
   CHECK(out.accessible_palette == true);
   CHECK(out.ui_scale == doctest::Approx(1.25f));
   CHECK(out.restore_session == true);
@@ -166,6 +168,7 @@ TEST_CASE("ViewPrefs: keys absent from an older file degrade to the base default
   CHECK(out.show_layer_bands == base.show_layer_bands);  // absent: base wins
   CHECK(out.edge_tooltips == base.edge_tooltips);
   CHECK(out.edge_routing == base.edge_routing);
+  CHECK(out.wheel_mode == base.wheel_mode);  // #158
   CHECK(out.accessible_palette == base.accessible_palette);
   CHECK(out.restore_session == base.restore_session);
   CHECK(out.ui_scale == doctest::Approx(base.ui_scale));
@@ -280,4 +283,111 @@ TEST_CASE("ViewPrefs: a malformed machine_profiles entry drops only that entry")
   CHECK(out.machine_profiles[0].first == "good");
   CHECK(out.machine_profiles[1].first == "also good");
   CHECK(out.machine_profiles[1].second == doctest::Approx(20.0));
+}
+
+// --- #158: wheel_mode ---------------------------------------------------------
+//
+// The key is new, so the interesting cases are the ones where it is not there or
+// is wrong, and the ViewPrefsLoadInfo that App::load_prefs uses to decide whether
+// to show the one-time "scrolling now pans" notice.
+
+TEST_CASE("ViewPrefs: wheel_mode absent from an older file keeps the base and is reported") {
+  PrefsFileBackup backup;
+  // A file from a release where the wheel always zoomed: it exists and parses,
+  // but has no wheel_mode.
+  write_raw_prefs_file(R"({"dark_theme": false})");
+
+  ViewPrefs base;  // wheel_mode defaults to Pan
+  ViewPrefsLoadInfo info;
+  const ViewPrefs out = load_view_prefs(base, &info);
+
+  CHECK(out.wheel_mode == WheelMode::Pan);
+  CHECK(info.file_read);
+  CHECK_FALSE(info.wheel_mode_present);
+  CHECK(out.dark_theme == false);  // the rest of the file still loads
+}
+
+TEST_CASE("ViewPrefs: wheel_mode zoom is read and reported present") {
+  PrefsFileBackup backup;
+  write_raw_prefs_file(R"({"wheel_mode": "zoom"})");
+
+  ViewPrefsLoadInfo info;
+  const ViewPrefs out = load_view_prefs(ViewPrefs{}, &info);
+  CHECK(out.wheel_mode == WheelMode::Zoom);
+  CHECK(info.file_read);
+  CHECK(info.wheel_mode_present);
+
+  write_raw_prefs_file(R"({"wheel_mode": "pan"})");
+  ViewPrefs zoom_base;
+  zoom_base.wheel_mode = WheelMode::Zoom;
+  const ViewPrefs out2 = load_view_prefs(zoom_base, &info);
+  CHECK(out2.wheel_mode == WheelMode::Pan);  // the file wins over the base
+  CHECK(info.wheel_mode_present);
+}
+
+TEST_CASE("ViewPrefs: a wrong-typed or unknown wheel_mode degrades to the base") {
+  PrefsFileBackup backup;
+  ViewPrefs base;
+  base.wheel_mode = WheelMode::Zoom;
+
+  for (const char* text : {R"({"wheel_mode": 1})", R"({"wheel_mode": "scroll"})",
+                           R"({"wheel_mode": "Zoom"})", R"({"wheel_mode": null})"}) {
+    write_raw_prefs_file(text);
+    ViewPrefsLoadInfo info;
+    const ViewPrefs out = load_view_prefs(base, &info);
+    INFO(text);
+    CHECK(out.wheel_mode == WheelMode::Zoom);
+    CHECK(info.file_read);
+    // Reported absent, so the next save rewrites a valid value.
+    CHECK_FALSE(info.wheel_mode_present);
+  }
+}
+
+TEST_CASE("ViewPrefs: no file / malformed / non-object reports file_read=false") {
+  PrefsFileBackup backup;
+  const ViewPrefs base = all_non_default();  // wheel_mode Zoom, dark_theme false
+
+  auto check_unread = [&](const char* label) {
+    // Start `info` dirty to prove load_view_prefs resets it rather than leaving
+    // the caller's value in place.
+    ViewPrefsLoadInfo info;
+    info.file_read = true;
+    info.wheel_mode_present = true;
+    const ViewPrefs out = load_view_prefs(base, &info);
+    INFO(label);
+    CHECK(out.wheel_mode == base.wheel_mode);
+    CHECK(out.dark_theme == base.dark_theme);
+    CHECK_FALSE(info.file_read);
+    CHECK_FALSE(info.wheel_mode_present);
+  };
+
+  std::remove(view_prefs_file_path().c_str());
+  check_unread("missing file");
+  write_raw_prefs_file("{not json");
+  check_unread("malformed");
+  write_raw_prefs_file("[1,2]");
+  check_unread("non-object");
+  // Parses far enough to see a wheel_mode, then throws: still reported unread.
+  write_raw_prefs_file(R"({"wheel_mode": "zoom", "dark_theme": )");
+  check_unread("truncated after wheel_mode");
+}
+
+TEST_CASE("ViewPrefs: a null info pointer is accepted") {
+  PrefsFileBackup backup;
+  write_raw_prefs_file(R"({"wheel_mode": "zoom"})");
+  CHECK(load_view_prefs(ViewPrefs{}, nullptr).wheel_mode == WheelMode::Zoom);
+  CHECK(load_view_prefs(ViewPrefs{}).wheel_mode == WheelMode::Zoom);
+}
+
+TEST_CASE("ViewPrefs: save writes wheel_mode so the upgrade notice fires once") {
+  PrefsFileBackup backup;
+  // App::load_prefs saves right after showing the notice. After that, the file
+  // carries wheel_mode, and the next launch must not show it again.
+  save_view_prefs(ViewPrefs{});
+
+  ViewPrefsLoadInfo info;
+  const ViewPrefs out = load_view_prefs(ViewPrefs{}, &info);
+  CHECK(info.file_read);
+  CHECK(info.wheel_mode_present);
+  CHECK(out.wheel_mode == WheelMode::Pan);
 }
