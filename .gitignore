@@ -17,6 +17,8 @@ tests/fixtures/*.npz
 tests/fixtures/*.h5
 tests/fixtures/*.keras
 tests/fixtures/*.wasm
+tests/fixtures/*.prototxt
+tests/fixtures/*.caffemodel
 .wf/
 imgui.ini
 tests/fixtures/model.mlpackage/

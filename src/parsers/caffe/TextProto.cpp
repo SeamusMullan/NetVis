@@ -380,7 +380,7 @@ Result<TextDocument> TextDocument::parse(const uint8_t* data, uint64_t size,
                     uint64_t name_off) -> Result<bool> {
     const int rule = elide_rule(parent, name);
     const bool store = rule < 0;
-    TextKind kind;
+    TextKind kind = TextKind::Number;
     std::string value;
     const uint64_t value_off = first.offset;
     if (first.kind == TokKind::String) {

@@ -20,6 +20,17 @@ Formats emitted:
   model_frozen.pb   - Frozen TensorFlow GraphDef (Const payload, ":1" slot ref).
   saved_model/      - TensorFlow SavedModel dir (stub + FunctionDef body +
                       a stand-in variables/ checkpoint).
+  model_caffe.prototxt          - Caffe text NetParameter, modern `layer` schema
+                                  (Input, in-place ReLU, CEIL pooling, LRN,
+                                  branches, Concat, Eltwise, Flatten, FC, Softmax).
+  model_caffe.caffemodel        - its binary twin (net-level input_shape; packed
+                                  data before shape, as Blob::ToProto writes it).
+  model_caffe_alone.prototxt    - the same text; two .caffemodel files beside it,
+                                  none named after it -> no pairing (ambiguous).
+  model_caffe_v1_deploy.prototxt - legacy V1 `layers` schema (enum types, input_dim,
+                                  a TRAIN-only layer the TEST filter drops).
+  model_caffe_v1.caffemodel     - V1 binary with legacy 4-D blob dims; paired with
+                                  the prototxt above by the `_deploy` suffix rule.
 """
 
 import os
@@ -2011,6 +2022,256 @@ def build_tf_savedmodel_dir(out_dir):
 
 
 # ---------------------------------------------------------------------------
+# Caffe (#138/#109): text NetParameter (.prototxt) + binary NetParameter
+# (.caffemodel), both schema generations.
+# ---------------------------------------------------------------------------
+# Field numbers per BVLC/caffe src/caffe/proto/caffe.proto (master):
+#   NetParameter: name 1, layers 2 (V1), input 3, input_dim 4, input_shape 8,
+#                 layer 100
+#   LayerParameter: name 1, type 2, bottom 3, top 4, blobs 7, phase 10,
+#     concat_param 104, convolution_param 106, eltwise_param 110,
+#     inner_product_param 117, lrn_param 118, pooling_param 121
+#   V1LayerParameter: bottom 2, top 3, name 4, type 5 (LayerType enum),
+#     blobs 6, convolution_param 10, inner_product_param 17, pooling_param 19
+#   BlobProto: num 1, channels 2, height 3, width 4, data 5 (packed float),
+#              shape 7 (BlobShape: dim 1, packed int64)
+# Byte order follows Caffe's own writers: Net::ToProto emits name then layer;
+# Blob::ToProto emits data(5) BEFORE shape(7) (protobuf field order).
+
+def pb_packed_varints(field, values):
+    return pb_len(field, b"".join(varint(v) for v in values))
+
+
+def pb_packed_f32(field, floats):
+    return pb_len(field, b"".join(struct.pack("<f", f) for f in floats))
+
+
+def pb_f32(field, f):
+    """A non-packed float field (wire type 5)."""
+    return pb_tag(field, 5) + struct.pack("<f", f)
+
+
+def caffe_blob_shape(dims):
+    return pb_packed_varints(1, dims)
+
+
+def caffe_blob(dims, floats):
+    """Modern BlobProto exactly as Blob::ToProto writes it: data(5) then shape(7)."""
+    return pb_packed_f32(5, floats) + pb_len(7, caffe_blob_shape(dims))
+
+
+def caffe_blob_legacy(n, c, h, w, floats):
+    """V1-era BlobProto: num(1) channels(2) height(3) width(4), then data(5)."""
+    return (pb_varint(1, n) + pb_varint(2, c) + pb_varint(3, h) + pb_varint(4, w)
+            + pb_packed_f32(5, floats))
+
+
+def caffe_ramp(n, step=0.125):
+    """Deterministic, exactly-representable weight values."""
+    return [(i % 8) * step for i in range(n)]
+
+
+CAFFE_PHASE_TEST = 1
+CAFFE_CONV1_W = caffe_ramp(4 * 3 * 3 * 3)
+CAFFE_CONV1_B = [1.0, 2.0, 3.0, 4.0]          # stats test: min 1, max 4, mean 2.5
+CAFFE_BR_W = caffe_ramp(2 * 4)
+CAFFE_BR_B = [0.5, -0.5]
+CAFFE_FC_W = caffe_ramp(3 * 64, 0.0625)
+CAFFE_FC_B = [0.25, 0.5, 0.75]
+
+
+def caffe_layer(name, type_, bottoms, tops, params=(), blobs=()):
+    """LayerParameter in field order: name, type, bottom*, top*, blobs*, phase,
+    then the *_param messages (all field numbers >= 100)."""
+    b = bytearray()
+    b += pb_string(1, name)
+    b += pb_string(2, type_)
+    for x in bottoms:
+        b += pb_string(3, x)
+    for x in tops:
+        b += pb_string(4, x)
+    for blob in blobs:
+        b += pb_len(7, blob)
+    b += pb_varint(10, CAFFE_PHASE_TEST)
+    for field, body in sorted(params, key=lambda p: p[0]):
+        b += pb_len(field, body)
+    return bytes(b)
+
+
+def _caffe_conv(num_output, kernel, pad=None):
+    body = pb_varint(1, num_output)
+    if pad is not None:
+        body += pb_varint(3, pad)
+    return (106, body + pb_varint(4, kernel))
+
+
+def build_caffe_prototxt():
+    """Deploy-style text NetParameter, modern `layer` schema. With the sibling
+    weights the expected shapes are: data [1,3,8,8] -> conv1 [1,4,8,8] -> relu1 in
+    place (conv1 -> conv1#1) -> pool1 [1,4,4,4] (CEIL rounding; FLOOR would give 3)
+    -> norm1 [1,4,4,4] -> b1, b2 [1,2,4,4] -> cat [1,4,4,4] -> sum [1,4,4,4]
+    -> flat [1,64] -> fc [1,3] -> prob [1,3]."""
+    return (
+        "# NetVis Caffe fixture (#138): modern LayerParameter schema.\n"
+        'name: "nv_caffe_tiny"\n'
+        "layer {\n"
+        '  name: "data"\n'
+        '  type: "Input"\n'
+        '  top: "data"\n'
+        "  input_param { shape: { dim: 1 dim: 3 dim: 8 dim: 8 } }\n"
+        "}\n"
+        "layer {\n"
+        '  name: "conv1"\n'
+        "  type: 'Convolution'   # single-quoted literal\n"
+        '  bottom: "data"\n'
+        '  top: "conv1"\n'
+        "  convolution_param { num_output: 4 kernel_size: 3 pad: 1 }\n"
+        "}\n"
+        "layer {\n"
+        '  name: "relu1"\n'
+        '  type: "ReLU"\n'
+        '  bottom: "conv1"\n'
+        '  top: "conv1"          # in place\n'
+        "}\n"
+        "layer: {\n"
+        '  name: "pool1"\n'
+        '  type: "Pooling"\n'
+        '  bottom: "conv1"\n'
+        '  top: "pool1"\n'
+        "  pooling_param { pool: MAX kernel_size: 3 stride: 2 }\n"
+        "}\n"
+        "layer {\n"
+        '  name: "norm1"\n'
+        '  type: "LRN"\n'
+        '  bottom: "pool1"\n'
+        '  top: "norm1"\n'
+        "  lrn_param { local_size: 3 alpha: 1e-4 beta: 0.75 }\n"
+        "}\n"
+        'layer { name: "b1" type: "Convolution" bottom: "norm1" top: "b1" '
+        "convolution_param { num_output: 2 kernel_size: 1 } }\n"
+        'layer { name: "b2" type: "Convolution" bottom: "norm1" top: "b2" '
+        "convolution_param { num_output: 2 kernel_size: 1 } }\n"
+        'layer { name: "cat" type: "Concat" bottom: "b1" bottom: "b2" top: "cat" }\n'
+        'layer { name: "sum" type: "Eltwise" bottom: "norm1" bottom: "cat" top: "sum" '
+        "eltwise_param { operation: SUM } }\n"
+        'layer { name: "flat" type: "Flatten" bottom: "sum" top: "flat" }\n'
+        'layer { name: "fc" type: "InnerProduct" bottom: "flat" top: "fc" '
+        "inner_product_param { num_output: 3 } }\n"
+        'layer { name: "prob" type: "Softmax" bottom: "fc" top: "prob" }\n'
+    ).encode("utf-8")
+
+
+def build_caffe_caffemodel():
+    """Binary twin of build_caffe_prototxt() as Net::ToProto would write it, except
+    the input is declared net-level (input 3 + input_shape 8) instead of an Input
+    layer: a NetParameter carrying input_shape satisfies looks_like_onnx_proto, so
+    this fixture is the detection-order regression guard."""
+    layers = [
+        caffe_layer("conv1", "Convolution", ["data"], ["conv1"], [_caffe_conv(4, 3, 1)],
+                    [caffe_blob([4, 3, 3, 3], CAFFE_CONV1_W), caffe_blob([4], CAFFE_CONV1_B)]),
+        caffe_layer("relu1", "ReLU", ["conv1"], ["conv1"]),
+        caffe_layer("pool1", "Pooling", ["conv1"], ["pool1"],
+                    [(121, pb_varint(1, 0) + pb_varint(2, 3) + pb_varint(3, 2))]),
+        caffe_layer("norm1", "LRN", ["pool1"], ["norm1"],
+                    [(118, pb_varint(1, 3) + pb_f32(2, 0.0001) + pb_f32(3, 0.75))]),
+        caffe_layer("b1", "Convolution", ["norm1"], ["b1"], [_caffe_conv(2, 1)],
+                    [caffe_blob([2, 4, 1, 1], CAFFE_BR_W), caffe_blob([2], CAFFE_BR_B)]),
+        caffe_layer("b2", "Convolution", ["norm1"], ["b2"], [_caffe_conv(2, 1)],
+                    [caffe_blob([2, 4, 1, 1], CAFFE_BR_W), caffe_blob([2], CAFFE_BR_B)]),
+        caffe_layer("cat", "Concat", ["b1", "b2"], ["cat"]),
+        caffe_layer("sum", "Eltwise", ["norm1", "cat"], ["sum"], [(110, pb_varint(1, 1))]),
+        caffe_layer("flat", "Flatten", ["sum"], ["flat"]),
+        caffe_layer("fc", "InnerProduct", ["flat"], ["fc"], [(117, pb_varint(1, 3))],
+                    [caffe_blob([3, 64], CAFFE_FC_W), caffe_blob([3], CAFFE_FC_B)]),
+        caffe_layer("prob", "Softmax", ["fc"], ["prob"]),
+    ]
+    b = bytearray()
+    b += pb_string(1, "nv_caffe_tiny")
+    b += pb_string(3, "data")
+    b += pb_len(8, caffe_blob_shape([1, 3, 8, 8]))
+    for layer in layers:
+        b += pb_len(100, layer)
+    return bytes(b)
+
+
+CAFFE_V1 = {"CONVOLUTION": 4, "POOLING": 17, "RELU": 18, "INNER_PRODUCT": 14,
+            "SOFTMAX": 20}
+CAFFE_V1_CONV_W = caffe_ramp(2 * 3 * 3 * 3)
+CAFFE_V1_CONV_B = [1.0, -1.0]
+CAFFE_V1_FC_W = caffe_ramp(3 * 18, 0.25)
+CAFFE_V1_FC_B = [0.0, 0.5, 1.0]
+
+
+def caffe_v1_layer(name, type_enum, bottoms, tops, params=(), blobs=()):
+    """V1LayerParameter in field order: bottom*, top*, name, type, blobs*, params."""
+    b = bytearray()
+    for x in bottoms:
+        b += pb_string(2, x)
+    for x in tops:
+        b += pb_string(3, x)
+    b += pb_string(4, name)
+    b += pb_varint(5, type_enum)
+    for blob in blobs:
+        b += pb_len(6, blob)
+    for field, body in sorted(params, key=lambda p: p[0]):
+        b += pb_len(field, body)
+    return bytes(b)
+
+
+def build_caffe_v1_prototxt():
+    """Legacy V1 `layers` schema: net-level input + input_dim, enum layer types
+    (one given numerically), an in-place ReLU and a TRAIN-only layer the TEST phase
+    filter must drop. Expected shapes: data [1,3,8,8] -> conv1 [1,2,6,6] -> conv1#1
+    -> pool1 [1,2,3,3]; fc1/prob unknown (Gemm needs a rank-2 input)."""
+    return (
+        'name: "nv_caffe_v1"\n'
+        'input: "data"\n'
+        "input_dim: 1\ninput_dim: 3\ninput_dim: 8\ninput_dim: 8\n"
+        "layers {\n"
+        '  name: "conv1"\n  type: CONVOLUTION\n  bottom: "data"\n  top: "conv1"\n'
+        "  convolution_param { num_output: 2 kernel_size: 3 }\n"
+        "}\n"
+        'layers { name: "relu1" type: RELU bottom: "conv1" top: "conv1" }\n'
+        'layers { name: "pool1" type: POOLING bottom: "conv1" top: "pool1"\n'
+        "  pooling_param { pool: AVE kernel_size: 2 stride: 2 } }\n"
+        'layers { name: "fc1" type: INNER_PRODUCT bottom: "pool1" top: "fc1"\n'
+        "  inner_product_param { num_output: 3 } }\n"
+        'layers { name: "prob" type: 20 bottom: "fc1" top: "prob" }   # 20 == SOFTMAX\n'
+        "layers {\n"
+        '  name: "loss"\n  type: SOFTMAX_LOSS\n  bottom: "fc1"\n  bottom: "label"\n'
+        '  top: "loss"\n  include { phase: TRAIN }\n'
+        "}\n"
+    ).encode("utf-8")
+
+
+def build_caffe_v1_caffemodel():
+    """V1 binary NetParameter with legacy 4-D blob dims (num/channels/height/width)
+    and net-level input fields (field order puts layers(2) before input(3))."""
+    layers = [
+        caffe_v1_layer("conv1", CAFFE_V1["CONVOLUTION"], ["data"], ["conv1"],
+                       [(10, pb_varint(1, 2) + pb_varint(4, 3))],
+                       [caffe_blob_legacy(2, 3, 3, 3, CAFFE_V1_CONV_W),
+                        caffe_blob_legacy(1, 1, 1, 2, CAFFE_V1_CONV_B)]),
+        caffe_v1_layer("relu1", CAFFE_V1["RELU"], ["conv1"], ["conv1"]),
+        caffe_v1_layer("pool1", CAFFE_V1["POOLING"], ["conv1"], ["pool1"],
+                       [(19, pb_varint(1, 1) + pb_varint(2, 2) + pb_varint(3, 2))]),
+        caffe_v1_layer("fc1", CAFFE_V1["INNER_PRODUCT"], ["pool1"], ["fc1"],
+                       [(17, pb_varint(1, 3))],
+                       [caffe_blob_legacy(1, 1, 3, 18, CAFFE_V1_FC_W),
+                        caffe_blob_legacy(1, 1, 1, 3, CAFFE_V1_FC_B)]),
+        caffe_v1_layer("prob", CAFFE_V1["SOFTMAX"], ["fc1"], ["prob"]),
+    ]
+    b = bytearray()
+    b += pb_string(1, "nv_caffe_v1")
+    for layer in layers:
+        b += pb_len(2, layer)
+    b += pb_string(3, "data")
+    for dim in (1, 3, 8, 8):
+        b += pb_varint(4, dim)
+    return bytes(b)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -2063,6 +2324,17 @@ def main():
     # TensorFlow (#107): frozen GraphDef + a SavedModel directory bundle.
     write("model_frozen.pb", build_tf_frozen())
     build_tf_savedmodel_dir(out_dir)
+    # Caffe (#138/#109): modern pair (same stem), the same text with no pairable
+    # sibling (two .caffemodel files here, none named after it -> ambiguous), and a
+    # V1 pair joined by the `_deploy` suffix rule.
+    cm = build_caffe_caffemodel()
+    assert cm[0] == 0x0A, "Caffe NetParameter must start with name(1)"
+    assert b"".join(struct.pack("<f", f) for f in CAFFE_CONV1_B) in cm, "conv1 bias missing"
+    write("model_caffe.prototxt", build_caffe_prototxt())
+    write("model_caffe.caffemodel", cm)
+    write("model_caffe_alone.prototxt", build_caffe_prototxt())
+    write("model_caffe_v1_deploy.prototxt", build_caffe_v1_prototxt())
+    write("model_caffe_v1.caffemodel", build_caffe_v1_caffemodel())
     write("model.mlmodel", build_coreml_mlmodel())
     # CoreML .mlpackage (mlProgram/MIL) DIRECTORY bundle (#85).
     build_mlpackage(out_dir)

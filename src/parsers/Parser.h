@@ -34,6 +34,8 @@ enum class Format : uint8_t {
   CoreML,         // .mlmodel — CoreML Model protobuf
   // v0.9.5 Pillar 5 (#107).
   TensorFlow,     // frozen .pb (GraphDef) + SavedModel (saved_model.pb)
+  // v0.9.5 Pillar 5 (#138/#109): .prototxt text + .caffemodel binary NetParameter
+  Caffe,
 };
 
 const char* format_name(Format f);
@@ -84,5 +86,8 @@ namespace coreml { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
 // v0.9.5 Pillar 5 parsers (#107). One entry point covers both TF containers: a
 // frozen GraphDef and a SavedModel (whose meta_graphs[0].graph_def it unwraps).
 namespace tensorflow { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
+// One entry point for both Caffe files: a text NetParameter (.prototxt, which also
+// picks up weights from a sibling .caffemodel) or a binary one (.caffemodel).
+namespace caffe { Result<ir::Model> parse(const MappedFile&, ProgressSink&); }
 
 }  // namespace netvis
