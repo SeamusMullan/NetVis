@@ -579,6 +579,18 @@ class Executor {
   // --- pending resolution ---
   Result<Sym> confirm(const Sym& s);
   Result<bool> retract(const Sym& s);
+  // Retract seg[0, cut). By the prefix invariant (pendings above a block base
+  // are always a contiguous prefix) every one of them is Pending; a confirmed
+  // value there would be silently lost, so it is an internal error instead.
+  Result<bool> retract_prefix(const std::vector<Sym>& seg, size_t cut) {
+    for (size_t i = 0; i < cut; ++i) {
+      if (seg[i].kind != Sym::Kind::Pending)
+        return internal("pending-prefix invariant violated");
+      auto r = retract(seg[i]);
+      if (!r) return r.error();
+    }
+    return true;
+  }
   Result<std::vector<uint32_t>> finalize_if(size_t rec, int64_t k);
   Result<bool> checkpoint(size_t base, int64_t pc, BcOp op);
 
@@ -702,10 +714,8 @@ Result<std::vector<uint32_t>> Executor::finalize_if(size_t rec, int64_t k) {
     if (k < 0 || static_cast<uint64_t>(k) > seg.size())
       return internal("if arity outside its branch");
     size_t cut = seg.size() - static_cast<size_t>(k);
-    for (size_t i = 0; i < cut; ++i) {
-      auto r = retract(seg[i]);
-      if (!r) return r.error();
-    }
+    auto rp = retract_prefix(seg, cut);
+    if (!rp) return rp.error();
     for (size_t i = cut; i < seg.size(); ++i) {
       auto v = use_edge(B(ids[br]), seg[i]);
       if (!v) return v.error();
@@ -1130,10 +1140,8 @@ Result<int64_t> Executor::exec_loop(GraphBuilder& b, int64_t s, int64_t hi, size
                        " values expected at the back-edge, " +
                        std::to_string(seg.size()) + " found)");
   const size_t cut = seg.size() - want;
-  for (size_t i = 0; i < cut; ++i) {
-    auto r = retract(seg[i]);
-    if (!r) return r.error();
-  }
+  auto rp = retract_prefix(seg, cut);
+  if (!rp) return rp.error();
   for (size_t i = cut; i < seg.size(); ++i) {  // [cond_next, carried_next...]
     auto v = use_edge(bb, seg[i]);
     if (!v) return v.error();
@@ -1168,10 +1176,8 @@ Result<bool> Executor::exec_ret(GraphBuilder& b, int64_t pc, size_t base) {
                  : pend_prefix_[base + below - 1] - (base ? pend_prefix_[base - 1] : 0);
   if (pend_below != below) return fail(pc, "values left on stack at RET");
   std::vector<Sym> seg = take_segment(base);
-  for (size_t i = 0; i < below; ++i) {
-    auto r = retract(seg[i]);
-    if (!r) return r.error();
-  }
+  auto rp = retract_prefix(seg, below);
+  if (!rp) return rp.error();
   for (size_t i = below; i < seg.size(); ++i) {
     auto v = use_edge(b, seg[i]);
     if (!v) return v.error();
