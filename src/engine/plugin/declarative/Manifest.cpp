@@ -16,6 +16,7 @@
 
 #include "engine/LayoutCache.h"        // layout_cache_dir (for the sibling config dir)
 #include "engine/OpCategory.h"
+#include "engine/plugin/AbiGate.h"      // check_manifest_api_version
 #include "engine/plugin/OpHandler.h"
 #include "engine/plugin/Registry.h"
 #include "engine/plugin/declarative/Dsl.h"
@@ -315,11 +316,14 @@ LoadedManifest load_manifest_file(const std::string& path, bool register_into) {
   if (j.is_discarded()) { lm.error = "JSON parse error"; return lm; }
   if (!j.is_object()) { lm.error = "manifest root is not an object"; return lm; }
 
-  if (j.contains("api_version") && j["api_version"].is_number_unsigned())
-    lm.api_version = j["api_version"].get<uint32_t>();
-  if (lm.api_version != kOpHandlerAbiVersion) {
-    lm.error = "api_version " + std::to_string(lm.api_version) + " != host " +
-               std::to_string(kOpHandlerAbiVersion);
+  // Read at full width: get<uint32_t>() on 4294967297 wraps to 1 and would pass.
+  const ApiVersionCheck av = check_manifest_api_version(j, kOpHandlerAbiVersion);
+  if (av.present) {
+    lm.api_version = av.declared > UINT32_MAX ? UINT32_MAX
+                                              : static_cast<uint32_t>(av.declared);
+  }
+  if (!av.ok) {
+    lm.error = av.error;
     return lm;  // whole file rejected, nothing registered
   }
   if (j.contains("name") && j["name"].is_string()) lm.name = j["name"].get<std::string>();

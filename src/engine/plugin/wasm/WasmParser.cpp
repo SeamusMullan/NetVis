@@ -21,7 +21,9 @@
 
 #include "core/ByteReader.h"
 #include "core/MappedFile.h"
+#include "engine/plugin/AbiGate.h"
 #include "engine/plugin/Registry.h"
+#include "engine/plugin/wasm/SdkCaps.h"
 #include "ir/IR.h"
 
 #if defined(_MSC_VER)
@@ -51,15 +53,22 @@ namespace {
 
 using netvis::ByteReader;
 
-// SDK caps mirrored (plugins/sdk/netvis_plugin.h).
-constexpr int64_t  kSniffHead = 4096;
-constexpr int64_t  kSniffTail = 4096;
-constexpr int32_t  kReadChunkCap = 4096;
-constexpr int32_t  kMaxRank = 8;
-constexpr int32_t  kMaxNodeIO = 4096;
-constexpr int32_t  kMaxAttrLen = 65536;
-constexpr int32_t  kMaxInternLen = 4096;
-constexpr int32_t  kErrMsgMax = 1024;
+// SDK caps, taken FROM plugins/sdk/netvis_plugin.h (see SdkCaps.h) rather than copied:
+// lowering one in the header lowers it here in the same commit.
+using caps::kSniffHead;
+using caps::kSniffTail;
+using caps::kReadChunkCap;
+using caps::kMaxRank;
+using caps::kMaxNodeIO;
+using caps::kMaxAttrLen;
+using caps::kMaxInternLen;
+using caps::kErrMsgMax;
+
+// The can_parse() sniff runs in a tiny sandbox, well under the SDK's ceiling.
+constexpr uint32_t kSniffMaxPages = 4;
+constexpr uint64_t kSniffMaxSteps = 500'000;
+static_assert(kSniffMaxPages <= caps::kCeilingPages, "sniff budget exceeds NV_MAX_MEMORY_PAGES");
+static_assert(kSniffMaxSteps <= caps::kCeilingSteps, "sniff budget exceeds NV_MAX_STEPS");
 
 // A recorded tensor byte range (a weight). host_read_range must never return bytes
 // overlapping one of these, and no rendered string's source range may overlap one.
@@ -536,16 +545,46 @@ bool rendered_strings_clean(const ParseHostCtx& h) {
   return true;
 }
 
+// Load `image` once and report whether this host can honour it as a parser: it
+// loads, every import it declares is bound, and it declares kParserPluginAbiVersion.
+WasmAbiProbe probe_parser_module(const std::vector<uint8_t>& image) {
+  WasmAbiProbe p;
+  WasmEngine& eng = WasmEngine::instance();
+  if (!eng.enabled()) { p.message = "WASM disabled"; return p; }
+
+  std::lock_guard<std::mutex> guard(eng.lock());
+  ParseHostCtx hc;   // no file, no model: only the version export is called
+  SandboxLimits lim{kSniffMaxPages, kSniffMaxSteps};
+  RunResult lerr;
+  WasmModule mod = eng.load(image, lim, &hc, &lerr);
+  if (!mod.loaded()) { p.message = lerr.message; return p; }
+  link_parser_capabilities(static_cast<IM3Module>(mod.raw_module()), &hc);
+  p.loaded = true;
+  p.unresolved_imports = mod.unresolved_imports();
+  p.abi = read_abi_declaration(mod, "netvis_parser_abi_version");
+  return p;
+}
+
 // The WasmParserPlugin adapter.
+//
+// ABI NEGOTIATION: building one loads the module once and reads the ABI version it
+// declares, so api_version() reports the MODULE's version and the Registry's check
+// in register_parser is a real gate (see WasmOpHandler for the same design). can_parse
+// and parse re-check on every call.
 class WasmParserPlugin final : public ParserPlugin {
  public:
   WasmParserPlugin(std::string name, std::shared_ptr<const std::vector<uint8_t>> image)
-      : name_(std::move(name)), image_(std::move(image)) {}
+      : name_(std::move(name)), image_(std::move(image)) {
+    if (image_) probe_ = probe_parser_module(*image_);
+  }
 
   Format format() const override { return Format::Unknown; }
   std::string_view display_name() const override { return name_; }
   int priority() const override { return 10'000; }  // below all built-ins
-  uint32_t api_version() const override { return kParserPluginAbiVersion; }
+  uint32_t api_version() const override {
+    return probe_.reported_version(kParserPluginAbiVersion);
+  }
+  const WasmAbiProbe& probe() const { return probe_; }
 
   bool can_parse(const MappedFile& file, const std::string& ext_hint) const override {
     (void)ext_hint;
@@ -556,12 +595,12 @@ class WasmParserPlugin final : public ParserPlugin {
     ParseHostCtx hc;
     hc.file = &file;
     // No model built during sniff; a tiny sandbox. netvis_can_parse -> i32 (1=yes).
-    SandboxLimits lim{4, 500'000};
+    SandboxLimits lim{kSniffMaxPages, kSniffMaxSteps};
     RunResult lerr;
     WasmModule mod = eng.load(*image_, lim, &hc, &lerr);
     if (!mod.loaded()) return false;
     link_parser_capabilities(static_cast<IM3Module>(mod.raw_module()), &hc);
-    if (!abi_ok(mod)) return false;
+    if (!module_ok(mod)) return false;
     int32_t yes = 0;
     RunResult rr = mod.call_i32("netvis_can_parse", &yes);
     return rr.status == RunStatus::Ok && yes != 0;
@@ -579,12 +618,12 @@ class WasmParserPlugin final : public ParserPlugin {
     hc.file = &file;
     hc.model = &model;
 
-    SandboxLimits lim{256, 200'000'000};   // parser gets more fuel than a pass
+    SandboxLimits lim{caps::kCeilingPages, caps::kCeilingSteps};   // the full SDK budget
     RunResult lerr;
     WasmModule mod = eng.load(*image_, lim, &hc, &lerr);
     if (!mod.loaded()) return err("wasm parser load failed: " + lerr.message, 0);
     link_parser_capabilities(static_cast<IM3Module>(mod.raw_module()), &hc);
-    if (!abi_ok(mod)) return err("wasm parser abi mismatch", 0);
+    if (!module_ok(mod)) return err("wasm parser abi mismatch", 0);
 
     int32_t ret = 0;
     // ParseLimits bound cumulative host allocation, but wrap the guest call so any
@@ -613,13 +652,15 @@ class WasmParserPlugin final : public ParserPlugin {
   }
 
  private:
-  static bool abi_ok(WasmModule& mod) {
-    int32_t v = -1;
-    RunResult rr = mod.call_i32("netvis_parser_abi_version", &v);
-    return rr.status == RunStatus::Ok && v == static_cast<int32_t>(kParserPluginAbiVersion);
+  // The per-call gate: every import bound, and the module declares this host's ABI.
+  static bool module_ok(WasmModule& mod) {
+    if (!mod.unresolved_imports().empty()) return false;
+    const AbiDeclaration abi = read_abi_declaration(mod, "netvis_parser_abi_version");
+    return abi.declared && abi.version == kParserPluginAbiVersion;
   }
   std::string name_;
   std::shared_ptr<const std::vector<uint8_t>> image_;
+  WasmAbiProbe probe_;
 };
 
 }  // namespace
@@ -641,9 +682,9 @@ std::string load_wasm_parser_plugin(const std::string& plugin_json_path) {
   try {
     nlohmann::json j; f >> j;
     if (!j.is_object()) return "manifest is not an object";
-    if (auto v = j.find("api_version"); v != j.end() && v->is_number_integer()) {
-      if (v->get<int>() != static_cast<int>(kParserPluginAbiVersion)) return "api_version mismatch";
-    }
+    // Strict, full-width, and REQUIRED (see AbiGate.h): same gate as every loader.
+    const ApiVersionCheck av = check_manifest_api_version(j, kParserPluginAbiVersion);
+    if (!av.ok) return av.error;
     if (auto n = j.find("name"); n != j.end() && n->is_string()) plugin_name = n->get<std::string>();
     if (auto w = j.find("parser_wasm"); w != j.end() && w->is_string()) wasm_rel = w->get<std::string>();
     if (wasm_rel.empty()) return "manifest missing \"parser_wasm\"";
@@ -655,7 +696,16 @@ std::string load_wasm_parser_plugin(const std::string& plugin_json_path) {
   auto image = std::make_shared<std::vector<uint8_t>>(
       (std::istreambuf_iterator<char>(wf)), std::istreambuf_iterator<char>());
   if (image->size() < 8) return "wasm image too small";
-  Registry::instance().register_parser(make_wasm_parser(plugin_name, image));
+
+  // Module gate, BEFORE registering: it must load, bind every import it declares and
+  // declare the ABI this host speaks, else it is refused here with a reason (the
+  // Registry would drop a wrong-ABI parser anyway, but silently).
+  auto parser = std::make_unique<WasmParserPlugin>(plugin_name, image);
+  if (std::string why = parser->probe().refusal(kParserPluginAbiVersion,
+                                                "netvis_parser_abi_version");
+      !why.empty())
+    return why;
+  Registry::instance().register_parser(std::move(parser));
   return {};
 }
 

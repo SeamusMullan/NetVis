@@ -28,6 +28,7 @@
 
 #include "engine/OpCategory.h"
 #include "engine/plugin/OpHandler.h"
+#include "engine/plugin/wasm/WasmRuntime.h"
 
 namespace netvis::plugin::wasm {
 
@@ -37,8 +38,9 @@ OpCategory clamp_category(int32_t raw);
 
 // Per-handler load/abstain diagnostics for the Plugins panel (#11 / §A.2).
 struct WasmOpDiag {
-  bool   loaded = false;         // module loaded + abi matched
-  bool   abi_mismatch = false;
+  bool   loaded = false;         // module loaded (and linked)
+  bool   abi_mismatch = false;   // declares a different ABI version, or none
+  bool   unresolved_import = false;  // imports a host function this host lacks
   bool   missing_category = false;  // required export absent
   std::string message;           // human-readable load/abi diagnostic
 };
@@ -47,23 +49,44 @@ struct WasmOpDiag {
 // constructs a fresh WasmModule per invocation under WasmEngine::lock() (no live
 // module shared across threads). category() is required; color/flops/infer_shape
 // default to honest-unknown on abstain/trap/fuel/load-error.
+//
+// ABI NEGOTIATION. Building a handler loads the module once and asks it which ABI
+// it was built for (WasmAbiProbe), so api_version() reports what the MODULE
+// declared rather than echoing the host's constant. That makes the Registry's
+// version check on register_op_handler a real gate for a WASM handler: a module
+// that declares another version, declares none, or imports host functions this host
+// does not provide is dropped at registration instead of replacing a built-in
+// result with honest-unknown. Every invocation re-checks the same things, so a
+// handler that somehow reached the table by another route still cannot answer.
 class WasmOpHandler final : public OpHandler {
  public:
   WasmOpHandler(std::string plugin_name, std::shared_ptr<const std::vector<uint8_t>> image);
+  // For a caller that already holds the probe (the loader, which builds one handler
+  // per declared op from one image), so the module is probed once, not once per op.
+  WasmOpHandler(std::string plugin_name, std::shared_ptr<const std::vector<uint8_t>> image,
+                const WasmAbiProbe& probe);
 
   OpCategory  category(const OpContext& ctx) const override;
   ColorResult color(const OpContext& ctx) const override;
   FlopResult  flops(const OpContext& ctx) const override;
   ShapeResult infer_shape(const OpContext& ctx) const override;
-  uint32_t    api_version() const override { return kOpHandlerAbiVersion; }
+  uint32_t    api_version() const override { return abi_version_; }
 
   const WasmOpDiag& diag() const { return diag_; }
 
  private:
+  void adopt_probe(const WasmAbiProbe& probe);
+
   std::string plugin_name_;
   std::shared_ptr<const std::vector<uint8_t>> image_;
+  uint32_t abi_version_ = 0;    // what the module declared; see api_version()
   mutable WasmOpDiag diag_;
 };
+
+// Load `image` once and report whether this host can honour it as an op handler
+// (loads, every import is bound, declares kOpHandlerAbiVersion). Takes the engine
+// lock. With WASM disabled, returns a probe that is not compatible.
+WasmAbiProbe probe_op_module(const std::vector<uint8_t>& image);
 
 // A discovered op-plugin op entry (from the sidecar plugin.json "ops" list).
 struct WasmOpDecl {

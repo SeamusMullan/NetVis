@@ -28,7 +28,9 @@ OpCategory clamp_category(int32_t raw) {
 
 #include <nlohmann/json.hpp>
 
+#include "engine/plugin/AbiGate.h"
 #include "engine/plugin/Registry.h"
+#include "engine/plugin/wasm/SdkCaps.h"
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -61,6 +63,9 @@ namespace {
 // invocation is a footgun; small caps make trap/fuel-exhaustion cheap + safe.
 constexpr uint32_t kOpMaxPages = 64;         // 4 MiB
 constexpr uint64_t kOpMaxSteps = 2'000'000;
+// A facet's budget may be below the SDK's ceiling (NV_MAX_*), never above it.
+static_assert(kOpMaxPages <= caps::kCeilingPages, "op budget exceeds NV_MAX_MEMORY_PAGES");
+static_assert(kOpMaxSteps <= caps::kCeilingSteps, "op budget exceeds NV_MAX_STEPS");
 
 // Threaded to every op import via IM3ImportContext::userdata. Borrows the ctx for
 // one invocation; captures the guest's pushed results.
@@ -379,15 +384,20 @@ m3ApiRawFunction(op_set_flops) {
   m3ApiSuccess();
 }
 // void op_set_output_shape(i32 slot, i32 dims_ptr, i32 rank, i32 dtype)
+//
+// A rank above NV_MAX_RANK DROPS the output: the shape stays unknown. It must not be
+// clamped to the first NV_MAX_RANK dims - that records a truncated, lower-rank shape
+// as a known one, which is a fabricated shape (the honesty rule), and it is exactly
+// what a plugin built against a LATER v1 header with a raised NV_MAX_RANK would hit
+// on this host. The parser facet refuses the same overflow (read_dims).
 m3ApiRawFunction(op_set_output_shape) {
   m3ApiGetArg(int32_t, slot);
   m3ApiGetArgMem(int64_t*, dims);
   m3ApiGetArg(int32_t, rank);
   m3ApiGetArg(int32_t, dtype);
   OpHostCtx* h = octx(_ctx);
-  if (h && slot >= 0 && rank >= 0) {
-    // Clamp rank to NV_MAX_RANK(8); bounds-check the CLAMPED byte count (§A.2).
-    int32_t r = rank > 8 ? 8 : rank;
+  if (h && slot >= 0 && rank >= 0 && rank <= caps::kMaxRank) {
+    const int32_t r = rank;   // already within NV_MAX_RANK: bounds-check this exact count (§A.2)
     ShapeResult::Out out;
     out.slot = static_cast<uint32_t>(slot);
     if (dtype >= 0 && dtype <= static_cast<int32_t>(ir::DType::Unknown))
@@ -438,7 +448,11 @@ void link_op_capabilities(IM3Module mod, OpHostCtx* ctx) {
   L("op_attr_float", "F(*i*)", &op_attr_float);
   L("op_attr_string", "i(*i*i)", &op_attr_string);
   L("op_attr_ints", "i(*i*i)", &op_attr_ints);
-  L("op_input_const_ints", "i(*i)", &op_input_const_ints);
+  // (slot, dst, cap) -> i32: three i32 params, like the SDK header declares. This
+  // used to read "i(*i)" - two - so wasm3 rejected every real plugin's import with
+  // "function signature mismatch" and the call never worked. The freeze test now
+  // compares every link string with the header's prototype.
+  L("op_input_const_ints", "i(i*i)", &op_input_const_ints);
   L("op_set_category", "v(i)", &op_set_category);
   L("op_set_flops", "v(Ii)", &op_set_flops);
   L("op_set_output_shape", "v(i*ii)", &op_set_output_shape);
@@ -465,11 +479,23 @@ bool invoke_facet(const std::vector<uint8_t>& image, const char* facet_export,
   }
   link_op_capabilities(static_cast<IM3Module>(mod.raw_module()), hc);
 
+  // Link gate: an import the host does not answer (a name this host lacks, or the
+  // host's name declared with another signature) makes the module unusable; refuse
+  // it visibly instead of letting each entry point that reaches it abstain quietly.
+  {
+    const std::vector<std::string> unresolved = mod.unresolved_imports();
+    if (!unresolved.empty()) {
+      if (diag) {
+        diag->loaded = true; diag->unresolved_import = true;
+        diag->message = "unresolved import: " + unresolved.front();
+      }
+      return false;
+    }
+  }
+
   // ABI gate: refuse a module whose netvis_op_abi_version != kOpHandlerAbiVersion.
-  int32_t abi = -1;
-  RunResult ar = mod.call_i32("netvis_op_abi_version", &abi);
-  if (ar.status != RunStatus::Ok ||
-      abi != static_cast<int32_t>(kOpHandlerAbiVersion)) {
+  const AbiDeclaration abi = read_abi_declaration(mod, "netvis_op_abi_version");
+  if (!abi.declared || abi.version != kOpHandlerAbiVersion) {
     if (diag) {
       diag->loaded = true; diag->abi_mismatch = true;
       diag->message = "netvis_op_abi_version mismatch or missing";
@@ -486,9 +512,45 @@ bool invoke_facet(const std::vector<uint8_t>& image, const char* facet_export,
 
 }  // namespace
 
+WasmAbiProbe probe_op_module(const std::vector<uint8_t>& image) {
+  WasmAbiProbe p;
+  WasmEngine& eng = WasmEngine::instance();
+  if (!eng.enabled()) { p.message = "WASM disabled"; return p; }
+
+  std::lock_guard<std::mutex> guard(eng.lock());   // §0.3, same as invoke_facet
+  OpHostCtx hc;   // ctx == nullptr: every read import answers its "unresolved" value
+  SandboxLimits lim{kOpMaxPages, kOpMaxSteps};
+  RunResult lerr;
+  WasmModule mod = eng.load(image, lim, &hc, &lerr);
+  if (!mod.loaded()) { p.message = lerr.message; return p; }
+  link_op_capabilities(static_cast<IM3Module>(mod.raw_module()), &hc);
+  p.loaded = true;
+  p.unresolved_imports = mod.unresolved_imports();
+  p.abi = read_abi_declaration(mod, "netvis_op_abi_version");
+  return p;
+}
+
 WasmOpHandler::WasmOpHandler(std::string plugin_name,
                              std::shared_ptr<const std::vector<uint8_t>> image)
-    : plugin_name_(std::move(plugin_name)), image_(std::move(image)) {}
+    : plugin_name_(std::move(plugin_name)), image_(std::move(image)) {
+  if (image_) adopt_probe(probe_op_module(*image_));
+}
+
+WasmOpHandler::WasmOpHandler(std::string plugin_name,
+                             std::shared_ptr<const std::vector<uint8_t>> image,
+                             const WasmAbiProbe& probe)
+    : plugin_name_(std::move(plugin_name)), image_(std::move(image)) {
+  adopt_probe(probe);
+}
+
+void WasmOpHandler::adopt_probe(const WasmAbiProbe& probe) {
+  abi_version_ = probe.reported_version(kOpHandlerAbiVersion);
+  diag_.loaded = probe.loaded;
+  diag_.abi_mismatch = probe.loaded && (!probe.abi.declared ||
+                                        probe.abi.version != kOpHandlerAbiVersion);
+  diag_.unresolved_import = probe.loaded && !probe.unresolved_imports.empty();
+  diag_.message = probe.refusal(kOpHandlerAbiVersion, "netvis_op_abi_version");
+}
 
 OpCategory WasmOpHandler::category(const OpContext& ctx) const {
   if (!image_) return ctx.default_category();
@@ -546,10 +608,10 @@ std::string load_wasm_op_plugin(const std::string& plugin_json_path) {
   try {
     nlohmann::json j; f >> j;
     if (!j.is_object()) return "manifest is not an object";
-    if (auto v = j.find("api_version"); v != j.end() && v->is_number_integer()) {
-      if (v->get<int>() != static_cast<int>(kOpHandlerAbiVersion))
-        return "api_version mismatch";
-    }
+    // Strict, full-width, and REQUIRED: the declarative loader already rejects a
+    // missing or non-unsigned api_version, and a WASM plugin gets no softer gate.
+    const ApiVersionCheck av = check_manifest_api_version(j, kOpHandlerAbiVersion);
+    if (!av.ok) return av.error;
     if (auto n = j.find("name"); n != j.end() && n->is_string()) plugin_name = n->get<std::string>();
     if (auto w = j.find("wasm"); w != j.end() && w->is_string()) wasm_rel = w->get<std::string>();
     if (wasm_rel.empty()) return "manifest missing \"wasm\"";
@@ -575,10 +637,21 @@ std::string load_wasm_op_plugin(const std::string& plugin_json_path) {
       (std::istreambuf_iterator<char>(wf)), std::istreambuf_iterator<char>());
   if (image->size() < 8) return "wasm image too small";
 
+  // Module gate, BEFORE anything is registered: the module must load, bind every
+  // import it declares, and declare the ABI this host speaks. Otherwise the plugin
+  // is refused here with a reason, rather than registered as a handler that can only
+  // abstain - which, for an override:true op, would replace a built-in answer (its
+  // FLOPs, its shape) with honest-unknown while the plugins panel showed the plugin
+  // as loaded.
+  const WasmAbiProbe probe = probe_op_module(*image);
+  if (std::string why = probe.refusal(kOpHandlerAbiVersion, "netvis_op_abi_version");
+      !why.empty())
+    return why;
+
   for (const WasmOpDecl& d : ops) {
     Registry::instance().register_op_handler(
         d.op_key, d.domain,
-        std::make_unique<WasmOpHandler>(plugin_name, image),
+        std::make_unique<WasmOpHandler>(plugin_name, image, probe),
         Origin::Wasm, d.override_builtin, plugin_name);
   }
   return {};  // empty => success
@@ -590,9 +663,21 @@ std::string load_wasm_op_plugin(const std::string& plugin_json_path) {
 
 namespace netvis::plugin::wasm {
 
+// Without the engine nothing can be probed or run, so a handler declares no usable
+// ABI (version 0): were one ever constructed, the Registry would refuse it.
 WasmOpHandler::WasmOpHandler(std::string plugin_name,
                              std::shared_ptr<const std::vector<uint8_t>> image)
     : plugin_name_(std::move(plugin_name)), image_(std::move(image)) {}
+WasmOpHandler::WasmOpHandler(std::string plugin_name,
+                             std::shared_ptr<const std::vector<uint8_t>> image,
+                             const WasmAbiProbe&)
+    : plugin_name_(std::move(plugin_name)), image_(std::move(image)) {}
+void WasmOpHandler::adopt_probe(const WasmAbiProbe&) {}
+WasmAbiProbe probe_op_module(const std::vector<uint8_t>&) {
+  WasmAbiProbe p;
+  p.message = "WASM disabled";
+  return p;
+}
 OpCategory  WasmOpHandler::category(const OpContext& ctx) const { return ctx.default_category(); }
 ColorResult WasmOpHandler::color(const OpContext&) const { return ColorResult::use_category(); }
 FlopResult  WasmOpHandler::flops(const OpContext&) const { return FlopResult::unknown(); }

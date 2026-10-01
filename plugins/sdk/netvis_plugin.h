@@ -52,7 +52,13 @@ typedef enum {
 
 typedef uint32_t nv_strid_t;   /* interned string id (StringId::id) */
 
-/* ---- Sandbox caps (mirror SandboxLimits + the new marshalling caps). ------ */
+/* ---- Sandbox caps (mirror SandboxLimits + the new marshalling caps). ------
+ * The host takes these values from THIS header (src/engine/plugin/wasm/SdkCaps.h)
+ * and static_asserts its own budgets against them, so a cap here is the cap the
+ * host enforces. NV_MAX_MEMORY_PAGES / NV_MAX_STEPS are the CEILING a plugin may
+ * rely on: parser parse() and a pass run() get all of it, the op-handler facet
+ * gets 64 pages / 2,000,000 steps per call, and a parser's can_parse() sniff gets
+ * 4 pages / 500,000 steps. A facet is never granted more than the ceiling. */
 #define NV_MAX_MEMORY_PAGES 256u        /* 16 MiB linear-memory cap           */
 #define NV_MAX_STEPS        200000000ull/* fuel: yield-check decrements       */
 #define NV_NULL_GUARD_OFF   8u          /* offsets < 8 are the null guard      */
@@ -79,10 +85,13 @@ typedef uint32_t nv_strid_t;   /* interned string id (StringId::id) */
   __attribute__((import_module(module), import_name(name)))
 #define NV_EXPORT(name) __attribute__((export_name(name)))
 
+/* NV_FACET: op */
 /* ---- Op-handler facet — module "netvis_op" (Increment A §A.2). ------------
  * Read imports (host answers about the current op); result out-imports (guest
- * pushes its verdict). Sig chars audited vs m3_LinkRawFunctionEx: i=i32, I=i64,
- * f=f32, F=f64, *=i32 memory offset. */
+ * pushes its verdict). Each prototype's wasm signature is frozen in
+ * abi-v1-surface.txt and tests/test_plugin_abi_freeze.cpp requires the host's
+ * m3_LinkRawFunctionEx string for it to agree (host sig chars: i=i32, I=i64,
+ * f=f32, F=f64, *=i32 memory offset, v=void). */
 NV_IMPORT("netvis_op","op_input_count")        int32_t nv_op_input_count(void);
 NV_IMPORT("netvis_op","op_output_count")       int32_t nv_op_output_count(void);
 NV_IMPORT("netvis_op","op_default_category")   int32_t nv_op_default_category(void);
@@ -109,6 +118,7 @@ NV_IMPORT("netvis_op","op_set_flops")          void nv_op_set_flops(int64_t valu
 NV_IMPORT("netvis_op","op_set_output_shape")   void nv_op_set_output_shape(int32_t slot, int32_t dims_ptr, int32_t rank, int32_t dtype);
 NV_IMPORT("netvis_op","op_set_color")          void nv_op_set_color(int32_t rgba);
 
+/* NV_FACET: parser */
 /* ---- Parser facet — module "netvis" (Increment B §B.2). -------------------
  * Read (window-bounded, host-marked); model-mutating (append-only commands). */
 NV_IMPORT("netvis","host_file_len")        int64_t nv_host_file_len(void);
@@ -127,12 +137,14 @@ NV_IMPORT("netvis","host_add_attr_string") int32_t nv_host_add_attr_string(int32
 NV_IMPORT("netvis","host_add_attr_ints")   int32_t nv_host_add_attr_ints(int32_t g, int32_t node, int32_t name_id, int32_t ptr, int32_t count);
 NV_IMPORT("netvis","host_record_tensor")   int32_t nv_host_record_tensor(int32_t g, int32_t name_id, int64_t off, int64_t len, int32_t dtype, int32_t dims_ptr, int32_t rank);
 
+/* NV_FACET: pass */
 /* ---- Pass facet — module "netvis" (v0.6.0, already shipped). -------------- */
 NV_IMPORT("netvis","host_node_count")   int64_t nv_host_node_count(void);
 NV_IMPORT("netvis","host_total_flops")  double  nv_host_total_flops(void);
 NV_IMPORT("netvis","host_total_params") double  nv_host_total_params(void);
 NV_IMPORT("netvis","host_emit_metric")  void    nv_host_emit_metric(int32_t name_ptr, int32_t name_len, double value, int32_t known);
 
+/* NV_FACET: guest */
 /* ---- Tiny bump allocator: guests marshal small dims/name buffers without a
  * full libc. Backed by a static arena; reset() before each entry call. ------ */
 #ifndef NV_ARENA_BYTES
@@ -157,9 +169,12 @@ static inline void* nv_alloc(uint32_t n) {
  * the wasm32 plugin toolchain AND the host toolchain. [§D.1]
  * ========================================================================= */
 
-/* A marshalled tensor-record command payload (guest -> host_record_tensor is
- * passed by scalar args, but this struct documents the canonical field order &
- * is used by the host-side decoder for the (dims_ptr,rank) block). */
+/* The canonical field order of a tensor-record command. DOCUMENTATION-ONLY in
+ * ABI v1: host_record_tensor takes these as scalar arguments and no host code
+ * reads this struct, so it cannot strand a built plugin today. It is frozen
+ * anyway (field list in abi-v1-surface.txt, size asserted below, offsets asserted
+ * in tests/test_sdk_abi.cpp) so a later import that does pass it by pointer
+ * inherits a layout that was never allowed to drift. */
 typedef struct {
   int64_t off;       /* file offset of the payload / MIL blob header */
   int64_t len;       /* byte length (0 => host derives, e.g. blob-indirect) */
@@ -171,7 +186,10 @@ typedef struct {
 _Static_assert(sizeof(nv_tensor_hdr_t) == 24, "nv_tensor_hdr_t packing drift");
 _Static_assert(NV_DT_UNKNOWN == 15, "nv_dtype_t must match ir::DType (Unknown=15)");
 _Static_assert(NV_CAT_OTHER == 14, "nv_category_t must match OpCategory (Other=14)");
-#elif defined(__cplusplus) && __cplusplus >= 201103L
+#elif defined(__cplusplus) && \
+    (__cplusplus >= 201103L || (defined(_MSVC_LANG) && _MSVC_LANG >= 201103L))
+/* MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is set, hence
+ * _MSVC_LANG: without it these asserts would silently vanish on Windows. */
 static_assert(sizeof(nv_tensor_hdr_t) == 24, "nv_tensor_hdr_t packing drift");
 static_assert((int)NV_DT_UNKNOWN == 15, "nv_dtype_t must match ir::DType (Unknown=15)");
 static_assert((int)NV_CAT_OTHER == 14, "nv_category_t must match OpCategory (Other=14)");

@@ -79,6 +79,22 @@ uint8_t* WasmModule::memory(uint32_t* out_size) {
   return mem;
 }
 
+std::vector<std::string> WasmModule::unresolved_imports() const {
+  std::vector<std::string> out;
+  if (!impl_ || !impl_->module) return out;
+  const IM3Module m = impl_->module;
+  for (uint32_t i = 0; i < m->numFunctions; ++i) {
+    const IM3Function f = &m->functions[i];
+    // An import has both names; wasm3 sets `compiled` on it only when a host
+    // function was linked (LinkRawFunction), so an import still without it is one
+    // no host function answers.
+    if (f->import.moduleUtf8 && f->import.fieldUtf8 && !f->compiled) {
+      out.push_back(std::string(f->import.moduleUtf8) + "." + f->import.fieldUtf8);
+    }
+  }
+  return out;
+}
+
 void* WasmModule::raw_module() const { return impl_ ? impl_->module : nullptr; }
 void* WasmModule::raw_runtime() const { return impl_ ? impl_->runtime : nullptr; }
 
@@ -100,7 +116,11 @@ RunResult WasmModule::call_i32(const char* export_name, int32_t* out_ret) {
     if (err && std::strcmp(err, kFuelExhausted) == 0) {
       r.status = RunStatus::FuelExhausted; r.message = err; return r;  // start-section runaway
     }
-    r.status = RunStatus::LoadError; r.message = err ? err : "export not found"; return r;
+    r.status = RunStatus::LoadError; r.message = err ? err : "export not found";
+    // wasm3 reports a name that no function answers to as functionLookupFailed (a
+    // compile failure inside the export is a different, specific error).
+    r.export_missing = !err || std::strcmp(err, m3Err_functionLookupFailed) == 0;
+    return r;
   }
 
   // VALIDATE the export's signature BEFORE m3_CallV/GetResultsV. m3_FindFunction
@@ -214,13 +234,22 @@ WasmModule WasmEngine::load(const std::vector<uint8_t>& wasm, const SandboxLimit
 #else  // !NETVIS_ENABLE_WASM — safe no-op stubs
 
 namespace netvis::plugin::wasm {
+// Defined (empty) so the defaulted special members below can instantiate
+// unique_ptr<Impl>'s deleter; without it a WASM-off build fails to compile.
+struct WasmModule::Impl {};
 WasmModule::~WasmModule() = default;
 WasmModule::WasmModule(WasmModule&&) noexcept = default;
 WasmModule& WasmModule::operator=(WasmModule&&) noexcept = default;
 uint8_t* WasmModule::memory(uint32_t* out_size) { if (out_size) *out_size = 0; return nullptr; }
 void* WasmModule::raw_module() const { return nullptr; }
 void* WasmModule::raw_runtime() const { return nullptr; }
-RunResult WasmModule::call_i32(const char*, int32_t*) { return {RunStatus::Disabled, "WASM disabled"}; }
+std::vector<std::string> WasmModule::unresolved_imports() const { return {}; }
+RunResult WasmModule::call_i32(const char*, int32_t*) {
+  RunResult r;
+  r.status = RunStatus::Disabled;
+  r.message = "WASM disabled";
+  return r;
+}
 
 struct WasmEngine::Impl {};
 WasmEngine::WasmEngine() = default;
@@ -228,7 +257,10 @@ WasmEngine::~WasmEngine() = default;
 WasmEngine& WasmEngine::instance() { static WasmEngine e; return e; }
 bool WasmEngine::enabled() const { return false; }
 WasmModule WasmEngine::load(const std::vector<uint8_t>&, const SandboxLimits&, void*, RunResult* out_err) {
-  if (out_err) *out_err = {RunStatus::Disabled, "WASM disabled"};
+  if (out_err) {
+    out_err->status = RunStatus::Disabled;
+    out_err->message = "WASM disabled";
+  }
   return WasmModule{};
 }
 }  // namespace netvis::plugin::wasm
