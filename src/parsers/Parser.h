@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "core/JobSystem.h"
 #include "core/MappedFile.h"
@@ -37,6 +38,66 @@ enum class Format : uint8_t {
 };
 
 const char* format_name(Format f);
+
+// Every file extension (lowercased, no dot) detect_format() acts on, and the
+// Format it breaks an otherwise-ambiguous file toward (spec §5). This is the ONE
+// place the detector's extension knowledge lives: the extension tiebreak at the
+// end of detect_format() walks this table, and the file chooser's openable list
+// (view/FileDialog.h) is built from it, so a format that parses can never be
+// unpickable from the GUI. First match wins.
+//
+// detect_format() consults an extension in three places, all routed through
+// names declared here so none can hide a literal:
+//   1. kCoreMLExtension - one of the two signals of the early CoreML guard
+//      (content via looks_like_coreml, OR this extension; a bare CoreML protobuf
+//      looks like ONNX, so the guard decides before the ONNX sniff);
+//   2. kZipExtensionFormats - the tiebreak for a zip no content signal claimed;
+//   3. kExtensionFormats - the final tiebreak for everything else.
+// Every extension used by 1 and 2 must also appear in this table, with the same
+// Format (tests/test_detect.cpp enforces it), and tests/test_detect.cpp checks
+// that each one routes the way it says.
+struct ExtensionFormat {
+  std::string_view ext;
+  Format format;
+};
+
+// The CoreML `.mlmodel` extension; see (1) above.
+inline constexpr std::string_view kCoreMLExtension = "mlmodel";
+
+inline constexpr ExtensionFormat kExtensionFormats[] = {
+    {"onnx", Format::ONNX},
+    {"tflite", Format::TFLite},
+    {"safetensors", Format::SafeTensors},
+    {"gguf", Format::GGUF},
+    {"xml", Format::OpenVINO},
+    {"npz", Format::Npz},
+    {"keras", Format::Keras},
+    {"h5", Format::Keras},
+    {"hdf5", Format::Keras},
+    {kCoreMLExtension, Format::CoreML},
+    {"pb", Format::TensorFlow},
+    {"pt", Format::PyTorchZip},
+    {"pth", Format::PyTorchZip},
+    {"bin", Format::PyTorchZip},
+    {"pkl", Format::PyTorchLegacy},
+    {"pickle", Format::PyTorchLegacy},
+};
+
+// The subset of extensions that break a tie for a ZIP archive whose central
+// directory carries no content signal (see (2) above). It is deliberately
+// narrower than kExtensionFormats: an `.h5` or `.onnx` name on a zip is not
+// evidence of that format, so such a zip falls through to the content default
+// (PyTorch zip) instead. A new zip-based format (say, TorchScript-Lite) adds its
+// extension HERE and in kExtensionFormats; the test fails if an extension is in
+// this table but missing from kExtensionFormats (the reverse is allowed: the main
+// table is the wider one).
+inline constexpr ExtensionFormat kZipExtensionFormats[] = {
+    {"npz", Format::Npz},
+    {"keras", Format::Keras},
+    {"pt", Format::PyTorchZip},
+    {"pth", Format::PyTorchZip},
+    {"bin", Format::PyTorchZip},
+};
 
 // Detect the format from file content. `ext_hint` is a lowercased extension
 // (without dot), used only to break ties (spec §5). Returns Format::Unknown if

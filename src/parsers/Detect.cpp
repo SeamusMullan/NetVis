@@ -439,18 +439,13 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
       reason = DetectReason::Magic;
       return Format::Npz;
     }
-    // Ambiguous zip: the file extension breaks the tie.
-    if (ext_hint == "npz") {
-      reason = DetectReason::Extension;
-      return Format::Npz;
-    }
-    if (ext_hint == "keras") {
-      reason = DetectReason::Extension;
-      return Format::Keras;
-    }
-    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
-      reason = DetectReason::Extension;
-      return Format::PyTorchZip;
+    // Ambiguous zip: the file extension breaks the tie. Table-driven
+    // (kZipExtensionFormats in Parser.h) so no extension literal can hide here.
+    for (const ExtensionFormat& e : kZipExtensionFormats) {
+      if (ext_hint == e.ext) {
+        reason = DetectReason::Extension;
+        return e.format;
+      }
     }
     // Unknown zip contents: default to PyTorch zip (its parser errors cleanly
     // if there is no data.pkl) rather than mis-claiming a tensor format.
@@ -500,9 +495,10 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
   //     (looks_like_coreml), so a CoreML file is recognised without its suffix
   //     (renamed, `model.bin`, an .mlpackage whose Manifest names an inner spec
   //     without one);
-  //   - the `.mlmodel` extension, the tiebreaker for a spec that carries no
-  //     model type at all, which has no content signal to find (spec §5).
-  const bool coreml_ext = ext_hint == "mlmodel";
+  //   - the `.mlmodel` extension (kCoreMLExtension, Parser.h), the tiebreaker
+  //     for a spec that carries no model type at all, which has no content
+  //     signal to find (spec §5).
+  const bool coreml_ext = ext_hint == kCoreMLExtension;
   if (coreml_ext || looks_like_coreml(d, size)) {
     reason = coreml_ext ? DetectReason::Extension : DetectReason::Structure;
     return Format::CoreML;
@@ -526,23 +522,13 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::ONNX;
   }
 
-  // Extension tiebreaker for ambiguous content.
+  // Extension tiebreaker for ambiguous content. Table-driven (kExtensionFormats
+  // in Parser.h) so the file chooser's openable list can be checked against it.
   if (!ext_hint.empty()) {
     reason = DetectReason::Extension;
-    if (ext_hint == "onnx") return Format::ONNX;
-    if (ext_hint == "tflite") return Format::TFLite;
-    if (ext_hint == "safetensors") return Format::SafeTensors;
-    if (ext_hint == "gguf") return Format::GGUF;
-    if (ext_hint == "xml") return Format::OpenVINO;
-    if (ext_hint == "npz") return Format::Npz;
-    if (ext_hint == "keras" || ext_hint == "h5" || ext_hint == "hdf5")
-      return Format::Keras;
-    if (ext_hint == "mlmodel") return Format::CoreML;
-    if (ext_hint == "pb") return Format::TensorFlow;
-    if (ext_hint == "pt" || ext_hint == "pth" || ext_hint == "bin") {
-      return Format::PyTorchZip;
+    for (const ExtensionFormat& e : kExtensionFormats) {
+      if (ext_hint == e.ext) return e.format;
     }
-    if (ext_hint == "pkl" || ext_hint == "pickle") return Format::PyTorchLegacy;
   }
 
   reason = DetectReason::None;
