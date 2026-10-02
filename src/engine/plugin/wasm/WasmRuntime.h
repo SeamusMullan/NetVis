@@ -27,6 +27,39 @@ struct SandboxLimits {
   uint64_t max_steps = 200'000'000;   // fuel: yield-check decrements; 0 => trap
 };
 
+// The step budget of an ABI PROBE: the one-off load a plugin adapter does to ask a
+// module which ABI it was built for (probe_op_module, probe_parser_module, the
+// WasmPassPlugin constructor). It runs wherever the plugin is loaded - which is the
+// UI thread, at start-up and on every Plugins-panel toggle - so it must not be
+// bounded by the budget of the work the module is later trusted with (up to
+// NV_MAX_STEPS = 200M steps): a module whose start section loops would freeze the
+// app for as long as that budget lasts. Reading a version is a constant function and
+// a legitimate start section is a handful of calls, so this is deliberately tiny.
+// A "step" is one function call or one loop iteration (the m3_Yield points).
+// The module's start section and its ABI-version export each get this many; a module
+// that needs more is refused, with that reason (docs/plugin-abi.md, "ABI probe
+// budget"). Every probe takes its limits from abi_probe_limits() below.
+// This bounds STEPS, not wall-clock time: a guest that does bulk-memory work in every
+// step (memory.fill over its whole memory) makes a step cost as much as the memory is
+// large, so an adversarial module can still stretch a probe to seconds (measured: ~5 s
+// at the op cap, ~0.3 s at the parser's, ~20 s at the pass's 16 MiB). Closing that
+// needs a wall-clock deadline in m3_Yield and/or probing off the UI thread; both are
+// follow-ups, not done here.
+inline constexpr uint64_t kAbiProbeStepBudget = 50'000;
+// Far below every budget a facet runs under (the smallest, the parser sniff, is
+// 500,000 steps; the op handler gets 2,000,000 and parse/run the 200M ceiling).
+static_assert(kAbiProbeStepBudget * 100 <= SandboxLimits{}.max_steps,
+              "the ABI probe budget must stay far below the run budget");
+
+// The limits one ABI probe runs under: the facet's own memory cap with the shared,
+// small probe step budget.
+inline SandboxLimits abi_probe_limits(uint32_t max_memory_pages) {
+  SandboxLimits lim;
+  lim.max_memory_pages = max_memory_pages;
+  lim.max_steps = kAbiProbeStepBudget;
+  return lim;
+}
+
 // Outcome of a sandboxed run.
 enum class RunStatus : uint8_t {
   Ok,           // ran to completion
@@ -39,6 +72,13 @@ enum class RunStatus : uint8_t {
 struct RunResult {
   RunStatus status = RunStatus::Disabled;
   std::string message;   // human-readable (trap text / link error)
+  // LoadError only: the named export does not exist at all (as opposed to existing
+  // with the wrong signature, or failing to compile). Lets a caller treat "absent"
+  // differently from "present but broken" - the ABI negotiation does (see below).
+  // Decided by WasmModule::has_export(), never from the error text: wasm3 reports
+  // "function lookup failed" for a name nothing answers to AND for a present export
+  // whose body calls a function index that does not exist.
+  bool export_missing = false;
 };
 
 // A loaded, sandboxed WASM module instance. One instance per run (fresh state, no
@@ -58,8 +98,27 @@ class WasmModule {
   // fuel/deadline cap; a runaway module returns FuelExhausted, never hangs.
   RunResult call_i32(const char* export_name, int32_t* out_ret);
 
+  // True when the module has a function by this name, i.e. exactly what
+  // m3_FindFunction resolves by (the module's export names, which is where wasm3
+  // keeps them). Read straight off the module: it neither compiles anything nor runs
+  // the start section, so it says "absent" only for a name that is absent - never
+  // for an export that is present but fails to compile or run.
+  bool has_export(const char* export_name) const;
+
   // Access the instance's linear memory (for marshalling); nullptr/0 if absent.
   uint8_t* memory(uint32_t* out_size);
+
+  // Function imports the module declares that NO host function answers, as
+  // "module.name" strings. Call after the facet's link step. m3_LinkRawFunctionEx
+  // leaves an import unbound in two cases that the link call itself hides from the
+  // caller: the host has no function of that name (a plugin built against a newer
+  // SDK, or a typo), and the host has one but the guest declared a different
+  // signature (wasm3 reports "function signature mismatch" and links nothing). In
+  // both a call to the import fails later, and only for the entry point that
+  // reaches it - so the module looks fine until it silently abstains. Naming the
+  // unbound imports up front lets a loader refuse the module visibly instead.
+  // Empty when everything the module imports is bound (or built without WASM).
+  std::vector<std::string> unresolved_imports() const;
 
   // Opaque native handles for the host-linking TU (WasmHost.cpp). Return nullptr
   // when built without NETVIS_ENABLE_WASM. Typed void* so this header stays free
@@ -72,6 +131,94 @@ class WasmModule {
   WasmModule() = default;
   struct Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+// What a module says about the ABI it was built against: the result of calling its
+// `netvis_<facet>_abi_version` export. Pure data; the version policy lives with
+// each facet (op/parser: a missing export is a refusal; pass: a missing export is
+// a pre-negotiation v1 plugin, see WasmHost.cpp).
+struct AbiDeclaration {
+  bool declared = false;         // the export exists and returned
+  bool export_missing = false;   // the export is absent (vs. present but failing)
+  bool fuel_exhausted = false;   // the module (start section or export) ran out of steps
+  uint32_t version = 0;          // the declared version; 0 when !declared or negative
+  std::string message;           // why it was not read, when !declared
+};
+
+inline AbiDeclaration read_abi_declaration(WasmModule& mod, const char* export_name) {
+  AbiDeclaration d;
+  int32_t v = -1;
+  RunResult r = mod.call_i32(export_name, &v);
+  if (r.status == RunStatus::Ok) {
+    d.declared = true;
+    d.version = v < 0 ? 0u : static_cast<uint32_t>(v);
+  } else {
+    d.export_missing = r.export_missing;
+    d.fuel_exhausted = (r.status == RunStatus::FuelExhausted);
+    d.message = r.message;
+  }
+  return d;
+}
+
+// The outcome of loading a plugin module once and asking whether THIS host can
+// honour it: it loads, every import it declares is bound, and it declares the ABI
+// version the host speaks. One of these is taken when an adapter is built, which is
+// what lets the adapters' api_version() report what the module declared (so the
+// Registry's version check is a real gate for WASM plugins, not a constant) and
+// lets a loader refuse a module before anything is registered.
+struct WasmAbiProbe {
+  bool loaded = false;                         // parsed, instantiated and linked
+  AbiDeclaration abi;                          // what it declared
+  std::vector<std::string> unresolved_imports; // imports no host function answers
+  std::string message;                         // load failure text, when !loaded
+
+  bool compatible(uint32_t host_version) const {
+    return loaded && abi.declared && abi.version == host_version &&
+           unresolved_imports.empty();
+  }
+  // The version an adapter reports through api_version(): what the module declared
+  // when that differs from the host's, and 0 ("not speakable") when it declared the
+  // host's version but cannot run here (did not load, or imports something this host
+  // does not provide).
+  uint32_t reported_version(uint32_t host_version) const {
+    if (compatible(host_version)) return host_version;
+    if (loaded && abi.declared && abi.version != host_version) return abi.version;
+    return 0;
+  }
+  // Why a loader refuses the module; empty when compatible.
+  std::string refusal(uint32_t host_version, const char* abi_export) const {
+    if (compatible(host_version)) return {};
+    if (!loaded) return "module failed to load: " + message;
+    if (!abi.declared) {
+      if (abi.fuel_exhausted) {
+        // The probe is bounded so that loading a plugin cannot hang the app.
+        return "module exceeded the ABI probe budget (" +
+               std::to_string(kAbiProbeStepBudget) + " steps): its start section and `" +
+               abi_export + "` must each finish within it";
+      }
+      if (!abi.export_missing) {
+        // Present but unusable (traps, will not compile, wrong signature): not the
+        // same as a module that never declared a version.
+        return std::string("module's `") + abi_export + "` export is present but " +
+               "failed (" + abi.message + "); this NetVis speaks ABI v" +
+               std::to_string(host_version);
+      }
+      return std::string("module does not declare an ABI version (no usable `") +
+             abi_export + "` export); this NetVis speaks ABI v" +
+             std::to_string(host_version);
+    }
+    if (abi.version != host_version) {
+      return "module declares ABI v" + std::to_string(abi.version) +
+             "; this NetVis speaks ABI v" + std::to_string(host_version);
+    }
+    std::string list;
+    for (const std::string& u : unresolved_imports) {
+      if (!list.empty()) list += ", ";
+      list += u;
+    }
+    return "module imports host functions this NetVis does not provide (or declares "
+           "them with a different signature): " + list;
+  }
 };
 
 // Process-wide engine: owns the wasm3 environment. Thread-compat: build one module

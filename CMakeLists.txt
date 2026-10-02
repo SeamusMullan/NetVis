@@ -203,6 +203,9 @@ list(APPEND NETVIS_CORE_SRC
 
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
 target_include_directories(netvis_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+# The repo root, PRIVATE, so the WASM adapters can include the shipped SDK header
+# (plugins/sdk/netvis_plugin.h) and take their caps from it instead of copying them.
+target_include_directories(netvis_core PRIVATE ${CMAKE_SOURCE_DIR})
 # Version string for headless surfaces (the MCP serverInfo). Same value CPack
 # stamps on installers, so a served version always matches the artifact's.
 target_compile_definitions(netvis_core PUBLIC NETVIS_VERSION_STRING="${NETVIS_VERSION}")

@@ -1528,14 +1528,19 @@ def build_wasm_const():
     return _wasm_module(types, funcs, exports, code)
 
 
-def build_wasm_ophandler(hostile=False):
+def build_wasm_ophandler(hostile=False, abi_version=1, omit_abi=False):
     """An OP-HANDLER plugin (#10, Increment A). Exports:
       netvis_op_abi_version : ()->i32   (returns 1)
       netvis_op_category    : ()->i32   (calls op_set_category(Conv=0), returns 0)
       netvis_op_flops       : ()->i32   (calls op_set_flops(1024, 1), returns 0)
     Imports from module "netvis_op": op_set_category:(i32)->() , op_set_flops:(i64,i32)->().
     hostile=True makes netvis_op_category call op_set_category(9999) to exercise the
-    host-side clamp (must become OpCategory::Other, never OOB)."""
+    host-side clamp (must become OpCategory::Other, never OOB).
+
+    abi_version sets what netvis_op_abi_version returns, and omit_abi drops the
+    export entirely. Both feed the ABI-freeze tests (#113): the host must refuse a
+    module declaring an ABI it was not built for, and refuse one that declares
+    none, in both cases cleanly (honest-unknown, nothing half-registered)."""
     CONV = 0
     CAT = 9999 if hostile else CONV
     # Type section:
@@ -1557,13 +1562,17 @@ def build_wasm_ophandler(hostile=False):
     # Functions: three local funcs, all type 2 () -> i32.
     funcs = _uleb(3) + _uleb(2) + _uleb(2) + _uleb(2)
     # Exports: the three entry points (func indices 2,3,4 after 2 imported).
-    exp = _uleb(3)
-    exp += nm("netvis_op_abi_version") + b"\x00" + _uleb(2)
+    # omit_abi keeps func 2 in the module but unexported, so the host sees a module
+    # that simply does not answer the ABI question -- the "old plugin, new host"
+    # shape, not a malformed module.
+    exp = _uleb(2 if omit_abi else 3)
+    if not omit_abi:
+        exp += nm("netvis_op_abi_version") + b"\x00" + _uleb(2)
     exp += nm("netvis_op_category") + b"\x00" + _uleb(3)
     exp += nm("netvis_op_flops") + b"\x00" + _uleb(4)
 
-    # func 2 abi_version: i32.const 1 ; end
-    b_abi = _uleb(0) + b"\x41" + _uleb(1) + b"\x0b"
+    # func 2 abi_version: i32.const <abi_version> ; end
+    b_abi = _uleb(0) + b"\x41" + _sleb(abi_version) + b"\x0b"
     # func 3 category: i32.const CAT ; call 0 (op_set_category) ; i32.const 0 ; end
     b_cat = _uleb(0) + b"\x41" + _sleb(CAT) + b"\x10" + _uleb(0) + b"\x41\x00" + b"\x0b"
     # func 4 flops: i64.const 1024 ; i32.const 1 ; call 1 (op_set_flops) ; i32.const 0 ; end
@@ -1581,7 +1590,137 @@ def build_wasm_ophandler(hostile=False):
     return bytes(out)
 
 
-def build_wasm_toyparser():
+def build_wasm_op_link_probe(variant):
+    """An op-handler plugin that exercises LINKING rather than answers (#113).
+
+    Always exports netvis_op_abi_version (returns 1), netvis_op_category (calls
+    op_set_category(Conv)) and netvis_op_flops, and always has one linear memory. What
+    differs is what the module imports from "netvis_op" and what flops does:
+
+      variant "const_ints"   imports op_input_const_ints with the signature the SDK
+                             header declares, (i32,i32,i32)->i32, and flops answers
+                             const_ints(0,64,4) + 8. Under a cost/test context there
+                             is no mmap base, so the host returns -1 and flops is a
+                             known 7: a result only a LINKED import can produce. (The
+                             host used to link it as a 2-arg function, so wasm3
+                             refused the header's own signature and the import never
+                             worked for any SDK-built plugin.)
+      variant "bad_sig"      imports op_set_flops as (i32,i32)->() where the host
+                             links (i64,i32)->(): a real name with the wrong
+                             signature. wasm3 refuses the link; the import stays
+                             unbound.
+      variant "unknown"      declares an extra import the host has no function for
+                             (op_from_a_newer_sdk) and never calls it: the "plugin
+                             built against a newer v1 header, running on an older v1
+                             host" shape. It declares ABI v1 and abstains from
+                             nothing - and must still be refused, visibly.
+    """
+    assert variant in ("const_ints", "bad_sig", "unknown")
+    i, I = b"\x7f", b"\x7e"
+
+    def ftype(params, results):
+        return (b"\x60" + _uleb(len(params)) + b"".join(params) +
+                _uleb(len(results)) + b"".join(results))
+
+    def nm(s):
+        b = s.encode(); return _uleb(len(b)) + b
+
+    # Types: t0 (i32)->() | t1 (i64,i32)->() | t2 ()->i32 | t3 (i32,i32,i32)->i32 |
+    #        t4 (i32,i32)->() | t5 ()->()
+    types = _uleb(6) + ftype([i], []) + ftype([I, i], []) + ftype([], [i]) + \
+        ftype([i, i, i], [i]) + ftype([i, i], []) + ftype([], [])
+
+    imports = [("op_set_category", 0),
+               ("op_set_flops", 4 if variant == "bad_sig" else 1)]
+    if variant == "const_ints":
+        imports.append(("op_input_const_ints", 3))
+    if variant == "unknown":
+        imports.append(("op_from_a_newer_sdk", 5))
+    imp = _uleb(len(imports))
+    for name, tidx in imports:
+        imp += nm("netvis_op") + nm(name) + b"\x00" + _uleb(tidx)
+    n_imp = len(imports)
+
+    funcs = _uleb(3) + _uleb(2) + _uleb(2) + _uleb(2)         # abi, category, flops
+    mem = _uleb(1) + b"\x00" + _uleb(1)                       # one memory, min 1 page
+    exp = _uleb(3)
+    exp += nm("netvis_op_abi_version") + b"\x00" + _uleb(n_imp)
+    exp += nm("netvis_op_category") + b"\x00" + _uleb(n_imp + 1)
+    exp += nm("netvis_op_flops") + b"\x00" + _uleb(n_imp + 2)
+
+    b_abi = _uleb(0) + b"\x41\x01\x0b"                         # return 1
+    b_cat = _uleb(0) + b"\x41\x00" + b"\x10" + _uleb(0) + b"\x41\x00" + b"\x0b"
+    if variant == "const_ints":
+        # call op_input_const_ints(0, 64, 4); i64.extend_i32_s; i64.const 8; i64.add;
+        # then op_set_flops(<that>, 1); return 0.
+        b_flp = (_uleb(0) + b"\x41\x00" + b"\x41" + _sleb(64) + b"\x41\x04" +
+                 b"\x10" + _uleb(2) + b"\xac" + b"\x42\x08" + b"\x7c" +
+                 b"\x41\x01" + b"\x10" + _uleb(1) + b"\x41\x00" + b"\x0b")
+    elif variant == "bad_sig":
+        # op_set_flops(7, 1) through the (i32,i32)->() import; return 0.
+        b_flp = (_uleb(0) + b"\x41\x07" + b"\x41\x01" + b"\x10" + _uleb(1) +
+                 b"\x41\x00" + b"\x0b")
+    else:
+        # op_set_flops(1024, 1) as the well-formed fixture does; return 0.
+        b_flp = (_uleb(0) + b"\x42" + _sleb(1024) + b"\x41\x01" + b"\x10" + _uleb(1) +
+                 b"\x41\x00" + b"\x0b")
+    code = _uleb(3)
+    for body in (b_abi, b_cat, b_flp):
+        code += _uleb(len(body)) + body
+
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(2, imp)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(5, mem)
+    out += _wasm_section(7, exp)
+    out += _wasm_section(10, code)
+    return bytes(out)
+
+
+def build_wasm_op_shape(rank):
+    """An op-handler plugin whose netvis_op_infer_shape declares output 0 as a float32
+    tensor of `rank` dims, [3, 4, 5, ...] (#113). Imports op_set_output_shape:
+    (i32,i32,i32,i32)->(); exports netvis_op_abi_version (returns 1) and
+    netvis_op_infer_shape. A rank above NV_MAX_RANK (8) must leave the shape unknown
+    (the output keeps its dtype and carries no shape) - not be clamped to its first
+    eight dims and recorded as a known rank-8 shape."""
+    import struct as _struct
+    i = b"\x7f"
+
+    def nm(s):
+        b = s.encode(); return _uleb(len(b)) + b
+
+    types = _uleb(2) + b"\x60" + _uleb(4) + i * 4 + _uleb(0) + \
+        b"\x60" + _uleb(0) + _uleb(1) + i
+    imp = _uleb(1) + nm("netvis_op") + nm("op_set_output_shape") + b"\x00" + _uleb(0)
+    funcs = _uleb(2) + _uleb(1) + _uleb(1)                       # abi (idx 1), infer (idx 2)
+    mem = _uleb(1) + b"\x00" + _uleb(1)
+    exp = _uleb(2)
+    exp += nm("netvis_op_abi_version") + b"\x00" + _uleb(1)
+    exp += nm("netvis_op_infer_shape") + b"\x00" + _uleb(2)
+    b_abi = _uleb(0) + b"\x41\x01\x0b"
+    # op_set_output_shape(slot=0, dims_ptr=16, rank, dtype=0 /*F32*/); return 0
+    b_inf = (_uleb(0) + b"\x41\x00" + b"\x41" + _sleb(16) + b"\x41" + _sleb(rank) +
+             b"\x41\x00" + b"\x10" + _uleb(0) + b"\x41\x00" + b"\x0b")
+    code = _uleb(2)
+    for body in (b_abi, b_inf):
+        code += _uleb(len(body)) + body
+    # 12 i64 dims at offset 16 (more than any rank this fixture is asked for).
+    dims = _struct.pack("<12q", *[d + 3 for d in range(12)])
+    data = _uleb(1) + _uleb(0) + b"\x41" + _sleb(16) + b"\x0b" + _uleb(len(dims)) + dims
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(2, imp)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(5, mem)
+    out += _wasm_section(7, exp)
+    out += _wasm_section(10, code)
+    out += _wasm_section(11, data)
+    return bytes(out)
+
+
+def build_wasm_toyparser(abi_version=1, omit_abi=False):
     """A PARSER plugin (#10, Increment B). Exports:
       netvis_parser_abi_version : ()->i32  (returns 1)
       netvis_can_parse          : ()->i32  (returns 1 — claims the file)
@@ -1590,7 +1729,12 @@ def build_wasm_toyparser():
     host_begin_graph:(i32)->i32, host_add_node:(i32,i32,i32,i32,i32,i32,i32)->i32,
     host_record_tensor:(i32,i32,i64,i64,i32,i32,i32)->i32, host_set_model_info:(i32,i32,i32)->().
     Uses no linear memory reads for structure (interns are host-side); a minimal
-    exercise of the append-only command path + zero-payload witness."""
+    exercise of the append-only command path + zero-payload witness.
+
+    abi_version sets what netvis_parser_abi_version returns; a value the host was
+    not built for must make can_parse/parse refuse rather than claim the file
+    (#113). omit_abi leaves the function in the module but unexported - a parser
+    that never answers the ABI question - and must be refused the same way."""
     # Type section
     #  t0 (I i)->i    host_intern_range(i64,i32)->i32
     #  t1 (i)->i      host_begin_graph(i32)->i32
@@ -1623,13 +1767,14 @@ def build_wasm_toyparser():
     imp += nm("netvis") + nm("host_add_attr_int") + b"\x00" + _uleb(6)   # func 5 (type t6)
     # three local funcs, all type 5 () -> i32 (indices 6,7,8 after 6 imported).
     funcs = _uleb(3) + _uleb(5) + _uleb(5) + _uleb(5)
-    exp = _uleb(3)
-    exp += nm("netvis_parser_abi_version") + b"\x00" + _uleb(6)
+    exp = _uleb(2 if omit_abi else 3)
+    if not omit_abi:
+        exp += nm("netvis_parser_abi_version") + b"\x00" + _uleb(6)
     exp += nm("netvis_can_parse") + b"\x00" + _uleb(7)
     exp += nm("netvis_parse") + b"\x00" + _uleb(8)
 
-    # func 6 abi_version: i32.const 1 ; end
-    b_abi = _uleb(0) + b"\x41\x01\x0b"
+    # func 6 abi_version: i32.const <abi_version> ; end
+    b_abi = _uleb(0) + b"\x41" + _sleb(abi_version) + b"\x0b"
     # func 7 can_parse: i32.const 1 ; end (always claims)
     b_can = _uleb(0) + b"\x41\x01\x0b"
     # func 8 parse:
@@ -1666,20 +1811,39 @@ def build_wasm_toyparser():
     return bytes(out)
 
 
-def build_wasm_pass():
+def build_wasm_pass(abi_version=None, abi_emits_metric=False, abi_broken=False):
     """A PASS plugin: imports netvis.host_total_flops : ()->f64 and
     netvis.host_emit_metric : (i32 ptr, i32 len, f64 value, i32 known)->void.
     On run() it emits a metric "double_flops" = 2 * host_total_flops(), known=1.
     Proves the capability host API + marshalling round-trip (and that NO weight
-    buffer ever crosses — the host has no such import)."""
-    # --- Type section: 3 types ---
+    buffer ever crosses — the host has no such import).
+
+    abi_version=None builds the pass exactly as it shipped in v0.6.0, with NO
+    netvis_pass_abi_version export: the host must keep running it (it predates the
+    export, and the ABI v1 promise is that a v1 plugin keeps loading). An integer
+    adds that export returning it (#113): 1 is a pass that declares the host's ABI,
+    anything else must be refused.
+
+    abi_emits_metric makes the ABI export itself call host_emit_metric (a metric named
+    "double_flops", value 7) before it returns abi_version: the export is guest code,
+    and a metric emitted while the module is being judged must not reach the caller
+    when the module is refused (#113 review). abi_broken makes the export a
+    PRESENT-but-unusable one: its body calls function index 99, which the module does
+    not have, so wasm3 fails to compile it with "function lookup failed" - the same
+    error it gives for a name nothing answers to. The host must refuse such a pass,
+    not mistake it for a pre-negotiation v1 pass that merely lacks the export."""
+    with_abi = abi_version is not None or abi_broken
+    # --- Type section: 3 types (+ a 4th only when the abi export is added, so the
+    # default output stays byte-identical to the v0.6.0 fixture) ---
     #  t0: () -> f64            (host_total_flops)
     #  t1: (i32,i32,f64,i32)->()(host_emit_metric)
     #  t2: () -> ()             (run)
+    #  t3: () -> i32            (netvis_pass_abi_version)
     t0 = b"\x60" + _uleb(0) + _uleb(1) + b"\x7c"                       # ()->f64
     t1 = b"\x60" + _uleb(4) + b"\x7f\x7f\x7c\x7f" + _uleb(0)           # (i32,i32,f64,i32)->()
     t2 = b"\x60" + _uleb(0) + _uleb(0)                                 # ()->()
-    types = _uleb(3) + t0 + t1 + t2
+    t3 = b"\x60" + _uleb(0) + _uleb(1) + b"\x7f"                       # ()->i32
+    types = _uleb(4 if with_abi else 3) + t0 + t1 + t2 + (t3 if with_abi else b"")
 
     def name(s):
         b = s.encode()
@@ -1689,14 +1853,16 @@ def build_wasm_pass():
     imp = _uleb(2)
     imp += name("netvis") + name("host_total_flops") + b"\x00" + _uleb(0)  # func type 0
     imp += name("netvis") + name("host_emit_metric") + b"\x00" + _uleb(1)  # func type 1
-    # --- Function section: one local func "run" of type 2 ---
-    funcs = _uleb(1) + _uleb(2)
+    # --- Function section: local func "run" of type 2 (+ the abi func, type 3) ---
+    funcs = (_uleb(2) + _uleb(2) + _uleb(3)) if with_abi else (_uleb(1) + _uleb(2))
     # --- Memory section: one memory, min 1 page (for the metric name bytes) ---
     mem = _uleb(1) + b"\x00" + _uleb(1)   # limits: flag 0 (min only), min=1
     # --- Export section: "run" (func index 2 = after 2 imported funcs) + memory ---
-    exp = _uleb(2)
+    exp = _uleb(3 if with_abi else 2)
     exp += name("run") + b"\x00" + _uleb(2)
     exp += name("memory") + b"\x02" + _uleb(0)
+    if with_abi:
+        exp += name("netvis_pass_abi_version") + b"\x00" + _uleb(3)   # func index 3
     # --- Data section: metric name "double_flops" at memory offset 8 ---
     # NOT offset 0: wasm3's m3ApiIsNullPtr treats a pointer == memory base (offset
     # 0) as null and traps host_read/CheckMem. Real toolchains reserve low memory
@@ -1718,7 +1884,23 @@ def build_wasm_pass():
     body += b"\x41\x01"                            # i32.const 1 (known)
     body += b"\x10" + _uleb(1)                     # call 1 (host_emit_metric)
     body += b"\x0b"                                # end
-    code = _uleb(1) + _uleb(len(body)) + body
+    if with_abi:
+        if abi_broken:
+            # func 3 netvis_pass_abi_version: call 99 (no such function) ; end
+            b_abi = _uleb(0) + b"\x10" + _uleb(99) + b"\x0b"
+        else:
+            # func 3 netvis_pass_abi_version: [emit a metric ;] i32.const <abi_version> ; end
+            b_abi = _uleb(0)
+            if abi_emits_metric:
+                b_abi += b"\x41" + _uleb(NAME_OFF)             # name ptr (non-null)
+                b_abi += b"\x41" + _uleb(len(mname))           # name len
+                b_abi += b"\x44" + _struct.pack("<d", 7.0)     # f64.const 7.0
+                b_abi += b"\x41\x01"                           # known = 1
+                b_abi += b"\x10" + _uleb(1)                    # call host_emit_metric
+            b_abi += b"\x41" + _sleb(abi_version) + b"\x0b"
+        code = _uleb(2) + _uleb(len(body)) + body + _uleb(len(b_abi)) + b_abi
+    else:
+        code = _uleb(1) + _uleb(len(body)) + body
 
     # Sections MUST appear in canonical id order: type(1) import(2) func(3)
     # memory(5) export(7) code(10) data(11). (code before data.)
@@ -1730,6 +1912,55 @@ def build_wasm_pass():
     out += _wasm_section(7, exp)
     out += _wasm_section(10, code)
     out += _wasm_section(11, data)
+    return bytes(out)
+
+
+def build_wasm_abi_probe(abi_export, start=None, export_loops=False):
+    """A module for the ABI PROBE's step budget (#113 review): the probe is the one-off
+    load that asks a module which ABI it was built for, and it runs on the thread that
+    loads plugins, so a module whose start section (or ABI export) never ends must be
+    refused after a small, fixed number of steps instead of running for the whole run
+    budget.
+
+    The module has no imports and one export, `abi_export` : () -> i32 returning 1 (the
+    host's ABI), so everything it is refused for is the budget and nothing else.
+
+      start        None      no start section (the control: a plain module)
+                   "forever" a start section that loops forever (loop; br 0)
+                   N (int)   a start section that loops N times (a counted loop)
+      export_loops the ABI export itself loops forever before returning 1
+
+    wasm3 runs the start function lazily on the first m3_FindFunction, and checks
+    `if (module->startFunction)` - truthiness - so the start function's index must be
+    non-zero: f0 is the ABI export and f1 is the start function."""
+    types = _uleb(2) + b"\x60" + _uleb(0) + _uleb(1) + b"\x7f" + b"\x60" + _uleb(0) + _uleb(0)
+    n_funcs = 2 if start is not None else 1
+    funcs = _uleb(n_funcs) + _uleb(0) + (_uleb(1) if start is not None else b"")
+    nm = abi_export.encode()
+    exports = _uleb(1) + _uleb(len(nm)) + nm + b"\x00" + _uleb(0)
+    forever = b"\x03\x40" + b"\x0c" + _uleb(0) + b"\x0b"          # loop; br 0; end
+    b_abi = _uleb(0) + (forever if export_loops else b"") + b"\x41\x01\x0b"
+    bodies = [b_abi]
+    if start == "forever":
+        bodies.append(_uleb(0) + forever + b"\x0b")
+    elif start is not None:
+        # one i32 local; i32.const N; local.set 0; loop; local.get 0; i32.const 1;
+        # i32.sub; local.tee 0; br_if 0; end; end
+        bodies.append(_uleb(1) + _uleb(1) + b"\x7f" +
+                      b"\x41" + _sleb(start) + b"\x21\x00" +
+                      b"\x03\x40" + b"\x20\x00" + b"\x41\x01" + b"\x6b" +
+                      b"\x22\x00" + b"\x0d" + _uleb(0) + b"\x0b" + b"\x0b")
+    code = _uleb(len(bodies))
+    for body in bodies:
+        code += _uleb(len(body)) + body
+    # Section order: type(1) func(3) export(7) start(8) code(10)
+    out = bytearray(b"\x00asm\x01\x00\x00\x00")
+    out += _wasm_section(1, types)
+    out += _wasm_section(3, funcs)
+    out += _wasm_section(7, exports)
+    if start is not None:
+        out += _wasm_section(8, _uleb(1))
+    out += _wasm_section(10, code)
     return bytes(out)
 
 
@@ -2087,6 +2318,42 @@ def main():
     write("plugin_ophandler.wasm", build_wasm_ophandler(hostile=False))
     write("plugin_ophandler_hostile.wasm", build_wasm_ophandler(hostile=True))
     write("plugin_toyparser.wasm", build_wasm_toyparser())
+    # ABI-negotiation fixtures (#113). A plugin built against a FUTURE host, and
+    # one built before the ABI export existed at all: the host must refuse both
+    # without registering anything and without losing the built-in answer.
+    write("plugin_ophandler_future_abi.wasm", build_wasm_ophandler(abi_version=2))
+    write("plugin_ophandler_no_abi.wasm", build_wasm_ophandler(omit_abi=True))
+    write("plugin_toyparser_future_abi.wasm", build_wasm_toyparser(abi_version=2))
+    write("plugin_toyparser_no_abi.wasm", build_wasm_toyparser(omit_abi=True))
+    # The pass facet's negotiation is optional-export: plugin_pass.wasm (no export) is
+    # the v0.6.0 shape and must keep running; these declare a version.
+    write("plugin_pass_abi1.wasm", build_wasm_pass(abi_version=1))
+    write("plugin_pass_future_abi.wasm", build_wasm_pass(abi_version=2))
+    # A pass whose ABI export is guest code too: one that emits a metric before returning
+    # a version (refused => no metrics), and one whose export is present but calls a
+    # function index the module lacks (refused, not mistaken for a pre-negotiation pass).
+    write("plugin_pass_abi_emits_future.wasm", build_wasm_pass(abi_version=2, abi_emits_metric=True))
+    write("plugin_pass_abi_emits_v1.wasm", build_wasm_pass(abi_version=1, abi_emits_metric=True))
+    write("plugin_pass_abi_broken.wasm", build_wasm_pass(abi_broken=True))
+    # ABI-probe budget fixtures (#113 review), per facet: a start section that never
+    # ends, an ABI export that never returns, a start section that does finish but needs
+    # far more steps than the probe budget (1,000,000 loop iterations; below every run
+    # budget), and a control whose start section is a short counted loop (1,000).
+    for facet, export in (("op", "netvis_op_abi_version"),
+                          ("parser", "netvis_parser_abi_version"),
+                          ("pass", "netvis_pass_abi_version")):
+        write("plugin_probe_%s_start_loop.wasm" % facet, build_wasm_abi_probe(export, start="forever"))
+        write("plugin_probe_%s_export_loop.wasm" % facet, build_wasm_abi_probe(export, export_loops=True))
+        write("plugin_probe_%s_start_long.wasm" % facet, build_wasm_abi_probe(export, start=1000000))
+        write("plugin_probe_%s_start_short.wasm" % facet, build_wasm_abi_probe(export, start=1000))
+    # Link-time fixtures (#113): an SDK-signature import that must bind, a real name
+    # with a wrong signature, and an import this host has no function for.
+    write("plugin_ophandler_const_ints.wasm", build_wasm_op_link_probe("const_ints"))
+    write("plugin_ophandler_bad_sig_import.wasm", build_wasm_op_link_probe("bad_sig"))
+    write("plugin_ophandler_unknown_import.wasm", build_wasm_op_link_probe("unknown"))
+    # Rank 8 is NV_MAX_RANK (answered); rank 9 is one over it (shape stays unknown).
+    write("plugin_ophandler_shape_r8.wasm", build_wasm_op_shape(8))
+    write("plugin_ophandler_shape_r9.wasm", build_wasm_op_shape(9))
 
     print("wrote fixtures to", out_dir)
     for name in sorted(os.listdir(out_dir)):
