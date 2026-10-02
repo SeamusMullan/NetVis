@@ -17,6 +17,7 @@
 #include "core/MappedFile.h"
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -34,6 +35,9 @@ TEST_CASE("export_npy round-trips a small F32 tensor") {
 
   // Write the raw payload to a source file and map it (the "model" mmap).
   std::string src = temp_path("src.bin");
+  std::string out_npy = temp_path("out.npy");
+  netvis_test::TempFileGuard cleanup_src(src);      // before mf: unmap first, then delete
+  netvis_test::TempFileGuard cleanup_out(out_npy);
   {
     std::ofstream out(src, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(values.data()),
@@ -49,7 +53,6 @@ TEST_CASE("export_npy round-trips a small F32 tensor") {
   t.file_offset = 0;
   t.byte_len = values.size() * sizeof(float);
 
-  std::string out_npy = temp_path("out.npy");
   auto r = export_npy(t, *mf, /*model_dir=*/"", out_npy);
   REQUIRE_MESSAGE(r, "export_npy returned an error");
   CHECK(*r);
@@ -91,7 +94,4 @@ TEST_CASE("export_npy round-trips a small F32 tensor") {
   for (size_t i = 0; i < values.size(); ++i) {
     CHECK(got[i] == doctest::Approx(values[i]));
   }
-
-  std::filesystem::remove(src);
-  std::filesystem::remove(out_npy);
 }

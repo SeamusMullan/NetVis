@@ -491,6 +491,19 @@ if(NETVIS_BUILD_TESTS)
     # plugins/sdk/netvis_plugin.h (the SDK<->C++ drift guard, #10 Increment D).
     target_include_directories(netvis_tests PRIVATE
       ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    if(MSVC)
+      # doctest 2.4.11 forward-declares std::basic_ostream and friends instead
+      # of including <ostream>. The MSVC STL that ships with Visual Studio 2026
+      # (toolset 14.51) defines inline string_view/iostream operators that need
+      # the complete type, so every test TU failed with C2027/C2065 in
+      # <__msvc_string_view.hpp>. This switch makes doctest include the real
+      # headers; doctest already turns it on by itself under libc++.
+      target_compile_definitions(netvis_tests PRIVATE DOCTEST_CONFIG_USE_STD_HEADERS)
+      # doctest's per-assertion templates plus nlohmann::json can push one test
+      # TU past the default object-file section limit (fatal error C1128).
+      # /bigobj raises it; it only changes the .obj format, never the program.
+      target_compile_options(netvis_tests PRIVATE /bigobj)
+    endif()
 
     # Generate the tiny fixture models at build time (Python 3 stdlib only, no
     # pip) so `ctest` always has them, and run tests from the source root so the

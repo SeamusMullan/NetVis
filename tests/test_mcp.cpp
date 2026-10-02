@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "engine/McpServer.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 using json = nlohmann::json;
@@ -121,6 +122,7 @@ TEST_CASE("MCP: the model cache reuses, revalidates and evicts") {
   // shared fixture other tests read.
   const std::string copy =
       (std::filesystem::temp_directory_path() / "nv_mcp_cache.onnx").string();
+  netvis_test::TempFileGuard cleanup(copy);  // before the cache, which maps the file
   std::filesystem::copy_file(kOnnx, copy,
                              std::filesystem::copy_options::overwrite_existing);
 
@@ -147,6 +149,4 @@ TEST_CASE("MCP: the model cache reuses, revalidates and evicts") {
   auto a3 = cache.get(copy);
   REQUIRE(a3);
   CHECK(cache.misses() == 4);
-
-  std::filesystem::remove(copy);
 }

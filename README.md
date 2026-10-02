@@ -42,7 +42,10 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   FunctionDef library as drill-down subgraphs), and best-effort **TorchScript**
   archive op listings. Zip-based formats are disambiguated by content, not
   extension. SavedModel checkpoint weights (`variables/`) are reported as
-  present but not decoded.
+  present but not decoded. What each format actually yields — graph, shapes,
+  addressable weights — and where the gaps are is in
+  [`docs/format-support.md`](docs/format-support.md); its support table is checked
+  against the parsers on every test run (the prose around it is not).
 - **Instant open:** memory-mapped I/O; structure parsed off the main thread; the
   window is interactive the moment the `mmap` succeeds.
 - **Compute-graph canvas:** a single custom-drawn region (no per-node widgets) with
@@ -266,8 +269,17 @@ cmake --preset tsan  && cmake --build --preset tsan  && ctest --preset tsan
 
 ## CI & releases
 
-`.github/workflows/ci.yml` runs on every push/PR: the ASan+UBSan and TSan
-sanitizer suites plus a headless `core-only` build + `ctest`.
+`.github/workflows/ci.yml` runs on every pull request and every push to master:
+the ASan+UBSan and TSan sanitizer suites, a headless `core-only` build +
+`ctest`, and a Release build of the full GUI app plus `ctest` on **Linux, macOS
+and Windows** (`build + ctest (<runner>, app)`). The app job compiles the ImGui
+app and the test suite with GCC, AppleClang and MSVC, so a break on any platform
+turns the pull-request check red instead of surfacing when a release tag is
+built. Linux is built twice: on `ubuntu-22.04` (GCC 11), the image the release
+package is built on, and on `ubuntu-latest` (newest GCC). The job uses the same
+setup steps and runner images as `package.yml` (kept in sync by hand), is
+skipped on tag pushes because the package job builds the same app for the tag,
+and does not gate releases.
 
 Pushing a `vX.Y.Z` tag additionally builds the per-OS installers and publishes a
 GitHub Release with them attached:
