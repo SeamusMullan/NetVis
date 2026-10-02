@@ -419,21 +419,56 @@ int App::run() {
   return 0;
 }
 
+namespace {
+
+// Vertical padding above and below the tab row inside its strip.
+constexpr float kTabStripPadY = 3.0f;
+
+// The strip under the menu bar that App::frame() reserved for the model tabs
+// THIS frame; h == 0 means the tab bar is hidden. File-local, like the
+// dock-layout one-shot in App::frame().
+struct TabStrip {
+  float y = 0.0f;
+  float h = 0.0f;
+};
+TabStrip tab_strip;
+
+}  // namespace
+
 // #62: the row of open-model tabs, drawn just under the menu bar. Uses an ImGui
 // tab bar with a close button per tab and a trailing "+" to open a new empty
 // tab. Switching is instant (each tab holds its fully-loaded session). Hidden
-// entirely when there is a single still-empty tab so the startup UI is clean.
+// entirely when there is a single still-empty tab so the startup UI is clean
+// (App::frame() then reserves no strip).
 void App::draw_tab_bar() {
-  const bool single_empty = tabs_.size() == 1 &&
-                            session().stage() == LoadStage::Empty &&
-                            session().path().empty();
-  if (single_empty) return;
+  if (tab_strip.h <= 0.0f) return;
+
+  // The tab bar needs a window of its own: begun outside any window, ImGui puts
+  // it in the implicit fallback "Debug##Default" window, a 400x400 panel that
+  // floated over the graph canvas. Pin a no-decoration window to the reserved
+  // strip instead, as StatusBar.cpp does for the bottom bar.
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, tab_strip.y), ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, tab_strip.h), ImGuiCond_Always);
+  ImGui::SetNextWindowViewport(vp->ID);
+  const ImGuiWindowFlags strip_flags =
+      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+      ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar |
+      ImGuiWindowFlags_NoScrollWithMouse;
+  // Same WindowMinSize relaxation as the status bar, so the strip keeps its
+  // exact height. Popped straight after Begin so the tab-list popup keeps the
+  // normal window padding.
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(0.0f, 0.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, kTabStripPadY));
+  const bool strip_open = ImGui::Begin("##model_tab_strip", nullptr, strip_flags);
+  ImGui::PopStyleVar(2);
 
   const ImGuiTabBarFlags flags = ImGuiTabBarFlags_AutoSelectNewTabs |
                                  ImGuiTabBarFlags_Reorderable |
                                  ImGuiTabBarFlags_FittingPolicyScroll |
                                  ImGuiTabBarFlags_TabListPopupButton;
-  if (ImGui::BeginTabBar("##model_tabs", flags)) {
+  if (strip_open && ImGui::BeginTabBar("##model_tabs", flags)) {
     size_t to_close = tabs_.size();  // sentinel: nothing to close
     for (size_t i = 0; i < tabs_.size(); ++i) {
       ImGui::PushID(static_cast<int>(i));
@@ -462,6 +497,7 @@ void App::draw_tab_bar() {
     // Apply a close AFTER the loop so we never mutate tabs_ mid-iteration.
     if (to_close < tabs_.size()) close_tab(to_close);
   }
+  ImGui::End();
   // One-frame programmatic-selection sync consumed; user clicks own it now.
   want_tab_sync_ = false;
 }
@@ -478,6 +514,20 @@ void App::frame() {
   // WorkPos/WorkSize from scratch every NewFrame, so this does not accumulate.
   ImGuiViewport* main_vp = ImGui::GetMainViewport();
   main_vp->WorkSize.y -= status_bar_height();
+
+  // Likewise reserve the strip for the model tabs (#62) at the top of the work
+  // area, which already starts below the menu bar. The visibility test is made
+  // here, not in draw_tab_bar(), so the reserved strip and the drawn bar agree.
+  const bool single_empty = tabs_.size() == 1 &&
+                            session().stage() == LoadStage::Empty &&
+                            session().path().empty();
+  tab_strip = TabStrip{};
+  if (!single_empty) {
+    tab_strip.y = main_vp->WorkPos.y;
+    tab_strip.h = ImGui::GetFrameHeight() + 2.0f * kTabStripPadY;
+    main_vp->WorkPos.y += tab_strip.h;
+    main_vp->WorkSize.y -= tab_strip.h;
+  }
 
   // A full-viewport dockspace so every panel is dockable (spec §8). We capture
   // its id so we can seed a sensible default arrangement on first run.
