@@ -44,6 +44,15 @@ namespace netvis {
 // so App.h stays light. Forward-declared here, defined in view/GraphNav.h.
 struct GraphNavState;
 
+// #170: forward-declared so App.h stays light. ScreenshotOptions lives in
+// engine/ScreenshotCli.h, ViewFile in engine/ViewFile.h, and ViewFileApplier (the
+// phased applier behind File > Load View State and `--screenshot --view`) in
+// view/ViewFileApply.h. App.cpp includes the last so Tab's unique_ptr sees a
+// complete type at ~Tab.
+struct ScreenshotOptions;
+struct ViewFile;
+struct ViewFileApplier;
+
 // Static cost/analyzer report (v0.3.0). Forward-declared so App.h needn't include
 // engine/CostModel.h; ViewState holds it by unique_ptr, rebuilt by ensure_cost().
 struct CostReport;
@@ -330,6 +339,11 @@ struct Tab {
   ViewState view;
   PendingDecode decode;
   std::string title;   // basename shown on the tab; "(empty)" until a file opens
+  // #170: a view-state file being applied in phases (File > Load View State).
+  // Non-null only while it waits for the tab's pool to go idle; stepped once per
+  // frame by App::step_pending_views(). ~Tab is out-of-line (App.cpp) so the
+  // unique_ptr's deleter sees the complete type.
+  std::unique_ptr<ViewFileApplier> pending_view;
 
   Tab();
   ~Tab();
@@ -351,6 +365,23 @@ class App {
 
   // Run the main loop until the window closes. Returns process exit code.
   int run();
+
+  // #170 `netvis --screenshot`: open opt.model_path through the normal pipeline in a
+  // HIDDEN window, wait until the load is quiescent, render at exactly
+  // opt.width x opt.height into an offscreen framebuffer, write a PNG, and tear
+  // down. Returns a ScreenshotExit code (engine/ScreenshotCli.h). `view` is an
+  // optional parsed view file. Do not call init() first: this owns the whole
+  // window lifecycle. See view/AppScreenshot.cpp.
+  int run_screenshot(const ScreenshotOptions& opt, const ViewFile* view);
+
+  // True while a --canvas-only capture is running: frame() then draws only the graph
+  // canvas (no menus, tabs, panels, status bar or toasts). Always false otherwise.
+  bool canvas_only() const { return capture_.active && capture_.canvas_only; }
+
+  // True for the whole of a `--screenshot` run (full-window or canvas-only). Things
+  // that vary with the machine or the checkout rather than with the model (the
+  // absolute model path) are kept out of the picture while this is set.
+  bool capturing() const { return capture_.active; }
 
   // Open a file (from dialog / drop / CLI). Delegates to ModelSession.
   void open_file(const std::string& path);
@@ -523,6 +554,34 @@ class App {
   // Install the font-metric SizeFn on a tab's session (used by layout to measure
   // node label extents). Factored out so new_tab()/init() share one definition.
   void install_size_fn(Tab& tab);
+
+  // --- #170 headless capture (implemented in App.cpp / AppScreenshot.cpp) ----
+  // init() is init_with(path, {}). A capture uses hidden=true (an invisible
+  // window, no swap, no focus) and hermetic=true (ignore prefs, recent files,
+  // session, imgui.ini and plugin discovery, so the same command gives the same
+  // picture).
+  struct InitConfig {
+    bool hidden = false;
+    bool hermetic = false;
+  };
+  bool init_with(const std::string& initial_path, const InitConfig& cfg);
+  // Backend shutdowns, DestroyContext, window and GLFW teardown (the tail of run()).
+  void shutdown_window();
+
+  struct CaptureConfig {
+    bool active = false;
+    bool canvas_only = false;
+    uint32_t width = 0, height = 0;
+  };
+  CaptureConfig capture_;
+  // Pin DisplaySize / DisplayFramebufferScale / DeltaTime and park the mouse
+  // off-screen, after the GLFW backend's NewFrame has written its own values.
+  void apply_capture_io_overrides();
+  // The --canvas-only frame: just the graph canvas, filling the viewport.
+  void frame_canvas_only();
+  // Advance every tab's pending view-file load (see Tab::pending_view).
+  void step_pending_views();
+  int capture_body(const ScreenshotOptions& opt, const ViewFile* view);
 
   void frame();                 // one UI frame
   void draw_tab_bar();          // #62: the row of model tabs

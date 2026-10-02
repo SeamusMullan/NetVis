@@ -102,6 +102,13 @@ class ModelSession {
   // other stage.
   void cancel_layout();
 
+  // #170: layout-cache switch. When off, layout jobs neither read nor write the
+  // persistent cache (`--screenshot --no-layout-cache`: a before/after image of a
+  // layout change must not be served a .nvl another build wrote). On by default.
+  // MAIN THREAD; takes effect for the next layout request.
+  void set_layout_cache_enabled(bool enabled) { use_layout_cache_ = enabled; }
+  bool layout_cache_enabled() const { return use_layout_cache_; }
+
   const SearchIndex& search() const { return search_; }
 
   const MappedFile& file() const { return *file_; }
@@ -162,6 +169,12 @@ class ModelSession {
   SizeFn size_fn_;
   uint64_t generation_ = 0;
   uint64_t enrich_generation_ = 0;  // see enrich_generation()
+  bool use_layout_cache_ = true;    // see set_layout_cache_enabled()
+  // True from the moment an ONNX shape-inference job is submitted until its
+  // (generation-checked) completion runs. Both layout completions pick
+  // Enriching-vs-Ready from this flag rather than from stage_, which lost a race
+  // when shape inference finished before the first layout (#170). Main thread only.
+  bool shapes_pending_ = false;
 
   // Kick a layout job for the current collapse view (used after parse + expand).
   void request_layout();

@@ -237,6 +237,21 @@ TEST_CASE("manifest: cyclic var dependency rejected") {
   CHECK(lm.ops[0].error.find("cyclic") != std::string::npos);
 }
 
+TEST_CASE("manifest: a comment cannot hide deep nesting from the nesting pre-scan") {
+  // A lone quote inside a // comment used to flip the scan into string mode, so the
+  // thousand real brackets after it were never counted and the file reached the parser
+  // (which, with comments ignored, accepts it). The scan now skips comments the way the
+  // parser does.
+  const std::string deep = std::string(1000, '[') + std::string(1000, ']');
+  for (const std::string& lead : {std::string("// \"\n"), std::string("/* \" */")}) {
+    std::string p = write_temp(lead + deep);
+    netvis_test::TempFileGuard cleanup(p);
+    LoadedManifest lm = load_manifest_file(p, /*register_into=*/false);
+    CHECK(lm.ok == false);
+    CHECK(lm.error.find("nesting too deep") != std::string::npos);
+  }
+}
+
 TEST_CASE("manifest: JSONC comments accepted, valid op compiles") {
   std::string p = write_temp(R"json({
     // a comment (JSONC)

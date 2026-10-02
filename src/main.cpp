@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // main.cpp — process entry point.
 //
-// Two modes:
+// Modes:
 //   * GUI (default): create the App, forward an optional CLI path (argv[1]) as
 //     the initial file, and run the main loop. All real work lives in App;
 //     keeping main tiny means the same App can be driven from a test harness.
@@ -16,6 +16,11 @@
 //     headless contract; see engine/QueryCli.h and docs/agent-cli.md.
 //   * MCP server (`netvis mcp`): serve the same query surface to MCP clients
 //     over stdio until EOF. See engine/McpServer.h.
+//   * Screenshot (`netvis --screenshot out.png [...] model`, issue #170): open the
+//     model through the normal pipeline in a hidden window, wait until it has
+//     finished loading, render it offscreen at an exact size, write a PNG and exit.
+//     Needs a window system (it is not headless like the modes above), so it lives
+//     only in this binary. Checked FIRST; combining it with another mode is refused.
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -29,6 +34,8 @@
 #include "engine/McpServer.h"
 #include "engine/QueryCli.h"
 #include "engine/ReportJson.h"
+#include "engine/ScreenshotCli.h"
+#include "engine/ViewFile.h"
 #include "view/App.h"
 
 namespace {
@@ -90,9 +97,67 @@ int run_bench_cli(int argc, char** argv) {
   return 0;
 }
 
+// `netvis --screenshot` (#170). The pure rules (argument parsing, path validation,
+// the capture gate) live in engine/ScreenshotCli.h and are unit-tested; the capture
+// itself is App::run_screenshot. Paths are made absolute HERE, before glfwInit,
+// because GLFW chdirs into Contents/Resources inside a macOS bundle.
+//
+// Returns a ScreenshotExit code. stdout stays empty; every failure is one line on
+// stderr prefixed "netvis --screenshot: error:".
+int run_screenshot_cli(int argc, char** argv) {
+  using namespace netvis;
+  auto report = [](const ScreenshotArgs& a) {
+    std::fprintf(stderr, "netvis --screenshot: error: %s\n", a.error.c_str());
+    if (a.status == ScreenshotExit::Usage)
+      std::fwrite(kScreenshotUsage.data(), 1, kScreenshotUsage.size(), stderr);
+    return exit_code(a.status);
+  };
+
+  ScreenshotArgs args = parse_screenshot_args(argc, argv);
+  if (args.help) {  // an explicit request for help is the one thing printed on stdout
+    std::fwrite(kScreenshotUsage.data(), 1, kScreenshotUsage.size(), stdout);
+    return 0;
+  }
+  if (args.status != ScreenshotExit::Ok) return report(args);
+  args = resolve_screenshot_paths(args.options);
+  if (args.status != ScreenshotExit::Ok) return report(args);
+  const ScreenshotOptions& opts = args.options;
+
+  // The view file is read BEFORE any window exists, so a bad one fails fast.
+  ViewFileLoad view;
+  const ViewFile* view_ptr = nullptr;
+  if (!opts.view_path.empty()) {
+    view = read_view_file(opts.view_path);
+    if (!view.ok()) {
+      std::fprintf(stderr, "netvis --screenshot: error: %s\n", view.error.c_str());
+      return exit_code(ScreenshotExit::View);
+    }
+    for (const std::string& w : view.warnings)
+      std::fprintf(stderr, "netvis --screenshot: note: %s\n", w.c_str());
+    view_ptr = &view.file;
+  }
+
+  netvis::App app;
+  return app.run_screenshot(opts, view_ptr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  // #170: checked FIRST. Today `--report` would silently win over a second mode
+  // flag; screenshot mode refuses the combination instead of guessing.
+  if (netvis::wants_screenshot(argc, argv)) {
+    const std::string conflict = netvis::screenshot_conflict(argc, argv);
+    if (!conflict.empty()) {
+      std::fprintf(stderr, "netvis --screenshot: error: cannot be combined with %s\n",
+                   conflict.c_str());
+      // A usage error like any other (exit 2), so it prints the usage too.
+      std::fwrite(netvis::kScreenshotUsage.data(), 1, netvis::kScreenshotUsage.size(), stderr);
+      return netvis::exit_code(netvis::ScreenshotExit::Usage);
+    }
+    return run_screenshot_cli(argc, argv);
+  }
+
   std::string report_path;
   bool report_mode = false;
   if (parse_report_arg(argc, argv, report_path, report_mode) && report_mode) {

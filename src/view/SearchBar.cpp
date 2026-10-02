@@ -21,6 +21,7 @@
 // App.h pulls in without including it; include it first so App.h compiles.
 #include "engine/LayoutEngine.h"
 #include "engine/SearchIndex.h"
+#include "engine/ViewFile.h"  // kSearchQueryUiBytes
 #include "ir/IR.h"
 #include "view/App.h"
 #include "view/PanelHelpers.h"
@@ -214,7 +215,7 @@ void draw_search_bar(App& app) {
   // InputText over a char buffer synced to vs.search_query. imgui_stdlib is not
   // compiled into this build, so we can't use the std::string overload; sync a
   // fixed buffer each frame instead.
-  static char buf[256];
+  static char buf[kSearchQueryUiBytes];  // a restored query is cut to fit (ViewFile.h)
   if (!was_open) {
     // Just opened: seed the buffer and grab keyboard focus (spec §8.4).
     std::snprintf(buf, sizeof(buf), "%s", vs.search_query.c_str());
@@ -330,7 +331,7 @@ void draw_search_results_panel(App& app) {
   const SearchIndex& index = app.session().search();
 
   // Editable query, synced to the SAME vs.search_query the overlay uses.
-  static char buf[256];
+  static char buf[kSearchQueryUiBytes];  // a restored query is cut to fit (ViewFile.h)
   std::snprintf(buf, sizeof(buf), "%s", vs.search_query.c_str());
   ImGui::SetNextItemWidth(-FLT_MIN);
   if (ImGui::InputTextWithHint("##results_query", "search (op:/name:/dtype:/...)",

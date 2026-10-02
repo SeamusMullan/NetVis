@@ -89,6 +89,8 @@
 
 #include "engine/DiffLoader.h"
 #include "engine/LayoutCache.h"
+#include "engine/ScreenshotCli.h"  // #170: kScreenshotFrameDt (apply_capture_io_overrides)
+#include "engine/ViewFile.h"       // #56/#170: the .netvis-view model
 #include "engine/TensorDiff.h"  // #50: cross-model same-tensor lookup
 #include "engine/plugin/declarative/Manifest.h"  // v0.6.0 #9: plugin discovery
 #include "engine/plugin/Registry.h"               // v0.7.0 #11: reset_to_builtins
@@ -103,6 +105,7 @@
 #include "view/Onboarding.h"        // #105: empty state + Help menu
 #include "view/PreferencesPanel.h"  // #102: the unified Settings window
 #include "view/SessionStore.h"      // #103: tabs + camera persistence
+#include "view/ViewFileApply.h"     // #170: complete ViewFileApplier for Tab::pending_view
 #include "view/ViewHistory.h"       // #106: capture_view / apply_view
 #include "view/ViewPrefs.h"         // #151: view_prefs.json + the preference set
 
@@ -283,6 +286,19 @@ void App::install_size_fn(Tab& tab) {
 // Initialization
 // ---------------------------------------------------------------------------
 bool App::init(const std::string& initial_path) {
+  return init_with(initial_path, InitConfig{});
+}
+
+// The body of init(), parameterised for #170's headless capture. With a default
+// InitConfig every branch below is off and this is exactly the old init().
+bool App::init_with(const std::string& initial_path, const InitConfig& cfg) {
+  if (cfg.hidden) {
+    // A capture must neither chdir into the macOS bundle's Contents/Resources (the
+    // CLI paths are made absolute before this runs, but a second defence costs
+    // nothing) nor create a menu bar / Dock presence it does not need.
+    glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
+    glfwInitHint(GLFW_COCOA_MENUBAR, GLFW_FALSE);
+  }
   glfwSetErrorCallback(glfw_error_callback);
   apply_platform_override();
   if (!glfwInit()) return false;
@@ -299,21 +315,46 @@ bool App::init(const std::string& initial_path) {
   glfwWindowHintString(GLFW_X11_CLASS_NAME, "netvis");
   glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "netvis");
 
-  window_ = glfwCreateWindow(1600, 1000, "NetVis", nullptr, nullptr);
+  if (cfg.hidden) {
+    // Invisible and never focused: no window flashes up, and nothing can steal
+    // input. The window only exists to own a GL context; its size is irrelevant
+    // because a capture renders into an FBO at the requested size (see
+    // apply_capture_io_overrides), so a small fixed one also avoids allocating a
+    // Retina-sized default framebuffer for a large --size.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
+    glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
+  }
+
+  window_ = cfg.hidden ? glfwCreateWindow(640, 480, "NetVis (capture)", nullptr, nullptr)
+                       : glfwCreateWindow(1600, 1000, "NetVis", nullptr, nullptr);
   if (window_ == nullptr) {
     glfwTerminate();
     return false;
   }
   glfwMakeContextCurrent(window_);
-  glfwSwapInterval(1);  // VSync: cap to display refresh, no busy spinning.
+  // VSync: cap to display refresh, no busy spinning. A capture never swaps (it
+  // renders into an FBO), and a hidden window must not wait on a vblank.
+  glfwSwapInterval(cfg.hidden ? 0 : 1);
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGuiIO& io = ImGui::GetIO();
+  if (cfg.hermetic) io.IniFilename = nullptr;        // read no imgui.ini, write none
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;  // dockable panels (spec §8).
 
   ImGui_ImplGlfw_InitForOpenGL(window_, true);
-  ImGui_ImplOpenGL3_Init("#version 330");
+  const bool gl_ok = ImGui_ImplOpenGL3_Init("#version 330");
+  if (cfg.hidden && !gl_ok) {
+    // Headless failure path: report it to the caller instead of rendering into a
+    // backend that never initialised.
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window_);
+    window_ = nullptr;
+    glfwTerminate();
+    return false;
+  }
 
   // Pre-bake three font handles for LOD text (spec §8.1). If no TTF is present,
   // fall back to the built-in font and reuse it for all three roles.
@@ -340,13 +381,16 @@ bool App::init(const std::string& initial_path) {
 
   // Load persisted view prefs BEFORE applying the theme so a saved theme choice
   // and the heatmap gradient take effect on startup. Writes into the active
-  // tab's ViewState via view().
-  load_prefs();
+  // tab's ViewState via view(). A hermetic capture keeps the shipped defaults.
+  if (!cfg.hermetic) load_prefs();
 
   // v0.6.0 (#9) / v0.7.0 (#11): discover plugins under the trust gate. Declarative
   // plugins load freely (safe by construction); WASM plugins (#10) register only when
-  // explicitly enabled (persisted in view_prefs "plugins", loaded above).
-  reload_plugins();
+  // explicitly enabled (persisted in view_prefs "plugins", loaded above). A hermetic
+  // capture runs the built-in handlers only: an installed plugin must not change a
+  // picture of the same file.
+  if (cfg.hermetic) plugin::Registry::instance().reset_to_builtins();
+  else reload_plugins();
 
   apply_theme(view().dark_theme);
 
@@ -359,6 +403,8 @@ bool App::init(const std::string& initial_path) {
   // (see App.h / DiffLoader.h).
   diff_jobs_ = std::make_unique<JobSystem>();
   diff_loader_ = std::make_unique<DiffLoader>(*diff_jobs_);
+
+  if (cfg.hermetic) return true;  // no recent.json, no session restore, no CLI open
 
   load_recent();
 
@@ -391,6 +437,7 @@ int App::run() {
     for (auto& t : tabs_) t->session->update();
     if (diff_loader_) diff_loader_->update();  // drain diff completions after.
     poll_file_dialog();  // the chooser answers on its own thread; act on it here
+    step_pending_views();  // #170: continue a Load View State that waited on a layout
     frame();
 
     // Render the assembled draw data to the default framebuffer.
@@ -409,14 +456,19 @@ int App::run() {
   // cameras still exist. A no-op unless the pref is on.
   save_session_now();
 
-  // Orderly teardown: backends, context, window, GLFW.
+  shutdown_window();
+  return 0;
+}
+
+// Orderly teardown: backends, context, window, GLFW. The tail of run(), split out
+// so a headless capture (App::run_screenshot) can tear down the same way.
+void App::shutdown_window() {
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
   glfwDestroyWindow(window_);
   window_ = nullptr;
   glfwTerminate();
-  return 0;
 }
 
 namespace {
@@ -505,7 +557,14 @@ void App::draw_tab_bar() {
 void App::frame() {
   ImGui_ImplOpenGL3_NewFrame();
   ImGui_ImplGlfw_NewFrame();
+  // #170: AFTER the GLFW backend has written its own display size, scale, delta
+  // time and mouse position, so the capture's values are the ones NewFrame reads.
+  if (capture_.active) apply_capture_io_overrides();
   ImGui::NewFrame();
+  if (canvas_only()) {  // #170 --canvas-only: just the graph, no chrome
+    frame_canvas_only();
+    return;
+  }
 
   // Reserve the bottom strip for the status bar BEFORE the dockspace runs.
   // DockSpaceOverViewport claims the ENTIRE work area, and a docked panel then
@@ -959,6 +1018,13 @@ void App::close_tab(size_t i) {
 }
 
 void App::add_toast(const std::string& text, bool is_error) {
+  // #170: a toast must never appear in a capture. Say it on stderr instead, so a
+  // note from the load (a view-file key that was ignored, ...) is not lost.
+  if (capture_.active) {
+    std::fprintf(stderr, "netvis --screenshot: %s: %s\n", is_error ? "error" : "note",
+                 text.c_str());
+    return;
+  }
   Toast t;
   t.text = text;
   t.ttl = 5.0f;
@@ -1270,7 +1336,7 @@ void App::redo_view() {
 // file being maintained (clearing it is clear_session's job, called on the
 // toggle itself).
 void App::save_session_now() {
-  if (!view().restore_session) return;
+  if (capture_.active || !view().restore_session) return;  // #170: captures write nothing
   SessionState s;
   s.active_tab = active_tab_;
   for (const std::unique_ptr<Tab>& t : tabs_) {
@@ -1363,116 +1429,134 @@ void App::load_view_state_dialog() {
 void App::save_view_state(const std::string& path) {
   ViewState& vs = view();
   ModelSession& s = session();
-  nlohmann::json j;
-  j["kind"] = "netvis-view";
-  j["version"] = 1;
-  j["model"] = s.path();          // informational - which model this view was for
-  j["graph"] = s.current_graph();
-  j["cam"] = {{"pan_x", vs.cam.pan.x}, {"pan_y", vs.cam.pan.y},
-              {"zoom", vs.cam.zoom}};
-  j["hide_const_edges"] = vs.hide_const_edges;
-  j["show_layer_bands"] = vs.show_layer_bands;
-  if (vs.nav) {
-    j["category_mask"] = vs.nav->category_mask;
-    j["path_a"] = vs.nav->path_a;   // stable IR node indices (see GraphNav.h #15)
-    j["path_b"] = vs.nav->path_b;
+  // The whole ViewSnapshot field set (#106) plus the heatmap metric and scale. The
+  // selection is a STABLE IR node index (display ids shift on collapse), exactly as
+  // capture_view stores it for undo/redo, so a saved view and an undo step cannot
+  // disagree about what "selected" means.
+  // The model is recorded relative to the view file when it sits inside the file's
+  // directory, so the pair can be committed or moved together (#170).
+  std::vector<std::string> dropped;  // what the reader's limits made us leave out
+  const ViewFile vf = view_file_from_snapshot(
+      capture_view(vs, s), model_path_for_view_file(s.path(), path), s.current_graph(),
+      vs.heatmap_metric, vs.heatmap_log_scale, &dropped);
+  const std::string text = serialize_view_file(vf);
+  if (text.size() > kMaxViewFileBytes) {
+    // Not even the compact form fits: a file this build would then refuse to load.
+    add_toast("View is too large to save (" + std::to_string(text.size() >> 20) +
+                  " MiB; the limit is " + std::to_string(kMaxViewFileBytes >> 20) + ")",
+              true);
+    return;
   }
-  // Selection stored as a STABLE IR node index (display ids shift on collapse).
-  int32_t sel_ir = -1;
-  const auto& disp = s.collapse().display_nodes();
-  if (vs.selected_display >= 0 &&
-      static_cast<size_t>(vs.selected_display) < disp.size() &&
-      !disp[static_cast<size_t>(vs.selected_display)].is_group)
-    sel_ir = static_cast<int32_t>(disp[static_cast<size_t>(vs.selected_display)].ir_node);
-  j["selected_ir_node"] = sel_ir;
 
   std::ofstream f(path);
   if (f) {
-    // `replace` rather than the default strict UTF-8 handler: this document
-    // carries the model PATH, and a path is not guaranteed valid UTF-8 on Linux.
-    // Strict would throw out of a save the user explicitly asked for. See
-    // save_recent for the full reasoning.
-    f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
-    add_toast("View saved", false);
+    // serialize_view_file dumps with the `replace` UTF-8 handler rather than the
+    // default strict one: this document carries the model PATH, and a path is not
+    // guaranteed valid UTF-8 on Linux. Strict would throw out of a save the user
+    // explicitly asked for. See save_recent for the full reasoning.
+    f << text;
+    f.close();
+  }
+  if (!f.fail()) {
+    if (dropped.empty()) {
+      add_toast("View saved", false);
+    } else {
+      add_toast("View saved without: " + dropped.front() +
+                    (dropped.size() > 1 ? " (+" + std::to_string(dropped.size() - 1) + " more)"
+                                        : std::string()),
+                false);
+    }
   } else {
     add_toast("Could not write view file", true);
   }
 }
 
 void App::load_view_state(const std::string& path) {
-  std::ifstream f(path);
-  if (!f) { add_toast("Could not open view file", true); return; }
-  ViewState& vs = view();
-  ModelSession& s = session();
-  try {
-    nlohmann::json j;
-    f >> j;
-    if (!j.is_object() || j.value("kind", "") != "netvis-view") {
-      add_toast("Not a NetVis view file", true);
-      return;
+  ViewFileLoad l = read_view_file(path);
+  if (!l.ok()) {
+    switch (l.error_kind) {
+      case ViewFileErrorKind::Io: add_toast("Could not open view file", true); break;
+      case ViewFileErrorKind::NotAViewFile: add_toast("Not a NetVis view file", true); break;
+      case ViewFileErrorKind::NewerVersion:
+        add_toast("View file is from a newer NetVis", true);
+        break;
+      default: add_toast("Corrupt view file", true); break;
     }
-
-    // Model-agnostic view state (camera, display toggles, category filter) always
-    // applies. Model-SPECIFIC state (graph dive, selection, path endpoints — all
-    // keyed by IR node index) only applies when the file was saved for the model
-    // currently loaded; otherwise those indices denote unrelated nodes in a
-    // different model (bounds-checked, so no UB, but a confidently-wrong view).
-    if (j.contains("cam") && j["cam"].is_object()) {
-      const auto& c = j["cam"];
-      vs.cam.pan.x = c.value("pan_x", vs.cam.pan.x);
-      vs.cam.pan.y = c.value("pan_y", vs.cam.pan.y);
-      vs.cam.zoom = c.value("zoom", vs.cam.zoom);
-      vs.animating = false;
-    }
-    if (j.contains("hide_const_edges") && j["hide_const_edges"].is_boolean())
-      vs.hide_const_edges = j["hide_const_edges"].get<bool>();
-    if (j.contains("show_layer_bands") && j["show_layer_bands"].is_boolean())
-      vs.show_layer_bands = j["show_layer_bands"].get<bool>();
-    if (!vs.nav) vs.nav = std::make_unique<GraphNavState>();
-    if (j.contains("category_mask") && j["category_mask"].is_number_unsigned())
-      vs.nav->category_mask = j["category_mask"].get<uint32_t>();
-
-    const ir::Model* m = s.model();
-    const std::string saved_model = j.value("model", std::string());
-    const bool same_model = m != nullptr && saved_model == s.path();
-    if (!same_model) {
-      add_toast(m == nullptr ? "View loaded (open a model to restore selection)"
-                             : "View loaded (camera only - saved for another model)",
-                false);
-      return;
-    }
-
-    // Same model: restore the graph dive, path endpoints, and selection.
-    uint32_t g = s.current_graph();
-    if (j.contains("graph") && j["graph"].is_number_unsigned()) {
-      uint32_t gg = j["graph"].get<uint32_t>();
-      if (gg < m->graphs.size() && gg != s.current_graph()) {
-        s.push_graph(gg);
-        g = gg;
-      }
-    }
-    if (j.contains("path_a") && j["path_a"].is_number_integer())
-      vs.nav->path_a = j["path_a"].get<int32_t>();
-    if (j.contains("path_b") && j["path_b"].is_number_integer())
-      vs.nav->path_b = j["path_b"].get<int32_t>();
-    // Bind nav ownership to the graph we just applied IR-index state for, so
-    // ensure_nav's cross-graph guard does not wipe path_a/path_b this frame (it
-    // clears IR-index nav collections when owner_graph != current graph — the
-    // just-loaded endpoints belong to `g`, so claim ownership).
-    vs.nav->owner_generation = s.generation();
-    vs.nav->owner_graph = g;
-    if (j.contains("selected_ir_node") && j["selected_ir_node"].is_number_integer()) {
-      int32_t ir_node = j["selected_ir_node"].get<int32_t>();
-      if (ir_node >= 0) {
-        int32_t d = panel_detail::display_index_for_node(
-            s.collapse(), static_cast<uint32_t>(ir_node));
-        if (d >= 0) vs.selected_display = d;
-      }
-    }
-    add_toast("View loaded", false);
-  } catch (...) {
-    add_toast("Corrupt view file", true);
+    return;
   }
+
+  // Model-agnostic view state (camera, display toggles, filters, navigation intent)
+  // always applies. Model-SPECIFIC state (graph dive, selection, collapse bitset,
+  // path endpoints, pins - all keyed by IR indices) only applies when the file was
+  // saved for the model currently loaded; otherwise those indices denote unrelated
+  // nodes in a different model. The applier does that in phases: the parts that
+  // change the session wait for the tab's pool to be idle (see ViewFileApply.h).
+  Tab& tab = *tabs_[active_tab_];
+  tab.pending_view = std::make_unique<ViewFileApplier>(
+      make_view_file_applier(l.file, std::move(l.warnings), *tab.session));
+  // Step it now. With an idle pool, which is the normal case, it completes right
+  // here, just as the old synchronous loader did.
+  step_pending_views();
+}
+
+// #170: advance every tab's in-progress view-file load. Called once per frame from
+// run() (and once right after a load starts).
+void App::step_pending_views() {
+  for (auto& t : tabs_) {
+    if (!t->pending_view) continue;
+    ViewFileApplier& a = *t->pending_view;
+    const ViewStep st = step_view_file(a, t->view, *t->session, t->jobs->idle());
+    if (st == ViewStep::Pending) continue;
+    if (st == ViewStep::Done) {
+      // Not just the outcome: every setting the load ignored (a stale index, a wrong-
+      // typed key, a collapse bitset for a different model) is said, so a partial load
+      // never reads as a clean "View loaded". A refused apply is an error toast.
+      for (const ViewLoadToast& toast : view_load_toasts(a.outcome, a.notes))
+        add_toast(toast.text, toast.is_error);
+    } else {
+      add_toast("View load cancelled: the model changed", false);
+    }
+    t->pending_view.reset();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// #170 headless capture hooks (the driver itself is view/AppScreenshot.cpp)
+// ---------------------------------------------------------------------------
+// Runs every capture frame, AFTER ImGui_ImplGlfw_NewFrame has written its own
+// values. The hidden window is a fixed 640x480 and says nothing about the capture
+// size, so everything the frame reads is pinned here:
+//   * DisplaySize / DisplayFramebufferScale: exactly the requested pixels at 1x,
+//     whatever the HiDPI scale of the real display. The OpenGL3 backend renders at
+//     DisplaySize x FramebufferScale into whatever framebuffer is bound, which is
+//     the offscreen FBO.
+//   * DeltaTime: a fixed step, so ImGui's clock, window first-appearance and the
+//     search-hit pulse (GetTime) are the same on every run.
+//   * The mouse: parked off-screen, so no hover, tooltip or edge highlight can leak
+//     into a picture. (The hidden window is unfocused, so the backend adds no mouse
+//     position of its own; this makes it explicit.) No key events are ever fed.
+void App::apply_capture_io_overrides() {
+  ImGuiIO& io = ImGui::GetIO();
+  io.DisplaySize = ImVec2(static_cast<float>(capture_.width), static_cast<float>(capture_.height));
+  io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+  io.DeltaTime = kScreenshotFrameDt;
+  io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+}
+
+// The --canvas-only frame: no menu bar, tab bar, panels, status bar or toasts. Only
+// the graph canvas (which draws its own minimap), filling the whole viewport.
+void App::frame_canvas_only() {
+  if (!session().has_graph()) return;  // the driver refuses a weights-only model first
+  ensure_nav(*this);
+  ensure_cost(*this);
+  const ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(vp->Pos);
+  ImGui::SetNextWindowSize(vp->Size);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+  draw_graph_canvas(*this);
+  ImGui::PopStyleVar(3);
 }
 
 void App::export_view_png(const std::string& path) {
@@ -1538,6 +1622,7 @@ void App::load_recent() {
 }
 
 void App::save_recent() {
+  if (capture_.active) return;  // #170: a hermetic capture writes no recent.json
   // CRASH GUARD (v0.9.4). nlohmann's dump() defaults to the STRICT UTF-8 error
   // handler and throws type_error.316 on a string that is not valid UTF-8. The
   // strings here are filesystem PATHS, which on Linux are byte sequences with no
@@ -1578,6 +1663,8 @@ void App::add_recent(const std::string& path) {
 // that file and the active tab's ViewState + the App-owned plugin set.
 // ---------------------------------------------------------------------------
 void App::save_prefs() {
+  // #170: a hermetic capture writes no preference file, whatever a panel asks for.
+  if (capture_.active) return;
   ViewPrefs p = prefs_from_view(view());
   p.plugins = plugin_enabled_;
   // #151: a preference belongs to the USER, not to whichever tab happened to be

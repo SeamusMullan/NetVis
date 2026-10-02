@@ -185,6 +185,24 @@ the server object, the tool table is built lazily on first use, and none of
 the engine paths the performance table gates were touched — the engine ladder
 reproduces the README numbers unchanged on this branch.
 
+## Pictures: `--screenshot`
+
+`query` answers in JSON. When a picture is the better answer, such as a before/after
+for a visual change or a figure for docs, the GUI binary can render one with
+nobody at the screen:
+
+```sh
+netvis --screenshot out.png --canvas-only --no-layout-cache model.onnx
+```
+
+It is not headless in the `netvis_query` sense. It needs OpenGL 3.3 and a window
+system (the window stays hidden), so it exists only in the GUI binary, and a
+Linux machine without a display needs `xvfb-run -a`. Like `query`, it reads no
+weight payloads (only the small shape constants ONNX shape inference reads, as in
+the GUI) and fails loudly: on any error it prints a reason on stderr, exits
+non-zero, and writes no file. Flags, exit codes, view files and the
+determinism rules are in the README section "Screenshots from the command line".
+
 ## Relation to `--report`
 
 `netvis --report <model>` predates `query` and is kept as-is for compatibility;

@@ -520,7 +520,18 @@ void draw_graph_canvas(App& app) {
   ViewState& vs = app.view();
   ModelSession& session = app.session();
 
-  ImGui::Begin("Graph");
+  // #170 --canvas-only: the capture frame fills the viewport with this window, so
+  // it must have no title bar, no resize/move grip, no docking tab, and must not
+  // persist or restyle itself. In every other mode the flags are None, i.e. the
+  // old unconditional `Begin("Graph")`.
+  ImGuiWindowFlags graph_flags = ImGuiWindowFlags_None;
+  if (app.canvas_only()) {
+    graph_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                  ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+                  ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                  ImGuiWindowFlags_NoNav;
+  }
+  ImGui::Begin("Graph", nullptr, graph_flags);
   // Single child region: everything below is manual ImDrawList output.
   ImGui::BeginChild("canvas", ImVec2(0, 0), ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoScrollbar |
@@ -595,9 +606,20 @@ void draw_graph_canvas(App& app) {
   dl->PushClipRect(origin, canvas_max, true);
 
   if (layout == nullptr || layout->boxes.empty()) {
-    // Nothing laid out yet — show a hint centered in the canvas.
-    const char* msg = session.model() ? "Laying out graph..."
-                                      : "Open a model (File > Open, or drop a file)";
+    // Nothing to draw: say WHY, centered in the canvas. A layout that exists and has no
+    // boxes is a finished layout of a graph with nothing in it, which must not read as
+    // "still working" (#170: a capture of such a model would otherwise state that).
+    const ir::Model* mdl = session.model();
+    const char* msg = "Open a model (File > Open, or drop a file)";
+    if (mdl != nullptr) {
+      if (layout == nullptr) {
+        msg = "Laying out graph...";
+      } else {
+        const uint32_t gi = session.current_graph();
+        const bool no_nodes = gi < mdl->graphs.size() && mdl->graphs[gi].nodes.empty();
+        msg = no_nodes ? "This graph has no nodes" : "Nothing to draw";
+      }
+    }
     ImVec2 ts = ImGui::CalcTextSize(msg);
     dl->AddText(ImVec2(origin.x + (canvas_size.x - ts.x) * 0.5f,
                        origin.y + (canvas_size.y - ts.y) * 0.5f),
