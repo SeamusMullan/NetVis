@@ -20,6 +20,7 @@
 #include "engine/plugin/wasm/WasmParser.h"
 #include "engine/plugin/wasm/WasmRuntime.h"
 #include "ir/IR.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 using namespace netvis::plugin;
@@ -50,6 +51,7 @@ TEST_CASE("WASM parser: can_parse + parse builds a model, zero payload reads") {
   if (!image) { WARN_MESSAGE(false, "fixture missing; run tools/gen_fixtures.py"); return; }
 
   std::string path = write_tmp("nv_toy_input.bin", std::string(64, '\0'));
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
 
@@ -78,8 +80,6 @@ TEST_CASE("WASM parser: can_parse + parse builds a model, zero payload reads") {
   // The structural parse reads NO weight payload (the toy records offset+len only;
   // host_read_range is never called, so the counter stays 0).
   CHECK(ByteReader::payload_read_counter() == 0);
-
-  std::filesystem::remove(path);
 }
 
 TEST_CASE("WASM parser: priority is below built-ins, format self-labels Unknown") {

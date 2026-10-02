@@ -199,6 +199,41 @@ def build_onnx():
     return bytes(model)
 
 
+def onnx_tensor_typed_int64(name, dims, values):
+    """TensorProto whose payload is a TYPED field (int64_data, field 7, packed)
+    rather than raw_data. Exporters write small shape constants this way. The
+    ONNX parser has no mmap byte range to record for it, so the tensor is listed
+    with its dims and dtype but is not addressable (docs/format-support.md)."""
+    b = bytearray()
+    for d in dims:
+        b += pb_varint(1, d)          # dims
+    b += pb_varint(2, 7)              # data_type = INT64 (7)
+    b += pb_len(7, b"".join(varint(v) for v in values))  # int64_data, packed
+    b += pb_string(8, name)           # name
+    return bytes(b)
+
+
+def build_onnx_typed_data():
+    """An ONNX model with one raw_data initializer and one typed-field int64
+    initializer (a Reshape target shape). Pins the documented gap: typed-field
+    initializers are recorded without an addressable payload."""
+    reshape = onnx_node("Reshape", "reshape0", ["x", "shape"], ["y"])
+    init_w = onnx_tensor_rawdata("W", [2, 2], [1.0, 2.0, 3.0, 4.0])
+    init_shape = onnx_tensor_typed_int64("shape", [2], [2, 8])
+
+    graph = bytearray()
+    graph += pb_len(1, reshape)       # node
+    graph += pb_string(2, "typed_graph")
+    graph += pb_len(5, init_w)        # initializer (repeated)
+    graph += pb_len(5, init_shape)
+
+    model = bytearray()
+    model += pb_varint(1, 1)          # ir_version
+    model += pb_string(2, "netvis-test")
+    model += pb_len(7, bytes(graph))
+    return bytes(model)
+
+
 # ---------------------------------------------------------------------------
 # SafeTensors (u64 LE header length + JSON header + payload)
 # ---------------------------------------------------------------------------
@@ -1037,6 +1072,24 @@ def build_npz(path):
             zf.writestr(info, data)
 
 
+def build_npz_compressed(path):
+    """Build the same two arrays as build_npz, but DEFLATE-compressed, which is
+    what np.savez_compressed writes. A DEFLATE stream has no linear mmap address
+    and its .npy header is inside the compressed bytes, so the parser lists each
+    entry by name only: unknown dtype, no shape, no addressable payload."""
+    w_npy = build_npz_npy((2, 3), "<f4", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    b_npy = build_npz_npy((3,), "<f4", [0.1, 0.2, 0.3])
+
+    if os.path.exists(path):
+        os.remove(path)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for arcname, data in (("w.npy", w_npy), ("b.npy", b_npy)):
+            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, data)
+
+
 # ---------------------------------------------------------------------------
 # CoreML .mlmodel (protobuf Model / NeuralNetwork / NeuralNetworkLayer)
 # ---------------------------------------------------------------------------
@@ -1293,7 +1346,9 @@ def build_mlpackage(out_dir):
         },
         "rootModelIdentifier": "11111111-1111-1111-1111-111111111111",
     }
-    with open(os.path.join(pkg, "Manifest.json"), "w") as f:
+    # newline="\n": text mode on Windows would write CRLF, and a fixture must be
+    # byte-identical on every OS (same input -> same bytes).
+    with open(os.path.join(pkg, "Manifest.json"), "w", newline="\n") as f:
         json.dump(manifest, f, indent=2)
     return pkg
 
@@ -2017,12 +2072,16 @@ def main():
     # Layout: 8 bytes padding + 8 bytes resolvable data (2 F32: 5.0, 6.0).
     weights_bin = b"\x00" * 8 + struct.pack("<f", 5.0) + struct.pack("<f", 6.0)
     write("weights.bin", weights_bin)
+    # Typed-field (int64_data) initializer: documented non-addressable gap (#114).
+    write("model_typed_data.onnx", build_onnx_typed_data())
     write("model.safetensors", build_safetensors())
     write("model.gguf", build_gguf())
     # Quantized GGUF fixture (#49): Q4_0 (2 known blocks) + Q4_K (refused).
     write("model_quant.gguf", build_gguf_quant())
     build_pytorch(os.path.join(out_dir, "model.pt"))
     build_npz(os.path.join(out_dir, "model.npz"))
+    # DEFLATE-compressed npz (np.savez_compressed): shapes/offsets unknown (#114).
+    build_npz_compressed(os.path.join(out_dir, "model_compressed.npz"))
     build_torchscript(os.path.join(out_dir, "model_ts.pt"))
     tfl = build_tflite()
     # Self-check: the file_identifier must land at bytes 4..8 and the root
