@@ -20,6 +20,7 @@
 #include "ir/IR.h"
 #include "parsers/Parser.h"
 #include "parsers/openvino/XmlReader.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -127,12 +128,12 @@ TEST_CASE("OpenVINO: truncated <net> yields a clean error, no crash") {
       "  <layers>\n"
       "    <layer id=\"0\" name=\"in\" type=\"Parameter\">\n";
   std::string path = write_temp("trunc.xml", truncated);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
   ProgressSink progress;
   auto res = openvino::parse(*mf, progress);
   CHECK_FALSE(res);  // must be an error, not a crash / not a bogus model
-  std::filesystem::remove(path);
 
   CHECK(ByteReader::payload_read_counter() == 0);
 }

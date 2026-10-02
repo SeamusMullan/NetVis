@@ -1305,7 +1305,9 @@ def build_mlpackage(out_dir):
         },
         "rootModelIdentifier": "11111111-1111-1111-1111-111111111111",
     }
-    with open(os.path.join(pkg, "Manifest.json"), "w") as f:
+    # newline="\n": text mode on Windows would write CRLF, and a fixture must be
+    # byte-identical on every OS (same input -> same bytes).
+    with open(os.path.join(pkg, "Manifest.json"), "w", newline="\n") as f:
         json.dump(manifest, f, indent=2)
     return pkg
 

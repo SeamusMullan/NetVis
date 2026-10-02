@@ -16,13 +16,14 @@
 #include "core/MappedFile.h"
 #include "engine/OpCategory.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
 namespace {
 
 // Write bytes to a uniquely-named temp file; returns the path. RAII cleanup is
-// handled by the caller via std::filesystem::remove at scope end.
+// handled by the caller with a TempFileGuard declared before the mapping.
 std::string write_temp(const std::string& stem, const std::vector<uint8_t>& bytes) {
   std::filesystem::path p =
       std::filesystem::temp_directory_path() / ("nv_detect_" + stem);
@@ -37,10 +38,10 @@ std::string write_temp(const std::string& stem, const std::vector<uint8_t>& byte
 Format detect_bytes(const std::string& stem, const std::vector<uint8_t>& bytes,
                     const std::string& ext_hint) {
   std::string path = write_temp(stem, bytes);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);  // mapping a freshly-written file must succeed
   Format f = detect_format(*mf, ext_hint);
-  std::filesystem::remove(path);
   return f;
 }
 
@@ -50,11 +51,11 @@ Format detect_bytes_reason(const std::string& stem,
                            const std::vector<uint8_t>& bytes,
                            const std::string& ext_hint, DetectReason& reason) {
   std::string path = write_temp(stem, bytes);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);  // mapping a freshly-written file must succeed
   Format f = detect_format(*mf, ext_hint, reason);
   CHECK(detect_format(*mf, ext_hint) == f);  // wrapper delegates identically
-  std::filesystem::remove(path);
   return f;
 }
 
