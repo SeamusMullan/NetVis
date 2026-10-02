@@ -76,15 +76,6 @@ char spinner_glyph() {
   return kFrames[static_cast<int>(ImGui::GetTime() * 8.0) & 3];
 }
 
-// Last path component, for the ladder's file column. The view aliases `path`,
-// which is owned by the DiffLoader slot and outlives the frame.
-std::string_view basename_of(const std::string& path) {
-  const size_t slash = path.find_last_of("/\\");
-  return slash == std::string::npos
-             ? std::string_view(path)
-             : std::string_view(path).substr(slash + 1);
-}
-
 // One "label   +/-value" row. The delta is computed in the UNSIGNED domain
 // because the inputs are saturating uint64 that can exceed INT64_MAX — casting
 // to int64 and negating would be signed-overflow UB — so a sign flag plus a
@@ -343,7 +334,10 @@ void draw_comparison_ladder(App& app, bool lock_slots) {
 
     ImGui::TableSetColumnIndex(1);
     const std::string& path = dl.path_of(i);
-    const std::string_view bn = basename_of(path);
+    // Last path component for the ladder's file column; it aliases `path`, which
+    // is owned by the DiffLoader slot and outlives the frame. Trailing
+    // separators are skipped, so a "M.mlpackage/" still names the bundle.
+    const std::string_view bn = detail::basename_of(path);
     if (bn.empty()) {
       ImGui::TextDisabled("(none)");
     } else {
@@ -933,9 +927,7 @@ void draw_diff_panel(App& app) {
       app.add_toast("No file chooser found - install zenity or kdialog", true);
     } else {
       add_dlg.start(FileDialog::Mode::Open, "Open comparison model", "",
-                    {"*.onnx", "*.tflite", "*.safetensors", "*.gguf", "*.pt",
-                     "*.pth", "*.bin", "*.pb"},
-                    "Model files");
+                    openable_patterns(), kOpenFilterDescription);
     }
   }
   // ready() CONSUMES the pick — it answers true exactly once — so the cap has to

@@ -36,8 +36,9 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
 
 - **Formats:** ONNX (`.onnx`, incl. sibling external-data), TFLite (`.tflite`),
   SafeTensors (`.safetensors`), GGUF (`.gguf`), PyTorch zip & legacy pickle
-  checkpoints (`.pt` / `.pth` / `.bin`), **OpenVINO IR** (`.xml` + `.bin`),
-  **CoreML** (`.mlmodel`), **Keras** (`.h5` / `.keras`), **NumPy** (`.npz`),
+  checkpoints (`.pt` / `.pth` / `.bin`, `.pkl` / `.pickle`), **OpenVINO IR**
+  (`.xml` + `.bin`), **CoreML** (`.mlmodel` / `.mlpackage`), **Keras**
+  (`.h5` / `.hdf5` / `.keras`), **NumPy** (`.npz`),
   **TensorFlow** (frozen `.pb` GraphDef + `saved_model.pb` bundles, incl. the
   FunctionDef library as drill-down subgraphs), and best-effort **TorchScript**
   archive op listings. Zip-based formats are disambiguated by content, not
@@ -196,7 +197,15 @@ ctest --preset core-only
 ```
 
 Open a model via the `File → Open` dialog, by dragging it onto the window, or by
-passing it as a CLI argument.
+passing it as a CLI argument. The dialog's "All supported models" filter covers
+every extension listed under Formats, in either letter case on Linux. Linux and
+Windows add an "All files" entry after it; the macOS chooser takes a list of
+types only, so there a file with another or no extension (which content
+detection would still accept, or a WASM-plugin format) is opened by drag-and-drop
+or on the command line. A CoreML `.mlpackage` is a directory, so the dialog can
+pick it only where the platform treats packages as files (macOS); elsewhere drag
+it onto the window or pass it on the command line. For a TensorFlow SavedModel,
+pick its `saved_model.pb`.
 
 ### Linux: Wayland and X11
 
