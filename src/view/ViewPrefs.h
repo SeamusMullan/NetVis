@@ -100,13 +100,28 @@ struct ViewPrefsLoadInfo {
   bool wheel_mode_present = false;
 };
 
+// Record ONLY `wheel_mode` in view_prefs.json, leaving every other key as it is. An
+// existing object is merged into (all its keys, including ones this build does not
+// know, survive); a missing file becomes `{"wheel_mode": "..."}`. A file that exists
+// but is malformed, not an object, or unreadable is left untouched and false is
+// returned. Best-effort and silent like save_view_prefs.
+//
+// Why not save_view_prefs(): that writes a value for EVERY preference. Called at
+// startup for a user who never changed a setting, it would pin today's default for
+// every key (show_layer_bands, edge_routing, ui_scale, ...), so a later release
+// that improved one of those defaults would never reach that user: load_view_prefs
+// reads the stamped value over the live default. The stamp must record the one
+// thing it exists for, that the wheel notice has been dealt with, and nothing more.
+bool stamp_wheel_mode(WheelMode mode);
+
 // Whether the cache directory shows NetVis has been used here before: a
 // recent.json, a session.json, or a cached layout (`*.nvl`). Needed because
-// view_prefs.json is written ONLY when a preference changes (never at startup), so
-// a long-time user who never touched a setting has no prefs file at all and looks
-// exactly like a fresh install through it. Only the cheap checks above; it never
-// reads or parses any of them. `cache_dir` is a parameter so tests can use a temp
-// directory; production passes layout_cache_dir().
+// view_prefs.json was written ONLY when a preference changed (no release before
+// #158 wrote it at startup), so a long-time user who never touched a setting has no
+// prefs file at all and looks exactly like a fresh install through it. Only the
+// cheap checks above; it never reads or parses any of them. `cache_dir` is a
+// parameter so tests can use a temp directory; production passes
+// layout_cache_dir().
 bool has_prior_user_data(const std::string& cache_dir);
 
 // What App::load_prefs should do about the #158 change of the wheel default.
@@ -114,11 +129,12 @@ enum class WheelDefaultAction : uint8_t {
   // Nothing to say and nothing to write.
   None,
   // An existing user, whose wheel used to zoom and now pans: show the one-time
-  // notice and save the prefs, which writes `wheel_mode` so it appears only once.
+  // notice and stamp_wheel_mode(), so it appears only once. Only `wheel_mode` is
+  // written; see stamp_wheel_mode for why that is not save_view_prefs().
   Notify,
-  // A fresh install: no notice (nothing changed for them), but save the prefs so
-  // the NEXT launch finds a file with `wheel_mode` and does not mistake a user who
-  // has since opened a model (and so has a recent.json) for an upgrade.
+  // A fresh install: no notice (nothing changed for them), but stamp_wheel_mode()
+  // so the NEXT launch finds a file with `wheel_mode` and does not mistake a user
+  // who has since opened a model (and so has a recent.json) for an upgrade.
   Stamp,
 };
 

@@ -115,6 +115,31 @@ void save_view_prefs(const ViewPrefs& p) {
   if (f) f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
+bool stamp_wheel_mode(WheelMode mode) {
+  const std::string path = view_prefs_file_path();
+  nlohmann::json j = nlohmann::json::object();
+  {
+    std::ifstream in(path);
+    if (in) {
+      // Merge into what is there, so every key the user already has (and any this
+      // build does not know) survives untouched.
+      try {
+        in >> j;
+      } catch (...) {
+        return false;  // malformed: leave it, exactly as wheel_default_action says
+      }
+      if (!j.is_object()) return false;
+    } else if (path_exists(path)) {
+      return false;  // present but unreadable: not a fresh install, so not ours
+    }
+  }
+  j["wheel_mode"] = wheel_mode_name(mode);
+  std::ofstream out(path);
+  if (!out) return false;
+  out << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+  return static_cast<bool>(out);
+}
+
 bool has_prior_user_data(const std::string& cache_dir) {
   namespace fs = std::filesystem;
   // An empty path would make "recent.json" resolve against the working directory.

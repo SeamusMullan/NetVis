@@ -52,8 +52,11 @@ The choice is saved in `view_prefs.json` and shared by every tab. Dragging, keys
 click-to-select behave the same in both modes. Anyone who has used NetVis
 before (it finds a saved preferences file, recent files, a saved session or a cached
 layout) sees a one-time notice about the new default on the first launch after
-upgrading. A fresh install does not. The preferences file is only written when a
-setting changes, so its absence alone does not mean a new user.
+upgrading. A fresh install does not. Before this release the preferences file was
+only written when a setting changed, so its absence alone does not mean a new user.
+The first launch of this release records just the wheel choice in that file (so the
+notice shows once) and nothing else: every other setting keeps following the
+built-in defaults until you change it.
 
 ## Compared with Netron
 

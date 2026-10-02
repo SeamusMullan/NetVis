@@ -19,6 +19,8 @@
 #include <string>
 #include <system_error>
 
+#include <nlohmann/json.hpp>
+
 #include "view/ViewPrefs.h"
 
 using namespace netvis;
@@ -508,7 +510,7 @@ TEST_CASE("ViewPrefs: the notice fires once across launches (load, act, save, lo
     const ViewPrefs p = load_view_prefs(ViewPrefs{}, &info);
     const bool prior = !info.file_present && has_prior_user_data(cache.str());
     const WheelDefaultAction act = wheel_default_action(info, prior);
-    if (act != WheelDefaultAction::None) save_view_prefs(p);
+    if (act != WheelDefaultAction::None) stamp_wheel_mode(p.wheel_mode);
     return act;
   };
 
@@ -542,8 +544,8 @@ TEST_CASE("ViewPrefs: a null info pointer is accepted") {
 
 TEST_CASE("ViewPrefs: save writes wheel_mode so the upgrade notice fires once") {
   PrefsFileBackup backup;
-  // App::load_prefs saves right after showing the notice. After that, the file
-  // carries wheel_mode, and the next launch must not show it again.
+  // A user changing any preference saves the whole file, which carries wheel_mode,
+  // so the next launch must not show the notice.
   save_view_prefs(ViewPrefs{});
 
   ViewPrefsLoadInfo info;
@@ -551,4 +553,116 @@ TEST_CASE("ViewPrefs: save writes wheel_mode so the upgrade notice fires once") 
   CHECK(info.file_read);
   CHECK(info.wheel_mode_present);
   CHECK(out.wheel_mode == WheelMode::Pan);
+}
+
+// --- #158: the startup stamp writes ONLY wheel_mode -----------------------------
+//
+// App::load_prefs used to call save_prefs() for Stamp and Notify, which writes a
+// value for every preference. After one launch every key was on disk, so a later
+// release that changed a default (show_layer_bands, edge_routing, ...) never
+// reached a user who had not chosen anything. The stamp must pin nothing else.
+
+namespace {
+
+nlohmann::json read_prefs_json() {
+  std::ifstream f(view_prefs_file_path());
+  nlohmann::json j;
+  f >> j;
+  return j;
+}
+
+}  // namespace
+
+TEST_CASE("ViewPrefs: stamp_wheel_mode on a fresh install writes only wheel_mode") {
+  PrefsFileBackup backup;  // starts with no prefs file
+  REQUIRE(stamp_wheel_mode(WheelMode::Pan));
+
+  const nlohmann::json j = read_prefs_json();
+  REQUIRE(j.is_object());
+  CHECK(j.size() == 1);
+  CHECK(j.value("wheel_mode", "") == "pan");
+}
+
+TEST_CASE("ViewPrefs: a stamped file leaves every other default to the next load") {
+  PrefsFileBackup backup;
+  REQUIRE(stamp_wheel_mode(WheelMode::Pan));
+
+  // The running app's defaults changed between releases: the base the next launch
+  // passes in differs from anything an earlier launch could have written. Every
+  // such value must come through, because the stamp pinned none of them.
+  ViewPrefs base = all_non_default();
+  base.wheel_mode = WheelMode::Pan;
+  ViewPrefsLoadInfo info;
+  const ViewPrefs out = load_view_prefs(base, &info);
+
+  CHECK(info.file_read);
+  CHECK(info.wheel_mode_present);  // so the notice does not fire again
+  CHECK(out.wheel_mode == WheelMode::Pan);
+  CHECK(out.dark_theme == base.dark_theme);
+  CHECK(out.show_minimap == base.show_minimap);
+  CHECK(out.show_layer_bands == base.show_layer_bands);
+  CHECK(out.edge_tooltips == base.edge_tooltips);
+  CHECK(out.cost_heatmap == base.cost_heatmap);
+  CHECK(out.heatmap_log_scale == base.heatmap_log_scale);
+  CHECK(out.heatmap_metric == base.heatmap_metric);
+  CHECK(out.heatmap_gradient.preset == base.heatmap_gradient.preset);
+  CHECK(out.heatmap_gradient.reverse == base.heatmap_gradient.reverse);
+  CHECK(out.edge_routing == base.edge_routing);
+  CHECK(out.accessible_palette == base.accessible_palette);
+  CHECK(out.ui_scale == doctest::Approx(base.ui_scale));
+  CHECK(out.restore_session == base.restore_session);
+  CHECK(out.custom_ridge == doctest::Approx(base.custom_ridge));
+  CHECK(out.machine_profiles == base.machine_profiles);
+}
+
+TEST_CASE("ViewPrefs: stamp_wheel_mode merges into an older file without touching it") {
+  PrefsFileBackup backup;
+  // A file from before wheel_mode, carrying one key this build knows and one it
+  // does not (written by some other release): both must survive the stamp, and the
+  // keys the file lacks must stay absent rather than being filled in.
+  write_raw_prefs_file(R"({"dark_theme": false, "future_key": [1, 2, 3]})");
+  REQUIRE(stamp_wheel_mode(WheelMode::Pan));
+
+  const nlohmann::json j = read_prefs_json();
+  REQUIRE(j.is_object());
+  CHECK(j.size() == 3);
+  CHECK(j.value("dark_theme", true) == false);
+  CHECK(j.contains("future_key"));
+  CHECK(j.value("wheel_mode", "") == "pan");
+  CHECK_FALSE(j.contains("show_layer_bands"));
+  CHECK_FALSE(j.contains("edge_routing"));
+  CHECK_FALSE(j.contains("ui_scale"));
+
+  // And it replaces a bad wheel_mode (which load reports as absent) rather than
+  // leaving it to trigger the notice on every launch.
+  write_raw_prefs_file(R"({"wheel_mode": "Zoom", "dark_theme": false})");
+  REQUIRE(stamp_wheel_mode(WheelMode::Pan));
+  const nlohmann::json k = read_prefs_json();
+  CHECK(k.value("wheel_mode", "") == "pan");
+  CHECK(k.value("dark_theme", true) == false);
+  CHECK(k.size() == 2);
+}
+
+TEST_CASE("ViewPrefs: stamp_wheel_mode records the mode it is given") {
+  PrefsFileBackup backup;
+  REQUIRE(stamp_wheel_mode(WheelMode::Zoom));
+  ViewPrefsLoadInfo info;
+  const ViewPrefs out = load_view_prefs(ViewPrefs{}, &info);
+  CHECK(info.wheel_mode_present);
+  CHECK(out.wheel_mode == WheelMode::Zoom);
+}
+
+TEST_CASE("ViewPrefs: stamp_wheel_mode leaves an unusable file alone") {
+  PrefsFileBackup backup;
+  // The same files wheel_default_action says to leave alone: rewriting one at
+  // startup would destroy whatever the user was editing.
+  for (const char* text : {"", "{ not json", "[1, 2, 3]", "42",
+                           R"({"wheel_mode": "zoom", "dark_theme": )"}) {
+    write_raw_prefs_file(text);
+    CHECK_FALSE(stamp_wheel_mode(WheelMode::Pan));
+    std::ifstream f(view_prefs_file_path(), std::ios::binary);
+    const std::string after((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    CHECK(after == text);
+  }
 }

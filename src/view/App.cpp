@@ -1644,8 +1644,9 @@ void App::load_prefs() {
   // a preference changes, so many long-time users never had one. The decision,
   // including the probe for other NetVis files (recent.json, session.json, cached
   // layouts, which load_recent has not read yet), is in view/ViewPrefs.cpp so it is
-  // tested; this only acts on it. Both actions save the prefs, which writes
-  // "wheel_mode", so neither can repeat.
+  // tested; this only acts on it. Both actions stamp "wheel_mode" (and ONLY that
+  // key: save_prefs() would pin today's default for every preference in a file the
+  // user never asked for), so neither can repeat.
   const bool prior_data =
       !info.file_present && has_prior_user_data(layout_cache_dir());
   const WheelDefaultAction act = wheel_default_action(info, prior_data);
@@ -1656,7 +1657,7 @@ void App::load_prefs() {
               false);
     toasts_.back().ttl = 15.0f;
   }
-  if (act != WheelDefaultAction::None) save_prefs();
+  if (act != WheelDefaultAction::None) stamp_wheel_mode(view().wheel_mode);
 }
 
 void App::reload_plugins() {
