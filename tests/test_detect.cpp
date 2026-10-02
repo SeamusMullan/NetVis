@@ -16,6 +16,7 @@
 #include "core/MappedFile.h"
 #include "engine/OpCategory.h"
 #include "parsers/Parser.h"
+#include "parsers/caffe/CaffeSniff.h"
 #include "temp_file_guard.h"
 
 using namespace netvis;
@@ -352,6 +353,43 @@ TEST_CASE("OpCategory: gap-fill samples") {
   CHECK(categorize_op("Result") == OpCategory::IO);
 }
 
+// #138/#109: Caffe display names. Unvetted Caffe layers keep their own names
+// (or a `Caffe` prefix) and these keys colour them; none may land in a category
+// whose CostModel rule would invent FLOPs without an output shape.
+TEST_CASE("OpCategory: Caffe display names") {
+  CHECK(categorize_op("Convolution") == OpCategory::Conv);
+  CHECK(categorize_op("Deconvolution") == OpCategory::Conv);
+  CHECK(categorize_op("InnerProduct") == OpCategory::MatMul);
+  CHECK(categorize_op("Pooling") == OpCategory::Pool);
+  CHECK(categorize_op("SPP") == OpCategory::Pool);
+  CHECK(categorize_op("LRN") == OpCategory::Norm);
+  CHECK(categorize_op("MeanVarianceNormalization") == OpCategory::Norm);
+  CHECK(categorize_op("Scale") == OpCategory::Elementwise);
+  CHECK(categorize_op("Bias") == OpCategory::Elementwise);
+  CHECK(categorize_op("Power") == OpCategory::Elementwise);
+  CHECK(categorize_op("Eltwise") == OpCategory::Elementwise);
+  CHECK(categorize_op("Threshold") == OpCategory::Activation);
+  CHECK(categorize_op("Crop") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeSplit") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeSlice") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeFlatten") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeReshape") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeTile") == OpCategory::Shape);
+  CHECK(categorize_op("CaffeLSTM") == OpCategory::Recurrent);
+  CHECK(categorize_op("CaffeRNN") == OpCategory::Recurrent);
+  CHECK(categorize_op("CaffeParameter") == OpCategory::Tensor);
+  CHECK(categorize_op("Input") == OpCategory::IO);
+  CHECK(categorize_op("Data") == OpCategory::IO);
+  CHECK(categorize_op("ImageData") == OpCategory::IO);
+  CHECK(categorize_op("MemoryData") == OpCategory::IO);
+  CHECK(categorize_op("HDF5Data") == OpCategory::IO);
+  CHECK(categorize_op("WindowData") == OpCategory::IO);
+  CHECK(categorize_op("DummyData") == OpCategory::IO);
+  // Reduce counts |input|, which would give these FLOPs with no output shape.
+  CHECK(categorize_op("Reduction") == OpCategory::Other);
+  CHECK(categorize_op("CaffeArgMax") == OpCategory::Other);
+}
+
 TEST_CASE("OpCategory: category_name is non-empty for every category") {
   // Exhaustive over Conv..Other (Other is last). category_name must return a
   // stable non-empty label for each, including the three new v0.4.0 ones.
@@ -364,4 +402,134 @@ TEST_CASE("OpCategory: category_name is non-empty for every category") {
   CHECK(std::string(category_name(OpCategory::Attention)) != "Other");
   CHECK(std::string(category_name(OpCategory::Recurrent)) != "Other");
   CHECK(std::string(category_name(OpCategory::Quantize)) != "Other");
+}
+
+// ---------------------------------------------------------------------------
+// #138: Caffe detection collisions. Caffe text and binary NetParameters both
+// look like protobuf to the loose ONNX sniff; these pin the sniff ORDER and the
+// one-level-deeper peeks against the real fixtures of every protobuf format.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::vector<uint8_t> bytes_of(const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); }
+
+// Detect a fixture file (WARN + nullopt-ish Unknown when the fixture is missing).
+bool fixture_format(const char* path, const std::string& ext, Format& f, DetectReason& r) {
+  if (!std::filesystem::exists(path)) {
+    WARN_MESSAGE(false, "fixture missing; run tools/gen_fixtures.py");
+    return false;
+  }
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);
+  f = detect_format(*mf, ext, r);
+  return true;
+}
+
+}  // namespace
+
+TEST_CASE("detect Caffe D1: a prototxt that walks the ONNX sniff onto ':'") {
+  // The ONNX sniff reads this as 0x0A (field 1, len 110) -> 'i' (field 13,
+  // fixed64) -> ':' (field 7, length-delimited, len 32) -> "graph": an ONNX
+  // signal. The Caffe text sniff runs ahead of every protobuf sniff.
+  const std::string kOnnxTrapPrototxt =
+      "\nname: \"AlexNet\"\nlayer {\n    name: \"data\"\n    type: \"Input\"\n    top: \"data\"\n"
+      "    input_param { shape: { dim: 64 dim: 1 dim: 28 dim: 28 } }\n}\n"
+      "layer {\n    name: \"conv1\"\n    type: \"Convolution\"\n    bottom: \"data\"\n    top: \"conv1\"\n"
+      "    convolution_param {\n        num_output: 20\n        kernel_size: 5\n        stride: 1\n    }\n}\n";
+  for (const char* ext : {"", "prototxt"}) {
+    DetectReason r = DetectReason::None;
+    CHECK_MESSAGE(detect_bytes_reason("caffe_trap", bytes_of(kOnnxTrapPrototxt), ext, r) ==
+                      Format::Caffe,
+                  ext);
+    CHECK(r == DetectReason::Structure);
+  }
+}
+
+TEST_CASE("detect Caffe D2: both fixtures by content, whatever the extension") {
+  Format f = Format::Unknown;
+  DetectReason r = DetectReason::None;
+  for (const char* ext : {"", "caffemodel", "onnx"}) {
+    if (!fixture_format("tests/fixtures/model_caffe.caffemodel", ext, f, r)) return;
+    CHECK_MESSAGE(f == Format::Caffe, ext);   // carries input_shape: ONNX-shaped
+    CHECK(r == DetectReason::Structure);
+  }
+  if (!fixture_format("tests/fixtures/model_caffe_v1.caffemodel", "", f, r)) return;
+  CHECK(f == Format::Caffe);
+  CHECK(r == DetectReason::Structure);
+  for (const char* p : {"tests/fixtures/model_caffe.prototxt",
+                        "tests/fixtures/model_caffe_v1_deploy.prototxt"}) {
+    for (const char* ext : {"", "txt"}) {
+      if (!fixture_format(p, ext, f, r)) return;
+      CHECK_MESSAGE(f == Format::Caffe, p);
+      CHECK(r == DetectReason::Structure);
+    }
+  }
+}
+
+TEST_CASE("detect Caffe D3: real protobuf fixtures keep their formats") {
+  Format f = Format::Unknown;
+  DetectReason r = DetectReason::None;
+  for (const char* ext : {"", "onnx", "caffemodel"}) {
+    if (!fixture_format("tests/fixtures/model.onnx", ext, f, r)) return;
+    CHECK_MESSAGE(f == Format::ONNX, ext);
+  }
+  for (const char* ext : {"", "pb", "caffemodel"}) {
+    if (!fixture_format("tests/fixtures/model_frozen.pb", ext, f, r)) return;
+    CHECK_MESSAGE(f == Format::TensorFlow, ext);
+  }
+  if (!fixture_format("tests/fixtures/saved_model/saved_model.pb", "", f, r)) return;
+  CHECK(f == Format::TensorFlow);
+  // CoreML's extension-less verdict belongs to #166's tests; here it only must
+  // never become Caffe.
+  for (const char* ext : {"", "mlmodel", "caffemodel"}) {
+    if (!fixture_format("tests/fixtures/model.mlmodel", ext, f, r)) return;
+    CHECK_MESSAGE(f != Format::Caffe, ext);
+  }
+  if (!fixture_format("tests/fixtures/model.xml", "", f, r)) return;
+  CHECK(f == Format::OpenVINO);
+
+  // The sniffs themselves reject every non-Caffe fixture (detection order aside).
+  for (const char* p :
+       {"tests/fixtures/model.onnx", "tests/fixtures/model_frozen.pb",
+        "tests/fixtures/saved_model/saved_model.pb", "tests/fixtures/model.mlmodel",
+        "tests/fixtures/model_mlprogram_deep.mlmodel", "tests/fixtures/model.tflite",
+        "tests/fixtures/model.xml", "tests/fixtures/model.gguf",
+        "tests/fixtures/model.safetensors"}) {
+    if (!std::filesystem::exists(p)) continue;
+    auto mf = MappedFile::open(p);
+    REQUIRE(mf);
+    CHECK_FALSE_MESSAGE(caffe::looks_like_caffemodel(mf->data(), mf->size()), p);
+    CHECK_FALSE_MESSAGE(caffe::looks_like_prototxt(mf->data(), mf->size()), p);
+  }
+
+  // The synthetic ONNX and CoreML buffers used above are not Caffe either.
+  const std::vector<uint8_t> onnx = {0x08, 0x07, 0x3a, 0x02, 0x00, 0x00};
+  const std::vector<uint8_t> coreml = {0x08, 0x04, 0xa2, 0x1f, 0x00};
+  CHECK(detect_bytes("caffe_onnx", onnx, "") != Format::Caffe);
+  CHECK(detect_bytes("caffe_onnx2", onnx, "caffemodel") == Format::ONNX);
+  CHECK(detect_bytes("caffe_coreml", coreml, "") != Format::Caffe);
+}
+
+TEST_CASE("detect Caffe D4: near-misses are not Caffe by content") {
+  const std::string tf_text = "node { name: \"x\" op: \"Placeholder\" }\n";
+  CHECK(detect_bytes("caffe_pbtxt", bytes_of(tf_text), "") != Format::Caffe);
+  CHECK(detect_bytes("caffe_pbtxt2", bytes_of(tf_text), "pbtxt") != Format::Caffe);
+
+  const std::string solver = "net: \"train.prototxt\"\nbase_lr: 0.01\n";
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("caffe_solver", bytes_of(solver), "", r) == Format::Unknown);
+  CHECK(detect_bytes_reason("caffe_solver2", bytes_of(solver), "prototxt", r) == Format::Caffe);
+  CHECK(r == DetectReason::Extension);
+
+  CHECK(detect_bytes("caffe_comment", bytes_of("# nothing\n"), "") == Format::Unknown);
+  CHECK(detect_bytes("caffe_emptylayer", bytes_of("layer { }\n"), "") != Format::Caffe);
+  CHECK(detect_bytes("caffe_badtype", bytes_of("layer { type: \"a b\" }\n"), "") != Format::Caffe);
+  CHECK(detect_bytes("caffe_v1bad", bytes_of("layers { type: 40 }\n"), "") != Format::Caffe);
+  CHECK(detect_bytes("caffe_v1ok", bytes_of("layers { type: 39 }\n"), "") == Format::Caffe);
+  CHECK(detect_bytes("caffe_v0", bytes_of("layers { layer { name: \"a\" } }\n"), "") ==
+        Format::Caffe);
+
+  // name + field 2 holding {field 1 varint} (a GraphDef VersionDef's shape).
+  const std::vector<uint8_t> versions = {0x0A, 0x01, 'n', 0x12, 0x02, 0x08, 0x01};
+  CHECK(detect_bytes("caffe_versions", versions, "") != Format::Caffe);
 }

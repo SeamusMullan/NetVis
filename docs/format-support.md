@@ -79,6 +79,11 @@ Two rules apply to every row:
 | CoreML | `tests/fixtures/model.mlpackage` | yes | yes | all | all |
 | TensorFlow | `tests/fixtures/model_frozen.pb` | yes | yes | all | all |
 | TensorFlow | `tests/fixtures/saved_model` | yes | yes | all | all |
+| Caffe | `tests/fixtures/model_caffe.prototxt` | yes | yes | all | all |
+| Caffe | `tests/fixtures/model_caffe.caffemodel` | yes | yes | all | all |
+| Caffe | `tests/fixtures/model_caffe_alone.prototxt` | yes | no | none | none |
+| Caffe | `tests/fixtures/model_caffe_v1_deploy.prototxt` | yes | yes | all | all |
+| Caffe | `tests/fixtures/model_caffe_v1.caffemodel` | yes | yes | all | all |
 <!-- END MATRIX -->
 
 ## Known gaps, by format
@@ -185,6 +190,27 @@ table: the `saved_model` row reads `all` / `all` for the one constant it recorde
 while none of the trained weights are recorded at all. Issue #135 covers decoding
 them, along with `.pbtxt` and multi-`meta_graph` files.
 
+**Caffe** — `.prototxt` and `.caffemodel` both yield graphs, in the current `layer`
+schema and the legacy V1 `layers` schema (`schema` in the metadata says which). A
+`.prototxt` takes its weights from a `.caffemodel` beside it — same name, same name
+without `_deploy`, or the only one in the folder — matched by layer name. A layer whose
+weights do not fit its definition is left unpaired and listed in `unpaired_layers`. The
+`.caffemodel` itself records weights as file offsets. Caffe declares only input shapes, so
+every other shape is inferred, and **only through layers with an exact ONNX equivalent**:
+`Scale`, `Bias`, `Power`, `Threshold`, `Split`, `Crop`, `Reshape`, `Tile`, `Embed`,
+`LSTM`/`RNN`, `ArgMax`, `Reduction`, `SPP` and fork layers leave their outputs unknown, and so
+does everything after them. A ResNet-style `BatchNorm → Scale` net therefore has no shapes past
+its first `Scale`. `InnerProduct` on a rank > 2 input stays unknown too, as does any
+V1 `InnerProduct`, whose weights keep their legacy 4-D `[1,1,N,K]` dims. A `.prototxt`
+opened without weights has no shapes past its first convolution or inner product,
+because the weight blob is what fixes the output channels. Activation element types are
+known only when weights are present: Caffe stores float weights as `data` and double
+weights as `double_data`, and activations share that type. Train/test files are shown as
+the TEST phase (or the net's own `state`), and the metadata lists what was excluded. Not
+decoded, and counted in the metadata: V0 (pre-2014) layer parameters, weights written as text
+inside a `.prototxt` (shaped but not addressable), unpacked or non-BVLC blob storage, and
+fork parameter messages in a `.caffemodel` (a `.prototxt` shows every field).
+
 ## Formats NetVis does not open
 
 Named here so the absence is a documented answer rather than a silent one. Each
@@ -192,7 +218,6 @@ has an open issue:
 
 | Format | Issue |
 |---|---|
-| Caffe (`.prototxt` + `.caffemodel`) | #109, #138 |
 | Darknet (`.cfg` + `.weights`) | #110, #139 |
 | torch.export (`.pt2`) / ExecuTorch (`.pte`) | #111, #140, #141 |
 | TorchScript compute graph (desktop archive and mobile `.ptl`) | #108, #136, #137 |

@@ -743,7 +743,7 @@ void App::open_file_dialog() {
   start_file_dialog(DialogKind::OpenModel, FileDialog::Mode::Open, "Open model",
                     "",
                     {"*.onnx", "*.tflite", "*.safetensors", "*.gguf", "*.pt",
-                     "*.pth", "*.bin", "*.pb"},
+                     "*.pth", "*.bin", "*.pb", "*.prototxt", "*.caffemodel"},
                     "Model files");
 }
 
