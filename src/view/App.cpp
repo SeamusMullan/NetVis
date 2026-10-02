@@ -476,6 +476,14 @@ void App::shutdown_window() {
 // tab. Switching is instant (each tab holds its fully-loaded session). Hidden
 // entirely when there is a single still-empty tab so the startup UI is clean.
 void App::draw_tab_bar() {
+  // #170: BeginTabBar below runs outside any Begin/End, so the tabs land in ImGui's
+  // implicit "Debug##Default" window: a 400x400 box at (60,60) that, with no
+  // imgui.ini (a hermetic capture), is ALWAYS at that default place, on top of the
+  // canvas and whatever is docked there. Until the tab bar has a window of its own,
+  // a capture leaves the bar out rather than ship a picture with a stray window in
+  // it (the interactive app still has the stray window; that is its own task).
+  if (capture_.active) return;
+
   const bool single_empty = tabs_.size() == 1 &&
                             session().stage() == LoadStage::Empty &&
                             session().path().empty();
@@ -1390,9 +1398,20 @@ void App::save_view_state(const std::string& path) {
   // selection is a STABLE IR node index (display ids shift on collapse), exactly as
   // capture_view stores it for undo/redo, so a saved view and an undo step cannot
   // disagree about what "selected" means.
-  const ViewFile vf = view_file_from_snapshot(capture_view(vs, s), s.path(), s.current_graph(),
-                                              vs.heatmap_metric, vs.heatmap_log_scale);
+  // The model is recorded relative to the view file when it sits inside the file's
+  // directory, so the pair can be committed or moved together (#170).
+  std::vector<std::string> dropped;  // what the reader's limits made us leave out
+  const ViewFile vf = view_file_from_snapshot(
+      capture_view(vs, s), model_path_for_view_file(s.path(), path), s.current_graph(),
+      vs.heatmap_metric, vs.heatmap_log_scale, &dropped);
   const std::string text = serialize_view_file(vf);
+  if (text.size() > kMaxViewFileBytes) {
+    // Not even the compact form fits: a file this build would then refuse to load.
+    add_toast("View is too large to save (" + std::to_string(text.size() >> 20) +
+                  " MiB; the limit is " + std::to_string(kMaxViewFileBytes >> 20) + ")",
+              true);
+    return;
+  }
 
   std::ofstream f(path);
   if (f) {
@@ -1401,7 +1420,17 @@ void App::save_view_state(const std::string& path) {
     // guaranteed valid UTF-8 on Linux. Strict would throw out of a save the user
     // explicitly asked for. See save_recent for the full reasoning.
     f << text;
-    add_toast("View saved", false);
+    f.close();
+  }
+  if (!f.fail()) {
+    if (dropped.empty()) {
+      add_toast("View saved", false);
+    } else {
+      add_toast("View saved without: " + dropped.front() +
+                    (dropped.size() > 1 ? " (+" + std::to_string(dropped.size() - 1) + " more)"
+                                        : std::string()),
+                false);
+    }
   } else {
     add_toast("Could not write view file", true);
   }
@@ -1443,8 +1472,15 @@ void App::step_pending_views() {
     ViewFileApplier& a = *t->pending_view;
     const ViewStep st = step_view_file(a, t->view, *t->session, t->jobs->idle());
     if (st == ViewStep::Pending) continue;
-    if (st == ViewStep::Done) add_toast(view_file_outcome_text(a.outcome), false);
-    else add_toast("View load cancelled: the model changed", false);
+    if (st == ViewStep::Done) {
+      // Not just the outcome: every setting the load ignored (a stale index, a wrong-
+      // typed key, a collapse bitset for a different model) is said, so a partial load
+      // never reads as a clean "View loaded". A refused apply is an error toast.
+      for (const ViewLoadToast& toast : view_load_toasts(a.outcome, a.notes))
+        add_toast(toast.text, toast.is_error);
+    } else {
+      add_toast("View load cancelled: the model changed", false);
+    }
     t->pending_view.reset();
   }
 }

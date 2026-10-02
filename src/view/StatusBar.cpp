@@ -21,6 +21,7 @@
 // App.h pulls in without including it; include it first so App.h compiles.
 #include "engine/LayoutEngine.h"
 #include "engine/ModelSession.h"
+#include "engine/ScreenshotCli.h"  // #170: screenshot_display_name
 #include "ir/IR.h"
 #include "parsers/Parser.h"  // #45: detect_format(...,reason) + detect_reason_name
 #include "view/App.h"
@@ -217,7 +218,12 @@ void draw_status_bar(App& app) {
                   static_cast<unsigned long long>(tensors));
     right += buf;
   }
-  right += session.path().empty() ? "(no file)" : session.path();
+  // A capture (#170) shows the file's name, not its absolute path: the path would put
+  // the user's name and directory layout into a picture meant for a public PR or doc,
+  // and would make the pixels depend on where the repository is checked out.
+  right += session.path().empty()
+               ? std::string("(no file)")
+               : (app.capturing() ? screenshot_display_name(session.path()) : session.path());
 
   float rw = ImGui::CalcTextSize(right.c_str()).x;
   float avail = ImGui::GetWindowWidth();

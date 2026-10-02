@@ -2,11 +2,16 @@
 // engine/ScreenshotCli.cpp — see ScreenshotCli.h. Pure rules for `--screenshot`.
 #include "engine/ScreenshotCli.h"
 
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <new>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +60,24 @@ bool is_value_flag(std::string_view n) {
 }
 bool is_bool_flag(std::string_view n) {
   return n == "--canvas-only" || n == "--fit" || n == "--no-layout-cache";
+}
+
+// An unpredictable 32-bit value for temp-file names. Never throws: a missing
+// entropy source (std::random_device can throw) falls back to the clock and a
+// process-wide counter, which still makes consecutive names differ.
+uint32_t random_u32() {
+  static std::atomic<uint32_t> counter{0};
+  uint64_t v = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+  v ^= static_cast<uint64_t>(counter.fetch_add(1, std::memory_order_relaxed) + 1) * 0x9E3779B97F4A7C15ull;
+  try {
+    std::random_device rd;
+    v ^= (static_cast<uint64_t>(rd()) << 32) | rd();
+  } catch (...) {
+  }
+  v ^= v >> 33;
+  v *= 0xFF51AFD7ED558CCDull;
+  v ^= v >> 33;
+  return static_cast<uint32_t>(v);
 }
 
 }  // namespace
@@ -109,6 +132,18 @@ ScreenshotArgs parse_screenshot_args(int argc, char** argv) {
     if (std::string_view(argv[i]).size() > kScreenshotMaxArgBytes)
       return usage_error("argument " + std::to_string(i) + " is longer than " +
                          std::to_string(kScreenshotMaxArgBytes) + " bytes");
+  }
+
+  // --help / -h wins over every other problem (a half-typed command line is exactly
+  // when it is asked for), but a model literally named "-h" can still follow `--`.
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view a = argv[i];
+    if (a == "--") break;
+    if (a == "--help" || a == "-h") {
+      ScreenshotArgs h;
+      h.help = true;
+      return h;
+    }
   }
 
   ScreenshotOptions o;
@@ -247,29 +282,18 @@ ScreenshotArgs resolve_screenshot_paths(ScreenshotOptions options) {
     if (!fs::is_directory(parent, ec))
       return fail(ScreenshotExit::Usage,
                   "output directory does not exist: '" + parent.string() + "'");
-    ec.clear();
-    const fs::file_status st = fs::status(out, ec);
-    if (fs::is_directory(st))
-      return fail(ScreenshotExit::Usage, "output '" + o.out_path + "' is a directory");
-    if (fs::exists(st)) {
-      if (!fs::is_regular_file(st))
-        return fail(ScreenshotExit::Usage,
-                    "refusing to overwrite '" + o.out_path + "': it exists and is not a regular file");
-      // Swapped arguments (`--screenshot model.onnx other.onnx`) must not clobber
-      // the model: an existing output is replaced only if it already is a PNG.
-      uint8_t head[8] = {};
-      size_t got = 0;
-      {
-        std::ifstream f(out, std::ios::binary);
-        if (f) {
-          f.read(reinterpret_cast<char*>(head), sizeof head);
-          got = static_cast<size_t>(f.gcount());
-        }
-      }
-      if (!is_png_signature(head, got))
-        return fail(ScreenshotExit::Usage,
-                    "refusing to overwrite '" + o.out_path + "': it exists and is not a PNG");
+    std::string why;
+    if (!screenshot_output_replaceable(o.out_path, why)) return fail(ScreenshotExit::Usage, why);
+    // The file is always a PNG whatever it is called, so `--screenshot a.jpg` would
+    // write PNG bytes into a .jpg and fool every tool that trusts the extension.
+    std::string ext = out.extension().string();
+    for (char& c : ext) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
+    if (ext != ".png")
+      return fail(ScreenshotExit::Usage,
+                  "the output file must end in .png (the capture is always a PNG), got '" +
+                      shown(out.filename().string()) + "'");
   }
 
   // --- model (Load): a directory is fine (.mlpackage, saved_model/) ------------
@@ -285,6 +309,133 @@ ScreenshotArgs resolve_screenshot_paths(ScreenshotOptions options) {
                   "view file not found or not a regular file: '" + o.view_path + "'");
   }
   return r;
+}
+
+// See the header. fopen's "x" is O_CREAT|O_EXCL on POSIX (which never opens through a symbolic link, even a
+// dangling one) and CREATE_NEW on Windows. The permission bits are the usual
+// 0666 & ~umask.
+std::FILE* open_new_file_exclusive(const std::filesystem::path& p, int& err) {
+  std::FILE* f = nullptr;
+#if defined(_WIN32)
+  err = static_cast<int>(_wfopen_s(&f, p.c_str(), L"wbx"));
+  if (f != nullptr) err = 0;
+  else if (err == 0) err = EIO;
+#else
+  errno = 0;
+  f = std::fopen(p.c_str(), "wbx");
+  err = (f != nullptr) ? 0 : (errno != 0 ? errno : EIO);
+#endif
+  return f;
+}
+
+bool screenshot_output_replaceable(const std::string& path, std::string& error) {
+  namespace fs = std::filesystem;
+  const fs::path out(path);
+  std::error_code ec;
+  const fs::file_status st = fs::status(out, ec);
+  if (fs::is_directory(st)) {
+    error = "output '" + path + "' is a directory";
+    return false;
+  }
+  if (st.type() == fs::file_type::none) {  // an error other than "not found"
+    error = "cannot examine output '" + path + "': " + ec.message();
+    return false;
+  }
+  if (!fs::exists(st)) return true;  // absent, or a dangling link (the link is replaced)
+  if (!fs::is_regular_file(st)) {
+    error = "refusing to overwrite '" + path + "': it exists and is not a regular file";
+    return false;
+  }
+  // Swapped arguments (`--screenshot model.onnx other.onnx`) must not clobber the
+  // model: an existing output is replaced only if it already is a PNG.
+  uint8_t head[8] = {};
+  size_t got = 0;
+  {
+    std::ifstream f(out, std::ios::binary);
+    if (f) {
+      f.read(reinterpret_cast<char*>(head), sizeof head);
+      got = static_cast<size_t>(f.gcount());
+    }
+  }
+  if (!is_png_signature(head, got)) {
+    error = "refusing to overwrite '" + path + "': it exists and is not a PNG";
+    return false;
+  }
+  return true;
+}
+
+bool write_screenshot_png(const std::string& path, const uint8_t* png, size_t len,
+                          std::string& error) {
+  namespace fs = std::filesystem;
+  if (png == nullptr || !is_png_signature(png, len)) {
+    error = "internal error: the encoded image is not a PNG";
+    return false;
+  }
+  if (path.empty()) {
+    error = "the output path is empty";
+    return false;
+  }
+  // Fail fast, before anything is created.
+  if (!screenshot_output_replaceable(path, error)) return false;
+
+  // An unpredictable name, created exclusively (see the header). A name that is
+  // already taken (EEXIST: a leftover, or somebody's planted file or link) is simply
+  // skipped; any other error is real.
+  fs::path tmp;
+  std::FILE* f = nullptr;
+  int err = 0;
+  for (int attempt = 0; attempt < 16 && f == nullptr; ++attempt) {
+    char suffix[40];
+    std::snprintf(suffix, sizeof suffix, ".%08x.netvis-tmp", static_cast<unsigned>(random_u32()));
+    tmp = fs::path(path);
+    tmp += suffix;
+    f = open_new_file_exclusive(tmp, err);
+    if (f == nullptr && err != EEXIST) break;
+  }
+  if (f == nullptr) {
+    error = "cannot create a temporary file next to '" + path +
+            "': " + std::error_code(err, std::generic_category()).message();
+    return false;
+  }
+
+  auto discard_tmp = [&tmp] {
+    std::error_code ec;
+    fs::remove(tmp, ec);
+  };
+  const size_t wrote = len == 0 ? 0 : std::fwrite(png, 1, len, f);
+  const bool flushed = std::fflush(f) == 0;
+  const bool closed = std::fclose(f) == 0;
+  if (wrote != len || !flushed || !closed) {
+    error = "failed writing '" + tmp.string() + "'";
+    discard_tmp();
+    return false;
+  }
+
+  // The capture may have run for minutes since the first check: look again, as late
+  // as possible, so a file somebody created at `path` meanwhile is not clobbered.
+  if (!screenshot_output_replaceable(path, error)) {
+    discard_tmp();
+    return false;
+  }
+  // rename(2) replaces atomically on POSIX; MSVC's std::filesystem::rename replaces
+  // an existing file too. A symbolic link at `path` is replaced, not followed.
+  std::error_code ec;
+  fs::rename(tmp, fs::path(path), ec);
+  if (ec) {
+    error = "cannot move the PNG into place at '" + path + "': " + ec.message();
+    discard_tmp();
+    return false;
+  }
+  return true;
+}
+
+std::string screenshot_display_name(const std::string& model_path) {
+  namespace fs = std::filesystem;
+  fs::path p(model_path);
+  // `bundle.mlpackage/` has an empty filename(); the bundle's name is its parent's.
+  if (!p.has_filename() && p.has_relative_path()) p = p.parent_path();
+  std::string name = p.filename().string();
+  return name.empty() ? model_path : name;
 }
 
 CaptureGate capture_gate(const CaptureGateInputs& in) {

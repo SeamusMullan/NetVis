@@ -31,12 +31,8 @@ namespace netvis {
 struct ViewState;    // view/App.h
 class ModelSession;  // engine/ModelSession.h
 
-// How much of the file applied (drives the toast text).
-enum class ViewApplyOutcome : uint8_t {
-  Full,        // same model: everything that was in range applied
-  OtherModel,  // another model: the model-independent settings applied
-  NoModel,     // nothing loaded yet: the model-independent settings applied
-};
+// ViewApplyOutcome, view_file_outcome_text and view_load_toasts (what the user is told)
+// are core: engine/ViewFile.h.
 
 enum class ViewStep : uint8_t {
   Pending,  // waiting for the pool to go idle; call again next frame
@@ -51,7 +47,8 @@ struct ViewFileApplier {
   std::vector<std::string> notes;   // what was ignored and why (parse warnings first)
   uint64_t generation = 0;          // the session generation this load was started against
   bool has_model = false;           // session.model() != nullptr at creation
-  bool same_model = false;          // the file's "model" is the live model
+  bool same_model = false;          // the file's "model" is the live model (also resolved
+                                    // against the file's own directory, see same_model_path)
   Phase phase = Phase::Agnostic;
   ViewApplyOutcome outcome = ViewApplyOutcome::NoModel;
 };
@@ -66,10 +63,9 @@ ViewStep step_view_file(ViewFileApplier& a, ViewState& vs, ModelSession& s, bool
 
 // The model-independent half: camera, toggles, edge routing, heatmap metric/scale,
 // the three filters and the navigation intent. Touches no session state, so it can
-// run at any time.
+// run at any time. (The filters are written WITHOUT their attr_filter_key, so the
+// Properties panel drops a restored attribute filter on the first node it draws;
+// the Specific phase pins it to the restored selection once that is known.)
 void apply_view_file_agnostic(const ViewFile& f, ViewState& vs);
-
-// The toast text for a finished load (the three strings #56 introduced).
-const char* view_file_outcome_text(ViewApplyOutcome o);
 
 }  // namespace netvis

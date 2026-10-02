@@ -16,6 +16,7 @@
 #include "engine/ModelSession.h"
 #include "view/App.h"
 #include "view/GraphNav.h"
+#include "view/PanelHelpers.h"
 #include "view/ViewHistory.h"
 
 namespace netvis {
@@ -27,7 +28,7 @@ ViewFileApplier make_view_file_applier(const ViewFile& f, std::vector<std::strin
   a.notes = std::move(notes);
   a.generation = s.generation();
   a.has_model = s.model() != nullptr;
-  a.same_model = a.has_model && same_model_path(f.model, s.path());
+  a.same_model = a.has_model && same_model_path(f.model, s.path(), f.source_dir);
   return a;
 }
 
@@ -124,9 +125,26 @@ ViewStep step_view_file(ViewFileApplier& a, ViewState& vs, ModelSession& s, bool
         // apply_view does the hard ordering (collapse before selection, at most ONE
         // re-layout, nav ownership claim, hover cleared). It refuses only when the
         // (generation, graph) moved or the bitset size does not match, neither of
-        // which can happen on a snapshot overlaid onto a capture taken just above.
-        if (!apply_view(r.snapshot, vs, s))
-          a.notes.push_back("view could not be applied: the model or graph changed");
+        // which can happen on a snapshot overlaid onto a capture taken just above, but
+        // if it ever does, that is a failure, not a "View loaded".
+        if (!apply_view(r.snapshot, vs, s)) {
+          a.outcome = ViewApplyOutcome::Failed;
+          a.phase = Phase::Done;
+          return ViewStep::Done;
+        }
+        // The filter text came from the file, but the Properties panel keeps an
+        // attribute filter only for the node it was typed against and clears it the
+        // first time it draws a different one (a fresh key is UINT64_MAX). Tie the
+        // restored filter to the restored selection, or it would be dropped on the
+        // very next frame.
+        if (a.file.attr_filter && vs.selected_display >= 0) {
+          const auto& display = s.collapse().display_nodes();
+          const size_t sel = static_cast<size_t>(vs.selected_display);
+          if (sel < display.size() && !display[sel].is_group &&
+              display[sel].ir_node != UINT32_MAX)
+            vs.attr_filter_key =
+                panel_detail::attr_filter_key(s.current_graph(), display[sel].ir_node);
+        }
         a.outcome = a.same_model ? ViewApplyOutcome::Full : ViewApplyOutcome::OtherModel;
         a.phase = Phase::Done;
         return ViewStep::Done;
@@ -136,15 +154,6 @@ ViewStep step_view_file(ViewFileApplier& a, ViewState& vs, ModelSession& s, bool
         return ViewStep::Done;
     }
   }
-}
-
-const char* view_file_outcome_text(ViewApplyOutcome o) {
-  switch (o) {
-    case ViewApplyOutcome::Full: return "View loaded";
-    case ViewApplyOutcome::OtherModel: return "View loaded (camera only - saved for another model)";
-    case ViewApplyOutcome::NoModel: return "View loaded (open a model to restore selection)";
-  }
-  return "View loaded";
 }
 
 }  // namespace netvis

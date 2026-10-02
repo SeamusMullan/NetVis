@@ -9,7 +9,9 @@
 //   * output/model/view path validation      (resolve_screenshot_paths)
 //   * the "is the model finished?" decision  (capture_gate)
 //   * the pixel flip/convert                 (rgba_bottom_up_to_rgb_top_down)
-//   * the PNG-or-refuse-to-overwrite check   (is_png_signature)
+//   * the PNG-or-refuse-to-overwrite check   (is_png_signature, screenshot_output_replaceable)
+//   * the atomic, symlink-safe PNG file write (write_screenshot_png)
+//   * the name shown in a capture            (screenshot_display_name)
 //
 // No GL, no ImGui, no exceptions. Hostile input is the norm for a CLI: every
 // numeric argument is digit-capped before it is converted, so no conversion can
@@ -18,6 +20,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,7 +45,8 @@ constexpr int exit_code(ScreenshotExit e) { return static_cast<int>(e); }
 inline constexpr uint32_t kScreenshotDefaultWidth = 1600;
 inline constexpr uint32_t kScreenshotDefaultHeight = 1000;
 inline constexpr uint32_t kScreenshotMinSide = 64;
-// 8192^2 RGBA is ~268 MB of readback; peak (readback + RGB copy + PNG) is ~450 MB.
+// 8192^2 RGBA is ~268 MB of readback; peak (readback + RGB copy + PNG + the
+// framebuffer itself) was measured at ~590 MB max RSS.
 inline constexpr uint32_t kScreenshotMaxSide = 8192;
 inline constexpr uint32_t kScreenshotDefaultTimeoutS = 120;
 inline constexpr uint32_t kScreenshotMaxTimeoutS = 3600;
@@ -55,7 +60,8 @@ inline constexpr size_t kScreenshotMaxArgBytes = 4096;
 inline constexpr std::string_view kScreenshotUsage =
     "usage: netvis --screenshot <out.png> [--size WxH] [--view <file.netvis-view>]\n"
     "              [--canvas-only] [--fit] [--theme dark|light] [--timeout <seconds>]\n"
-    "              [--no-layout-cache] [--] <model>\n";
+    "              [--no-layout-cache] [--] <model>\n"
+    "       netvis --screenshot --help\n";
 
 struct ScreenshotOptions {
   // Absolute after resolve_screenshot_paths(); view_path "" = no view file.
@@ -72,6 +78,9 @@ struct ScreenshotArgs {
   ScreenshotOptions options;
   ScreenshotExit status = ScreenshotExit::Ok;
   std::string error;  // one line, no prefix; empty when status == Ok
+  // `--help` / `-h` was given: print kScreenshotUsage on stdout and exit 0. Set only
+  // with status == Ok, and nothing else in `options` is meaningful then.
+  bool help = false;
 };
 
 // True iff some argv[i] (i >= 1) is `--screenshot` or starts with `--screenshot=`.
@@ -84,7 +93,8 @@ bool wants_screenshot(int argc, char** argv);
 std::string screenshot_conflict(int argc, char** argv);
 
 // Parse argv[1..argc). Never throws, never touches the filesystem. On any problem
-// status is Usage and `error` names the offending flag.
+// status is Usage and `error` names the offending flag. `--help` / `-h` anywhere
+// before a `--` wins over every other problem and sets `help`.
 ScreenshotArgs parse_screenshot_args(int argc, char** argv);
 
 // `WxH` / `WXH`: 1..5 ASCII digits each, no sign/space/exponent, each side in
@@ -97,7 +107,8 @@ bool parse_screenshot_size(std::string_view text, uint32_t& width, uint32_t& hei
 // Contents/Resources inside a macOS bundle, which would break relative paths.
 //   * output: parent must exist and be a directory; the output must not be a
 //     directory; an existing output is replaced only if it already is a PNG
-//     (so swapped arguments cannot clobber the model).                  -> Usage
+//     (so swapped arguments cannot clobber the model); the name must end in
+//     `.png`, because the file is always a PNG whatever it is called.   -> Usage
 //   * model:  must exist (a directory is fine: .mlpackage, saved_model/). -> Load
 //   * view:   must exist and be a regular file.                           -> View
 ScreenshotArgs resolve_screenshot_paths(ScreenshotOptions options);
@@ -148,5 +159,53 @@ bool rgba_bottom_up_to_rgb_top_down(const uint8_t* src, size_t src_len,
 
 // True iff the first 8 bytes are the PNG signature (89 50 4E 47 0D 0A 1A 0A).
 bool is_png_signature(const uint8_t* data, size_t len);
+
+// --- The output file -----------------------------------------------------------
+
+// May a capture write to `path`? The ONE rule behind both the up-front check in
+// resolve_screenshot_paths and the re-check write_screenshot_png makes just before
+// it moves the PNG into place (a capture can run for up to --timeout seconds, and
+// the file system is not frozen meanwhile):
+//   * a directory                      -> no
+//   * exists, not a regular file       -> no
+//   * exists, regular, not a PNG       -> no  (swapped arguments, a model, notes)
+//   * absent (or a dangling symlink)   -> yes
+//   * exists and is a PNG              -> yes
+// A symbolic link is judged by what it points at, as before; replacing it replaces
+// the LINK, never the file it points at (rename(2), see write_screenshot_png).
+// On "no", `error` is one line naming the path and the reason.
+bool screenshot_output_replaceable(const std::string& path, std::string& error);
+
+// Create `p` for writing (binary), failing with errno EEXIST if ANYTHING is already
+// there: a file, a directory, or a symbolic link (live or dangling), which is never
+// opened through. fopen "wbx": O_CREAT|O_EXCL on POSIX, CREATE_NEW on Windows; the
+// permission bits are the usual 0666 & ~umask. Returns the open FILE* (the caller
+// fclose()s it) or nullptr with `err` set to the errno value. This is the step that
+// makes write_screenshot_png's temp file safe in a shared directory; it is public so
+// that can be tested directly.
+std::FILE* open_new_file_exclusive(const std::filesystem::path& p, int& err);
+
+// Write `png` (a complete PNG file: must start with the PNG signature) to `path`
+// ATOMICALLY and without following a planted link:
+//   * the bytes go to a temp file in the SAME directory with an unpredictable name
+//     (`<path>.<8 hex digits>.netvis-tmp`), created EXCLUSIVELY (fopen "wbx":
+//     O_CREAT|O_EXCL on POSIX, which never opens through a symbolic link;
+//     CREATE_NEW on Windows), so another user cannot make the capture truncate or
+//     overwrite some other file by pre-creating the temp name as a symlink;
+//   * `path` is re-checked with screenshot_output_replaceable just before the
+//     rename, which then replaces it in one step, so a failed run never truncates
+//     or replaces a good PNG and never leaves a partial file;
+//   * on any failure the temp file is removed, `path` is untouched, and `error`
+//     says why.
+// Never throws.
+bool write_screenshot_png(const std::string& path, const uint8_t* png, size_t len,
+                          std::string& error);
+
+// What a capture shows for a model path: the final path component (a trailing
+// separator, as on a `.mlpackage/` bundle, is ignored). The full absolute path is
+// used to LOAD the model, but never drawn: it leaks the user's name and directory
+// layout into pictures meant for public docs, and it makes the pixels depend on
+// where the repository happens to be checked out.
+std::string screenshot_display_name(const std::string& model_path);
 
 }  // namespace netvis

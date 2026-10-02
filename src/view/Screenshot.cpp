@@ -11,8 +11,6 @@
 #include <cstddef>
 #include <cstdio>
 #include <climits>
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <new>
 #include <string>
@@ -251,7 +249,6 @@ void OffscreenTarget::release() {
 // ---------------------------------------------------------------------------
 bool write_png_rgb(const std::string& path, const std::vector<uint8_t>& rgb, uint32_t width,
                    uint32_t height, std::string& error) {
-  namespace fs = std::filesystem;
   if (width == 0 || height == 0 || width > static_cast<uint32_t>(INT_MAX / 3) ||
       height > static_cast<uint32_t>(INT_MAX)) {
     error = "PNG size is out of range";
@@ -277,40 +274,9 @@ bool write_png_rgb(const std::string& path, const std::vector<uint8_t>& rgb, uin
     return false;
   }
 
-  const std::string tmp = path + ".netvis-tmp";
-  auto cleanup = [&tmp] {
-    std::error_code ec;
-    fs::remove(fs::path(tmp), ec);
-  };
-  {
-    std::ofstream f(fs::path(tmp), std::ios::binary | std::ios::trunc);
-    if (!f) {
-      error = "cannot create '" + tmp + "'";
-      return false;
-    }
-    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
-    if (!f.good()) {
-      error = "failed writing '" + tmp + "'";
-      f.close();
-      cleanup();
-      return false;
-    }
-    f.close();
-    if (f.fail()) {
-      error = "failed closing '" + tmp + "'";
-      cleanup();
-      return false;
-    }
-  }
-  // Atomic on POSIX (rename(2) replaces); MSVC's rename replaces an existing file.
-  std::error_code ec;
-  fs::rename(fs::path(tmp), fs::path(path), ec);
-  if (ec) {
-    error = "cannot move the PNG into place at '" + path + "': " + ec.message();
-    cleanup();
-    return false;
-  }
-  return true;
+  // The file rules (an exclusively-created temp next to the target, a re-check of the
+  // target, an atomic rename, cleanup on failure) are core and unit-tested.
+  return write_screenshot_png(path, png.data(), png.size(), error);
 }
 
 }  // namespace netvis

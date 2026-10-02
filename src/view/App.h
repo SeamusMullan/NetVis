@@ -378,6 +378,11 @@ class App {
   // canvas (no menus, tabs, panels, status bar or toasts). Always false otherwise.
   bool canvas_only() const { return capture_.active && capture_.canvas_only; }
 
+  // True for the whole of a `--screenshot` run (full-window or canvas-only). Things
+  // that vary with the machine or the checkout rather than with the model (the
+  // absolute model path) are kept out of the picture while this is set.
+  bool capturing() const { return capture_.active; }
+
   // Open a file (from dialog / drop / CLI). Delegates to ModelSession.
   void open_file(const std::string& path);
 

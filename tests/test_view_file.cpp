@@ -17,6 +17,7 @@
 #include "core/MappedFile.h"
 #include "engine/ViewFile.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -491,8 +492,10 @@ TEST_CASE("view file: a model passed as --view is NotJson") {
 }
 
 TEST_CASE("view file: a view file passed as the model is Format::Unknown") {
-  TempDir td("nv170_viewfile_detect");
-  const fs::path p = td.path / "view.netvis-view";
+  // The guard comes BEFORE the mapping so the mapping is released first: Windows cannot
+  // delete a file that is still mapped (tests/temp_file_guard.h).
+  const fs::path p = fs::temp_directory_path() / "nv170_viewfile_detect.netvis-view";
+  netvis_test::TempFileGuard cleanup(p.string());
   write_file(p, serialize_view_file(view_file_from_snapshot(ViewSnapshot{}, "/m.onnx", 0,
                                                             HeatmapMetric::Flops, true)));
   auto mf = MappedFile::open(p.string());
@@ -740,4 +743,270 @@ TEST_CASE("json_nesting_ok in isolation") {
   CHECK_FALSE(json_nesting_ok("]]]]][[[[", 3));
   CHECK(json_nesting_ok("]]]]][[[", 3));
   CHECK(json_nesting_ok("", 0));
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes for #178: filters that fit their boxes, what the user is told after a
+// load, relative model paths, the save size limit, comments in the nesting scan.
+// ---------------------------------------------------------------------------
+TEST_CASE("view file: a filter longer than its box is cut to fit, on a character boundary, with a warning") {
+  // Exactly what the box holds is untouched: buffer size minus the NUL.
+  const std::string fits(kAttrFilterUiBytes - 1, 'a');
+  {
+    const ViewFileLoad r = parse(doc("\"attr_filter\":\"" + fits + "\""));
+    REQUIRE(r.ok());
+    CHECK(r.warnings.empty());
+    CHECK(*r.file.attr_filter == fits);
+  }
+  // One byte more is cut back to what fits.
+  {
+    const ViewFileLoad r = parse(doc("\"attr_filter\":\"" + fits + "b\""));
+    REQUIRE(r.ok());
+    CHECK(*r.file.attr_filter == fits);
+    REQUIRE(r.warnings.size() == 1);
+    CHECK(has(r.warnings[0], "attr_filter"));
+    CHECK(has(r.warnings[0], "cut to fit"));
+  }
+  // The other two boxes have their own size.
+  {
+    const std::string q(kSearchQueryUiBytes + 40, 'q');
+    const std::string t(kTableFilterUiBytes + 40, 't');
+    const ViewFileLoad r =
+        parse(doc("\"search_query\":\"" + q + "\",\"table_filter\":\"" + t + "\""));
+    REQUIRE(r.ok());
+    CHECK(r.file.search_query->size() == kSearchQueryUiBytes - 1);
+    CHECK(r.file.table_filter->size() == kTableFilterUiBytes - 1);
+    CHECK(r.warnings.size() == 2);
+  }
+  // A multi-byte character that straddles the limit is dropped whole, never split: the
+  // result is valid UTF-8 (no stray continuation byte at the end).
+  {
+    // 62 ASCII bytes, then U+00E9 (2 bytes: bytes 62 and 63; the limit is 63 bytes).
+    const std::string s = std::string(kAttrFilterUiBytes - 2, 'a') + "\xC3\xA9" + "z";
+    const ViewFileLoad r = parse(doc("\"attr_filter\":\"" + s + "\""));
+    REQUIRE(r.ok());
+    CHECK(r.file.attr_filter->size() == kAttrFilterUiBytes - 2);
+    CHECK(r.file.attr_filter->find('\xC3') == std::string::npos);
+  }
+  // And what the cut produced is what the overlay will hand to the UI.
+  {
+    const ViewFileLoad r = parse(doc("\"attr_filter\":\"" + fits + "bbbbbbbb\""));
+    REQUIRE(r.ok());
+    const ViewOverlayResult o = overlay_view_file(r.file, ViewSnapshot{}, true, 1, 1);
+    CHECK(o.snapshot.attr_filter.size() == kAttrFilterUiBytes - 1);
+  }
+}
+
+TEST_CASE("view_load_toasts: a load that dropped settings does not read as a clean success") {
+  using O = ViewApplyOutcome;
+  const std::vector<std::string> none;
+
+  SUBCASE("a clean full load is the single plain toast") {
+    const auto t = view_load_toasts(O::Full, none);
+    REQUIRE(t.size() == 1);
+    CHECK(t[0].text == "View loaded");
+    CHECK_FALSE(t[0].is_error);
+  }
+  SUBCASE("one ignored setting is counted and named") {
+    const auto t = view_load_toasts(O::Full, {"pinned 999 is out of range"});
+    REQUIRE(t.size() == 2);
+    CHECK(t[0].text == "View loaded (1 setting ignored)");
+    CHECK(t[1].text == "pinned 999 is out of range");
+    CHECK_FALSE(t[0].is_error);
+    CHECK_FALSE(t[1].is_error);
+  }
+  SUBCASE("many ignored settings: counted, the first few named, the rest summarised") {
+    std::vector<std::string> notes;
+    for (size_t i = 0; i < kViewLoadMaxNoteToasts + 2; ++i) notes.push_back("note " + std::to_string(i));
+    const auto t = view_load_toasts(O::Full, notes);
+    REQUIRE(t.size() == 1 + kViewLoadMaxNoteToasts + 1);
+    CHECK(t[0].text == "View loaded (" + std::to_string(notes.size()) + " settings ignored)");
+    for (size_t i = 0; i < kViewLoadMaxNoteToasts; ++i) CHECK(t[1 + i].text == notes[i]);
+    CHECK(t.back().text == "... and 2 more ignored");
+  }
+  SUBCASE("exactly the cap needs no summary line") {
+    std::vector<std::string> notes(kViewLoadMaxNoteToasts, "n");
+    CHECK(view_load_toasts(O::Full, notes).size() == 1 + kViewLoadMaxNoteToasts);
+  }
+  SUBCASE("another model / no model keep their own explanation, and the notes follow") {
+    const auto a = view_load_toasts(O::OtherModel, {"view file was saved for 'x'"});
+    REQUIRE(a.size() == 2);
+    CHECK(a[0].text == "View loaded (camera only - saved for another model)");
+    const auto b = view_load_toasts(O::NoModel, none);
+    REQUIRE(b.size() == 1);
+    CHECK(b[0].text == "View loaded (open a model to restore selection)");
+  }
+  SUBCASE("a refused apply is one ERROR toast, whatever the notes say") {
+    const auto t = view_load_toasts(O::Failed, {"some note", "another"});
+    REQUIRE(t.size() == 1);
+    CHECK(t[0].is_error);
+    CHECK(has(t[0].text, "could not be applied"));
+    CHECK_FALSE(has(t[0].text, "View loaded"));
+  }
+}
+
+TEST_CASE("same_model_path: a relative model also resolves against the view file's directory") {
+  TempDir td("nv170_samemodel_dir");
+  const fs::path models = td.path / "models";
+  fs::create_directories(models);
+  const fs::path live = models / "m.onnx";
+  write_file(live, "x");
+
+  // Relative to the view file's directory (what a committed file means) ...
+  CHECK(same_model_path("models/m.onnx", live.string(), td.path.string()));
+  CHECK(same_model_path("./models/m.onnx", live.string(), td.path.string()));
+  CHECK(same_model_path("models/../models/m.onnx", live.string(), td.path.string()));
+  // ... but not without that directory, from some other working directory,
+  CHECK_FALSE(same_model_path("models/m.onnx", live.string()));
+  CHECK_FALSE(same_model_path("models/m.onnx", live.string(), ""));
+  // ... and never for a different file.
+  CHECK_FALSE(same_model_path("models/n.onnx", live.string(), td.path.string()));
+  CHECK_FALSE(same_model_path("m.onnx", live.string(), td.path.string()));
+  // The directory only matters for a RELATIVE path: an absolute one stands alone.
+  CHECK_FALSE(same_model_path((td.path / "other" / "m.onnx").string(), live.string(),
+                              td.path.string()));
+  CHECK(same_model_path(live.string(), live.string(), "/somewhere/else"));
+  // Empty stays empty.
+  CHECK_FALSE(same_model_path("", live.string(), td.path.string()));
+}
+
+TEST_CASE("read_view_file records where the file came from, so a relative model resolves") {
+  TempDir td("nv170_viewfile_srcdir");
+  const fs::path models = td.path / "models";
+  fs::create_directories(models);
+  write_file(models / "m.onnx", "x");
+  const fs::path vf = td.path / "v.netvis-view";
+  write_file(vf, doc("\"model\":\"models/m.onnx\",\"selected_ir_node\":2"));
+
+  const ViewFileLoad l = read_view_file(vf.string());
+  REQUIRE(l.ok());
+  CHECK(l.file.model == "models/m.onnx");
+  CHECK_FALSE(l.file.source_dir.empty());
+  CHECK(same_model_path(l.file.model, (models / "m.onnx").string(), l.file.source_dir));
+  // From bytes there is no directory.
+  CHECK(parse(doc("\"model\":\"models/m.onnx\"")).file.source_dir.empty());
+  // The directory is not part of the format: it is never written.
+  CHECK_FALSE(has(serialize_view_file(l.file), "source_dir"));
+}
+
+TEST_CASE("model_path_for_view_file: relative when the model sits inside the view file's directory") {
+  TempDir td("nv170_modelpath_rel");
+  const fs::path dir = td.path;
+  const std::string view = (dir / "v.netvis-view").string();
+
+  CHECK(model_path_for_view_file((dir / "m.onnx").string(), view) == "m.onnx");
+  CHECK(model_path_for_view_file((dir / "models" / "m.onnx").string(), view) == "models/m.onnx");
+  // A bundle with a trailing separator is the same bundle.
+  CHECK(model_path_for_view_file((dir / "b.mlpackage").string() + "/", view) == "b.mlpackage");
+  // Outside the directory (a sibling, or the parent): unchanged, absolute as it was.
+  const std::string sibling = (dir.parent_path() / "elsewhere" / "m.onnx").string();
+  CHECK(model_path_for_view_file(sibling, view) == sibling);
+  const std::string parent_model = (dir.parent_path() / "m.onnx").string();
+  CHECK(model_path_for_view_file(parent_model, view) == parent_model);
+  // The directory itself is not "inside" itself.
+  CHECK(model_path_for_view_file(dir.string(), view) == dir.string());
+  // Nothing to do for the empty cases.
+  CHECK(model_path_for_view_file("", view).empty());
+  CHECK(model_path_for_view_file("/a/m.onnx", "") == "/a/m.onnx");
+  // And the pair round-trips: what was written resolves back to the same file.
+  const std::string rel = model_path_for_view_file((dir / "models" / "m.onnx").string(), view);
+  fs::create_directories(dir / "models");
+  write_file(dir / "models" / "m.onnx", "x");
+  CHECK(same_model_path(rel, (dir / "models" / "m.onnx").string(), dir.string()));
+}
+
+TEST_CASE("serialize_view_file: readable when it fits, compact when the readable form would not load back") {
+  // A normal file is indented for people.
+  {
+    ViewFile f;
+    f.model = "/m.onnx";
+    f.expanded = std::vector<bool>{true, false};
+    const std::string text = serialize_view_file(f);
+    CHECK(has(text, "\n  \"kind\""));
+  }
+  // 500k groups: ~11 bytes each indented is 5.5 MB, over the 4 MiB cap the reader
+  // enforces (so a save would have written a file this build refuses to load); the
+  // compact form (~6 bytes each) fits, and loads.
+  {
+    ViewFile f;
+    f.expanded = std::vector<bool>(500000, false);
+    const std::string text = serialize_view_file(f);
+    REQUIRE(text.size() <= kMaxViewFileBytes);
+    CHECK_FALSE(has(text, "\n"));
+    const ViewFileLoad l = parse(text);
+    REQUIRE(l.ok());
+    REQUIRE(l.file.expanded);
+    CHECK(l.file.expanded->size() == 500000);
+  }
+  // Past the cap even compactly, the text comes back over the limit: documented, so the
+  // caller (App::save_view_state) checks and refuses rather than writing it.
+  {
+    ViewFile f;
+    f.expanded = std::vector<bool>(800000, false);
+    CHECK(serialize_view_file(f).size() > kMaxViewFileBytes);
+  }
+}
+
+TEST_CASE("view_file_from_snapshot names everything it had to leave out") {
+  ViewSnapshot s;
+  s.search_query = std::string(kMaxViewFileString + 1, 'q');
+  s.attr_filter = std::string(kMaxViewFileString + 1, 'a');
+  s.table_filter = std::string(kMaxViewFileString + 1, 't');
+  for (uint32_t i = 0; i < kMaxViewFilePinned + 7; ++i) s.pinned.push_back(i);
+  s.expanded.assign(kMaxViewFileGroups + 1, true);
+
+  std::vector<std::string> dropped;
+  const ViewFile f = view_file_from_snapshot(s, std::string(kMaxViewFileString + 1, 'm'), 0,
+                                             HeatmapMetric::Flops, true, &dropped);
+  CHECK(f.model.empty());
+  CHECK_FALSE(f.search_query);
+  CHECK_FALSE(f.attr_filter);
+  CHECK_FALSE(f.table_filter);
+  CHECK_FALSE(f.expanded);
+  CHECK(f.pinned->size() == kMaxViewFilePinned);
+  CHECK(any_note_has(dropped, "model path"));
+  CHECK(any_note_has(dropped, "search_query"));
+  CHECK(any_note_has(dropped, "attr_filter"));
+  CHECK(any_note_has(dropped, "table_filter"));
+  CHECK(any_note_has(dropped, "collapse state"));
+  CHECK(any_note_has(dropped, "pinned"));
+  CHECK(dropped.size() == 6);
+
+  // Nothing over a limit: nothing to report. And a null `dropped` is fine.
+  std::vector<std::string> none;
+  (void)view_file_from_snapshot(ViewSnapshot{}, "/m.onnx", 0, HeatmapMetric::Flops, true, &none);
+  CHECK(none.empty());
+  CHECK_NOTHROW((void)view_file_from_snapshot(s, "/m.onnx", 0, HeatmapMetric::Flops, true));
+}
+
+TEST_CASE("json_nesting_ok: with comments allowed, a quote in a comment cannot hide the brackets") {
+  const std::string deep = std::string(100, '[') + std::string(100, ']');
+
+  // The attack the review found: a comment holding a lone quote flips a naive scan
+  // into string mode, so the 100 real brackets after it are never counted.
+  const std::string line = "// \"\n" + deep;
+  const std::string block = "/* \" */" + deep;
+  CHECK_FALSE(json_nesting_ok(line, 64, /*allow_comments=*/true));
+  CHECK_FALSE(json_nesting_ok(block, 64, /*allow_comments=*/true));
+  // \r also ends a line comment (as in nlohmann's lexer).
+  CHECK_FALSE(json_nesting_ok("// \"\r" + deep, 64, true));
+
+  // Brackets INSIDE a comment are not nesting.
+  CHECK(json_nesting_ok("// " + deep + "\n[]", 64, true));
+  CHECK(json_nesting_ok("/* " + deep + " */ []", 64, true));
+  // A comment marker inside a string is just text; the real nesting after it counts.
+  CHECK(json_nesting_ok("{\"url\":\"http://example.com/[[[[[[\"}", 1, true));
+  CHECK_FALSE(json_nesting_ok("{\"u\":\"//\",\"a\":" + deep + "}", 8, true));
+  CHECK_FALSE(json_nesting_ok("{\"u\":\"/*\",\"a\":" + deep + "}", 8, true));
+  // An unterminated block comment is a parse error for the real parser: nothing to count.
+  CHECK(json_nesting_ok("/* " + deep, 8, true));
+  // A lone '/' at the very end, and '/' followed by something else, are harmless.
+  CHECK(json_nesting_ok("[/", 8, true));
+  CHECK(json_nesting_ok("[/x]", 8, true));
+
+  // The default is unchanged: a comment-rejecting parser (the view-file reader) never
+  // gets as far as the brackets, so the scan stays the plain one.
+  CHECK(json_nesting_ok("[[[]]]", 3));
+  CHECK_FALSE(json_nesting_ok("[[[[]]]]", 3));
+  CHECK_FALSE(json_nesting_ok(deep, 64));
 }

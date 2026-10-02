@@ -114,6 +114,10 @@ int run_screenshot_cli(int argc, char** argv) {
   };
 
   ScreenshotArgs args = parse_screenshot_args(argc, argv);
+  if (args.help) {  // an explicit request for help is the one thing printed on stdout
+    std::fwrite(kScreenshotUsage.data(), 1, kScreenshotUsage.size(), stdout);
+    return 0;
+  }
   if (args.status != ScreenshotExit::Ok) return report(args);
   args = resolve_screenshot_paths(args.options);
   if (args.status != ScreenshotExit::Ok) return report(args);
@@ -147,6 +151,8 @@ int main(int argc, char** argv) {
     if (!conflict.empty()) {
       std::fprintf(stderr, "netvis --screenshot: error: cannot be combined with %s\n",
                    conflict.c_str());
+      // A usage error like any other (exit 2), so it prints the usage too.
+      std::fwrite(netvis::kScreenshotUsage.data(), 1, netvis::kScreenshotUsage.size(), stderr);
       return netvis::exit_code(netvis::ScreenshotExit::Usage);
     }
     return run_screenshot_cli(argc, argv);

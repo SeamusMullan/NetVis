@@ -23,6 +23,7 @@
 // live value, the rest apply), so one stale key never costs a user their file.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -40,6 +41,14 @@ inline constexpr int kMaxViewFileDepth = 8;                        // brace/brac
 inline constexpr size_t kMaxViewFileString = 4096;                 // model, search_query, ...
 inline constexpr size_t kMaxViewFileGroups = 1048576;              // `expanded` entries
 inline constexpr size_t kMaxViewFilePinned = 4096;                 // `pinned` entries
+// The char buffers the filter boxes edit through (including the NUL), in
+// view/PropertiesPanel.cpp, view/SearchBar.cpp and view/TensorTable.cpp. A filter
+// the file restores must fit its box, or the box would show (and, on the first
+// keystroke, silently cut) a different string from the one that is filtering. The
+// reader trims longer ones to fit and says so.
+inline constexpr size_t kAttrFilterUiBytes = 64;
+inline constexpr size_t kSearchQueryUiBytes = 256;
+inline constexpr size_t kTableFilterUiBytes = 256;
 // Same bounds as view/Camera.cpp's kMinZoom/kMaxZoom (the camera clamps to these
 // on every interaction, so a file may not ask for more).
 inline constexpr float kViewFileMinZoom = 0.02f;
@@ -53,6 +62,10 @@ enum class CollapseShorthand : uint8_t { All, None };
 // exception only because "" already means "no model recorded".
 struct ViewFile {
   std::string model;                                   // "" when absent
+  // The directory the file was read from (read_view_file), "" when it came from
+  // bytes. Not part of the format: a RELATIVE `model` is also tried against it, so a
+  // view file committed beside its model, or saved on another machine, still finds it.
+  std::string source_dir;
   std::optional<uint32_t> graph;                       // model-specific (subgraph dive)
 
   // cam.* — each key independent, as in v1.
@@ -114,20 +127,41 @@ ViewFileLoad read_view_file(const std::string& path);
 
 // Deterministic JSON (nlohmann sorts keys) for every PRESENT field. Written with the
 // `replace` UTF-8 error handler: the document carries a model PATH, which is not
-// guaranteed to be valid UTF-8 on Linux, and a save must not throw.
+// guaranteed to be valid UTF-8 on Linux, and a save must not throw. Indented for
+// people to read, unless that form would exceed kMaxViewFileBytes (a model with
+// hundreds of thousands of collapse groups): then the compact form, which is about
+// half the size. If even that is over the limit the text is still returned, and the
+// caller must check `size() <= kMaxViewFileBytes` before writing a file that this
+// build would refuse to load.
 std::string serialize_view_file(const ViewFile& f);
 
 // The view file that reproduces `s`. Sets every field except `collapse` (a hand-
 // written convenience that a snapshot, which has the full bitset, never needs).
+// Anything the reader would reject as over-limit (a path or filter longer than
+// kMaxViewFileString, more than kMaxViewFileGroups groups) is left OUT and, when
+// `dropped` is given, named there, as is a `pinned` list cut to kMaxViewFilePinned.
 ViewFile view_file_from_snapshot(const ViewSnapshot& s, const std::string& model_path,
                                  uint32_t graph, HeatmapMetric heatmap_metric,
-                                 bool heatmap_log_scale);
+                                 bool heatmap_log_scale,
+                                 std::vector<std::string>* dropped = nullptr);
+
+// The "model" string to record in a view file saved at `view_file_path` for the model
+// at `model_path`: the path RELATIVE to the view file's directory when the model sits
+// inside that directory (so the pair can be committed together or moved between
+// machines), otherwise `model_path` unchanged. Lexical only: nothing is resolved
+// through links and the file system is not consulted beyond making paths absolute.
+std::string model_path_for_view_file(const std::string& model_path,
+                                     const std::string& view_file_path);
 
 // Is `saved` (the file's "model") the same model as `live`? false if either is empty;
 // otherwise compares weakly_canonical forms, so `./m.onnx` and `/abs/m.onnx` match
 // (the #56 reader used plain string equality and they did not); falls back to string
-// equality if canonicalisation fails.
-bool same_model_path(const std::string& saved, const std::string& live);
+// equality if canonicalisation fails. A RELATIVE `saved` is tried against the process
+// working directory (what #56 and its relative-path files meant) and, when
+// `view_dir` is not empty, against `view_dir` (what a hand-written or committed file
+// means); either one naming the live file is a match.
+bool same_model_path(const std::string& saved, const std::string& live,
+                     const std::string& view_dir = std::string());
 
 // --- Overlay: which parts of the file apply to THIS model? ----------------------
 
@@ -166,5 +200,34 @@ struct ViewOverlayResult {
 ViewOverlayResult overlay_view_file(const ViewFile& f, const ViewSnapshot& base,
                                     bool same_model, uint32_t node_count,
                                     uint32_t value_count);
+
+// --- What the user is told after File > Load View State -------------------------
+
+// How much of the file applied (drives the toast text).
+enum class ViewApplyOutcome : uint8_t {
+  Full,        // same model: everything that was in range applied
+  OtherModel,  // another model: the model-independent settings applied
+  NoModel,     // nothing loaded yet: the model-independent settings applied
+  Failed,      // the model-specific half was refused (the model or graph moved under it)
+};
+
+struct ViewLoadToast {
+  std::string text;
+  bool is_error = false;
+};
+
+// At most this many ignored-setting notes get a toast of their own; the rest are
+// summarised, so a badly stale file cannot bury the window in toasts.
+inline constexpr size_t kViewLoadMaxNoteToasts = 3;
+
+// The three strings #56 introduced (plus "could not be applied" for Failed).
+const char* view_file_outcome_text(ViewApplyOutcome o);
+
+// The toasts for a finished load, in display order. `notes` is everything the load
+// ignored and why (parse warnings, then overlay notes). A load that dropped
+// settings must not read as a clean success: the first toast says how many, and the
+// notes follow (capped). Failed is a single error toast and ignores `notes`.
+std::vector<ViewLoadToast> view_load_toasts(ViewApplyOutcome o,
+                                            const std::vector<std::string>& notes);
 
 }  // namespace netvis

@@ -45,6 +45,7 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#include "imgui_internal.h"  // FindWindowByName: the stray-window check after the last frame
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -114,7 +115,7 @@ int App::capture_body(const ScreenshotOptions& opt, const ViewFile* view_file) {
   view().dark_theme = opt.dark_theme;
   apply_theme(opt.dark_theme);
   session().set_layout_cache_enabled(opt.use_layout_cache);
-  tabs_[active_tab_]->title = fs::path(opt.model_path).filename().string();
+  tabs_[active_tab_]->title = screenshot_display_name(opt.model_path);
 
   const auto deadline = Clock::now() + std::chrono::seconds(opt.timeout_s);
 
@@ -160,7 +161,9 @@ int App::capture_body(const ScreenshotOptions& opt, const ViewFile* view_file) {
     }
   };
 
-  // Map a settled gate to "carry on" (-1) or the exit code to return.
+  // Map a settled gate to "carry on" (-1) or the exit code to return. It runs after the
+  // load and again after a view file is applied, so a note is said once.
+  bool noted_empty = false;
   auto settle = [&](CaptureGate g) -> int {
     switch (g) {
       case CaptureGate::Ready: return -1;
@@ -175,7 +178,8 @@ int App::capture_body(const ScreenshotOptions& opt, const ViewFile* view_file) {
                         "' has no compute graph (weights-only); --canvas-only has nothing to draw");
       case CaptureGate::EmptyGraph:
         if (opt.canvas_only) return fail(ScreenshotExit::Load, "the graph has no nodes");
-        say("note", "the graph has no nodes; capturing the empty canvas");
+        if (!noted_empty) say("note", "the graph has no nodes; capturing the empty canvas");
+        noted_empty = true;
         return -1;
     }
     return -1;
@@ -205,6 +209,10 @@ int App::capture_body(const ScreenshotOptions& opt, const ViewFile* view_file) {
       if (Clock::now() >= deadline) return timeout_while_loading();
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    // apply_view refused (the model or graph moved under the load): nothing of the
+    // model-specific half applied, and a picture of the wrong state is not evidence.
+    if (applier.outcome == ViewApplyOutcome::Failed)
+      return fail(ScreenshotExit::View, view_file_outcome_text(applier.outcome));
     for (const std::string& n : applier.notes) say("note", n);
   }
 
@@ -257,6 +265,18 @@ int App::capture_body(const ScreenshotOptions& opt, const ViewFile* view_file) {
       dd->DisplaySize.y != static_cast<float>(opt.height) || dd->FramebufferScale.x != 1.0f ||
       dd->FramebufferScale.y != 1.0f) {
     return fail(ScreenshotExit::Graphics, "the rendered frame is not the requested size");
+  }
+
+  // A widget drawn outside any window lands in ImGui's implicit "Debug##Default"
+  // window (400x400 at (60,60) when there is no imgui.ini, as here), on top of the
+  // canvas. ImGui hides that window when nothing was written into it, so an active
+  // one in the last frame means some panel has a stray widget and the picture has a
+  // stray window in it. Say so; the picture is still written.
+  if (const ImGuiWindow* dbg = ImGui::FindWindowByName("Debug##Default");
+      dbg != nullptr && dbg->Active) {
+    say("note",
+        "the capture contains ImGui's implicit 'Debug' window (a widget was drawn "
+        "outside any window)");
   }
 
   // --- CAPTURE ------------------------------------------------------------------

@@ -58,10 +58,12 @@ class OffscreenTarget {
   std::string error_;
 };
 
-// Encode `rgb` (width*height*3, top-down) as a PNG and write it to `path`
-// ATOMICALLY: the bytes go to `<path>.netvis-tmp`, which is then renamed over the
-// target, so a failed run never truncates or replaces a good PNG. On failure
-// returns false, sets `error`, and removes the temp file.
+// Encode `rgb` (width*height*3, top-down) as a PNG and write it to `path` with
+// engine/ScreenshotCli.h's write_screenshot_png: atomically, through an
+// exclusively-created temp file with an unpredictable name (so a planted symlink is
+// never followed), never truncating or replacing a good PNG on failure. Only the
+// stb encoding is here; every file rule is core and unit-tested. On failure returns
+// false and sets `error`.
 bool write_png_rgb(const std::string& path, const std::vector<uint8_t>& rgb, uint32_t width,
                    uint32_t height, std::string& error);
 

@@ -293,7 +293,12 @@ LoadedManifest load_manifest_file(const std::string& path, bool register_into) {
   }
   // Pre-scan nesting BEFORE nlohmann::parse (it has no built-in limit; a deep file
   // could stack-overflow the recursive parser). [critique-fix]
-  if (!json_nesting_ok(text, 64)) { lm.error = "manifest nesting too deep"; return lm; }
+  // The parse below ignores comments, so the scan must skip them too: a quote inside a
+  // comment would otherwise hide the brackets after it from the depth count.
+  if (!json_nesting_ok(text, 64, /*allow_comments=*/true)) {
+    lm.error = "manifest nesting too deep";
+    return lm;
+  }
 
   json j = json::parse(text, nullptr, /*allow_exceptions=*/false, /*ignore_comments=*/true);
   if (j.is_discarded()) { lm.error = "JSON parse error"; return lm; }

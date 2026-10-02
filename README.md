@@ -238,7 +238,7 @@ netvis --screenshot heat.png --view heatmap.netvis-view --fit model.onnx
 
 | Flag | Meaning |
 |---|---|
-| `--screenshot <out.png>` | Output file. Written atomically; an existing file is replaced only if it is a PNG. |
+| `--screenshot <out.png>` | Output file; the name must end in `.png`. Written atomically through a temporary file next to it; an existing file is replaced only if it is a PNG (a symbolic link at the path is replaced, never written through). |
 | `--size WxH` | Pixels, 64–8192 per side (default `1600x1000`). |
 | `--view <file>` | Apply a view-state file saved with File → Save View State… |
 | `--fit` | Fit the graph to the canvas even if the view file stores a camera. |
@@ -246,6 +246,7 @@ netvis --screenshot heat.png --view heatmap.netvis-view --fit model.onnx
 | `--theme dark\|light` | Colour theme (default `dark`). |
 | `--timeout <s>` | Give up after this many seconds of loading (default 120, max 3600). |
 | `--no-layout-cache` | Recompute the layout instead of using the layout cache. |
+| `--help`, `-h` | Print the usage on stdout and exit 0. |
 
 Exit codes: `0` written, `2` bad arguments, `3` the model failed to open or lay out
 (or `--canvas-only` on a weights-only file), `4` bad view file, `5` timed out, `6`
@@ -255,16 +256,38 @@ A view file sets the camera, collapse state (`"collapse": "all"` works on any
 model), edge routing, cost heatmap and metric, critical path, navigation mode,
 selection and filters. Save one from the GUI, or write the keys you need by hand.
 Model-specific keys (selection, collapse bitset, pins) apply only when the file's
-`"model"` names the model being captured. The camera is relative to the canvas
-it was saved from, so add `--fit` when reusing a GUI-saved view at another size.
+`"model"` names the model being captured. A relative `"model"` is read relative to
+the view file's own directory, and File → Save View State… writes the model
+relative to the file when the model sits inside the file's directory, so a view
+file can be committed next to its model and used from any checkout. A filter longer
+than its box in the UI (64 bytes for the attribute filter, 256 for search and the
+tensor table) is cut to fit, with a note on stderr. The camera is relative to the
+canvas it was saved from, so add `--fit` when reusing a GUI-saved view at another
+size. In the GUI, File → Load View State… changes the live view, including the
+settings that are also saved preferences (edge routing, heatmap metric and scale,
+cost heatmap, layer bands); the next time you change any View-menu setting, the
+view as it then is, loaded values included, is saved as your defaults. `--screenshot`
+never reads or writes preferences.
 
 Screenshot mode ignores your saved preferences, recent files, `imgui.ini` and
 installed plugins, so a command produces the same picture every time on the same
 machine. Fonts and GL drivers differ between machines, so do not expect identical
 pixels across them. `--canvas-only` output is identical run to run. Full-window
-captures include the status bar's live load timings and so differ slightly. For
+captures include the status bar's live load timings and so differ slightly; the
+status bar shows the model's file name, never its absolute path, so a picture
+does not depend on where the repository is checked out or leak your user name.
+Full-window captures leave out the row of model tabs for now (it is drawn into an
+implicit ImGui window that would otherwise sit on top of the canvas). For
 before/after images of a layout change, pass `--no-layout-cache` so a layout
 cached by another build cannot stand in for the new one.
+
+A capture fits the whole graph into the requested size, so a large graph at the
+default `1600x1000` is drawn below the zoom at which node labels appear (a 38-node
+model shows unlabelled boxes). For a readable picture of a big model, ask for a
+larger `--size`, collapse repeated blocks (`"collapse": "all"` in a view file), or
+store a camera in a view file. Loading reads no weight payloads: the only bytes
+read are the shape constants (at most 64 elements each) that ONNX shape inference
+reads, exactly as in the GUI. An `8192x8192` capture peaks at about 600 MB.
 
 It needs OpenGL 3.3 and a window system, though the window stays hidden. On
 macOS run the binary inside the bundle

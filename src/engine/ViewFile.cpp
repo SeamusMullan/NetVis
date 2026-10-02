@@ -142,6 +142,20 @@ void read_opt_string(Ctx& c, const json& o, const char* key, std::optional<std::
   if (read_string(c, o, key, v)) dst = std::move(v);
 }
 
+// A filter string restored into a UI char buffer of `buf_bytes` (NUL included): cut it
+// to what the box can hold, at a UTF-8 character boundary, and warn. The box would
+// otherwise show a prefix of the string that is actually filtering.
+void fit_ui_text(Ctx& c, const char* key, std::optional<std::string>& v, size_t buf_bytes) {
+  if (!v || v->size() < buf_bytes) return;
+  const size_t was = v->size();
+  size_t cut = buf_bytes - 1;
+  while (cut > 0 && (static_cast<unsigned char>((*v)[cut]) & 0xC0u) == 0x80u) --cut;
+  v->resize(cut);
+  c.warnings.push_back("'" + std::string(key) + "' is " + std::to_string(was) +
+                       " bytes but the filter box holds " + std::to_string(buf_bytes - 1) +
+                       "; cut to fit");
+}
+
 template <typename T>
 void read_opt_int(Ctx& c, const json& o, const char* key, int64_t lo, int64_t hi,
                   std::optional<T>& dst) {
@@ -340,6 +354,9 @@ ViewFileLoad parse_view_file(std::string_view bytes) {
   read_opt_string(c, root, "search_query", f.search_query);
   read_opt_string(c, root, "attr_filter", f.attr_filter);
   read_opt_string(c, root, "table_filter", f.table_filter);
+  fit_ui_text(c, "search_query", f.search_query, kSearchQueryUiBytes);
+  fit_ui_text(c, "attr_filter", f.attr_filter, kAttrFilterUiBytes);
+  fit_ui_text(c, "table_filter", f.table_filter, kTableFilterUiBytes);
 
   read_collapse(c, root, f);
   read_expanded(c, root, f);
@@ -382,7 +399,14 @@ ViewFileLoad read_view_file(const std::string& path) {
     if (static_cast<uintmax_t>(f.gcount()) != size)
       return io_fail(ViewFileErrorKind::Io, "short read on view file '" + path + "'");
   }
-  return parse_view_file(buf);
+  ViewFileLoad parsed = parse_view_file(buf);
+  if (parsed.ok()) {
+    // Where a relative "model" is also looked for (see ViewFile::source_dir).
+    std::error_code abs_ec;
+    const fs::path abs = fs::absolute(fs::path(path), abs_ec);
+    if (!abs_ec) parsed.file.source_dir = abs.parent_path().string();
+  }
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -444,16 +468,27 @@ std::string serialize_view_file(const ViewFile& f) {
   // `replace`, not the default strict handler: the document carries a model PATH,
   // which is not guaranteed to be valid UTF-8 on Linux, and strict would throw out
   // of a save the user explicitly asked for.
-  return j.dump(2, ' ', false, json::error_handler_t::replace);
+  //
+  // Indented, which costs ~11 bytes per `expanded` entry ("    false,\n"): over the
+  // reader's 4 MiB cap from ~380k groups. Past the cap use the compact form (~6 bytes
+  // per entry) rather than write a file this build then refuses to load.
+  std::string pretty = j.dump(2, ' ', false, json::error_handler_t::replace);
+  if (pretty.size() <= kMaxViewFileBytes) return pretty;
+  return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 ViewFile view_file_from_snapshot(const ViewSnapshot& s, const std::string& model_path,
                                  uint32_t graph, HeatmapMetric heatmap_metric,
-                                 bool heatmap_log_scale) {
+                                 bool heatmap_log_scale, std::vector<std::string>* dropped) {
   ViewFile f;
-  // Anything the reader would reject as over-limit is left OUT, so a save can never
-  // write a file this build then refuses to load.
+  auto drop = [dropped](std::string what) {
+    if (dropped != nullptr) dropped->push_back(std::move(what));
+  };
+  // Anything the reader would reject as over-limit is left OUT (and named), so a save
+  // does not write a file this build then refuses to load. The size of the finished
+  // text is the caller's check (serialize_view_file).
   if (model_path.size() <= kMaxViewFileString) f.model = model_path;
+  else drop("the model path is longer than " + std::to_string(kMaxViewFileString) + " bytes");
   f.graph = graph;
   f.pan_x = s.pan_x;
   f.pan_y = s.pan_y;
@@ -476,39 +511,76 @@ ViewFile view_file_from_snapshot(const ViewSnapshot& s, const std::string& model
   f.nav_hops = s.nav_hops;
   f.nav_mode = s.nav_mode;
 
-  if (s.search_query.size() <= kMaxViewFileString) f.search_query = s.search_query;
-  if (s.attr_filter.size() <= kMaxViewFileString) f.attr_filter = s.attr_filter;
-  if (s.table_filter.size() <= kMaxViewFileString) f.table_filter = s.table_filter;
+  auto text = [&](const std::string& v, std::optional<std::string>& dst, const char* name) {
+    if (v.size() <= kMaxViewFileString) dst = v;
+    else drop(std::string("'") + name + "' is longer than " + std::to_string(kMaxViewFileString) + " bytes");
+  };
+  text(s.search_query, f.search_query, "search_query");
+  text(s.attr_filter, f.attr_filter, "attr_filter");
+  text(s.table_filter, f.table_filter, "table_filter");
 
   if (s.expanded.size() <= kMaxViewFileGroups) f.expanded = s.expanded;
+  else drop("the collapse state (" + std::to_string(s.expanded.size()) + " groups, the limit is " +
+            std::to_string(kMaxViewFileGroups) + ")");
   f.selected_ir_node = s.selected_ir_node;
   f.selected_value = s.selected_value;
   f.path_a = s.path_a;
   f.path_b = s.path_b;
   std::vector<uint32_t> pins = s.pinned;
-  if (pins.size() > kMaxViewFilePinned) pins.resize(kMaxViewFilePinned);
+  if (pins.size() > kMaxViewFilePinned) {
+    drop("only the first " + std::to_string(kMaxViewFilePinned) + " of " +
+         std::to_string(pins.size()) + " pinned nodes");
+    pins.resize(kMaxViewFilePinned);
+  }
   f.pinned = std::move(pins);
   return f;
+}
+
+std::string model_path_for_view_file(const std::string& model_path,
+                                     const std::string& view_file_path) {
+  namespace fs = std::filesystem;
+  if (model_path.empty() || view_file_path.empty()) return model_path;
+  std::error_code e1, e2;
+  fs::path m = fs::absolute(fs::path(model_path), e1).lexically_normal();
+  const fs::path dir = fs::absolute(fs::path(view_file_path), e2).lexically_normal().parent_path();
+  if (e1 || e2 || dir.empty()) return model_path;
+  // `bundle.mlpackage/` and `bundle.mlpackage` are the same bundle.
+  if (!m.has_filename() && m.has_relative_path()) m = m.parent_path();
+  const fs::path rel = m.lexically_relative(dir);
+  if (rel.empty() || rel == "." || *rel.begin() == "..") return model_path;
+  return rel.generic_string();  // '/' separators on every platform, so the file travels
 }
 
 // ---------------------------------------------------------------------------
 // same_model_path
 // ---------------------------------------------------------------------------
-bool same_model_path(const std::string& saved, const std::string& live) {
+bool same_model_path(const std::string& saved, const std::string& live,
+                     const std::string& view_dir) {
   namespace fs = std::filesystem;
   if (saved.empty() || live.empty()) return false;
   if (saved == live) return true;
-  std::error_code e1, e2;
-  fs::path a = fs::weakly_canonical(fs::path(saved), e1);
-  fs::path b = fs::weakly_canonical(fs::path(live), e2);
-  if (e1 || e2) return false;  // the plain string comparison above already said no
+  std::error_code e;
   // `dir` and `dir/` are the same bundle: drop a trailing separator before comparing.
   auto strip = [](fs::path& p) {
     if (!p.has_filename() && p.has_relative_path()) p = p.parent_path();
   };
-  strip(a);
+  fs::path b = fs::weakly_canonical(fs::path(live), e);
+  if (e) return false;  // the plain string comparison above already said no
   strip(b);
-  return a == b;
+  auto names_live = [&](const fs::path& candidate) {
+    std::error_code ec;
+    fs::path a = fs::weakly_canonical(candidate, ec);
+    if (ec) return false;
+    strip(a);
+    return a == b;
+  };
+  const fs::path saved_path(saved);
+  if (names_live(saved_path)) return true;  // as written: absolute, or relative to the CWD
+  // A relative path in a file means "next to the file" to whoever wrote it by hand or
+  // committed it with its model.
+  if (!view_dir.empty() && saved_path.is_relative() && names_live(fs::path(view_dir) / saved_path))
+    return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +698,38 @@ ViewOverlayResult overlay_view_file(const ViewFile& f, const ViewSnapshot& base,
     s.pinned = std::move(kept);
   }
   return r;
+}
+
+const char* view_file_outcome_text(ViewApplyOutcome o) {
+  switch (o) {
+    case ViewApplyOutcome::Full: return "View loaded";
+    case ViewApplyOutcome::OtherModel: return "View loaded (camera only - saved for another model)";
+    case ViewApplyOutcome::NoModel: return "View loaded (open a model to restore selection)";
+    case ViewApplyOutcome::Failed: return "View could not be applied: the model or graph changed";
+  }
+  return "View loaded";
+}
+
+std::vector<ViewLoadToast> view_load_toasts(ViewApplyOutcome o,
+                                            const std::vector<std::string>& notes) {
+  std::vector<ViewLoadToast> out;
+  if (o == ViewApplyOutcome::Failed) {
+    out.push_back({view_file_outcome_text(o), true});
+    return out;
+  }
+  std::string head = view_file_outcome_text(o);
+  // The other two outcomes already say what was left out; a full load that dropped
+  // settings must not read as a clean success.
+  if (o == ViewApplyOutcome::Full && !notes.empty()) {
+    head += " (" + std::to_string(notes.size()) +
+            (notes.size() == 1 ? " setting ignored)" : " settings ignored)");
+  }
+  out.push_back({std::move(head), false});
+  const size_t shown = std::min(notes.size(), kViewLoadMaxNoteToasts);
+  for (size_t i = 0; i < shown; ++i) out.push_back({notes[i], false});
+  if (notes.size() > shown)
+    out.push_back({"... and " + std::to_string(notes.size() - shown) + " more ignored", false});
+  return out;
 }
 
 }  // namespace netvis

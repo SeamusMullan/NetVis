@@ -98,7 +98,10 @@ TEST_CASE("screenshot gate: model_blocks.onnx has the shape the tests assume") {
   REQUIRE(model.has_graph);
   REQUIRE(model.graphs.size() == 1);
   CHECK(model.graphs[0].nodes.size() == 38);
-  CHECK(ByteReader::payload_read_counter() == 0);  // zero tensor payload bytes read
+  // The PARSE reads zero tensor payload bytes. (A session's later shape inference does
+  // read shape-constant initializers of at most 64 elements, as in the GUI; this
+  // fixture has none, so this check says nothing about that step.)
+  CHECK(ByteReader::payload_read_counter() == 0);
 
   CollapseTree tree;
   tree.build(model, 0);
