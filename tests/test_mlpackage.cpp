@@ -39,7 +39,11 @@ TEST_CASE("mlpackage: resolve_model_path finds inner model.mlmodel") {
   CHECK(resolved.display_path == kBundlePath);
 
   // map_path must end with Data/com.apple.CoreML/model.mlmodel and exist.
-  CHECK(resolved.map_path.ends_with("Data/com.apple.CoreML/model.mlmodel"));
+  // generic_string(): path joins use the native separator, so on Windows the
+  // result mixes '\\' (between joined components) with the manifest's '/'.
+  CHECK(std::filesystem::path(resolved.map_path)
+            .generic_string()
+            .ends_with("Data/com.apple.CoreML/model.mlmodel"));
   CHECK(std::filesystem::exists(resolved.map_path));
 
   // The map_path must be an actual file, not a directory.

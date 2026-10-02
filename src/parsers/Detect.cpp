@@ -78,6 +78,41 @@ bool read_varint(const uint8_t* d, uint64_t size, uint64_t& off, uint64_t& out) 
   return false;
 }
 
+// True when [off, off+len) lies inside [0, size). Overflow-safe: a hostile
+// length varint runs up to 2^64-1, so the naive `off + len > size` wraps around
+// and waves it through.
+bool fits(uint64_t off, uint64_t len, uint64_t size) {
+  return off <= size && len <= size - off;
+}
+
+// Step `off` over the payload of one protobuf field of wire type `wire` (its tag
+// already consumed). False on a truncated payload or a wire type that cannot
+// start a field, so a scan stops on anything that is not well-formed.
+bool skip_pb_value(const uint8_t* d, uint64_t size, uint32_t wire, uint64_t& off) {
+  switch (wire) {
+    case 0: {  // varint
+      uint64_t v;
+      return read_varint(d, size, off, v);
+    }
+    case 1:  // 64-bit
+      if (!fits(off, 8, size)) return false;
+      off += 8;
+      return true;
+    case 2: {  // length-delimited
+      uint64_t len;
+      if (!read_varint(d, size, off, len) || !fits(off, len, size)) return false;
+      off += len;
+      return true;
+    }
+    case 5:  // 32-bit
+      if (!fits(off, 4, size)) return false;
+      off += 4;
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Heuristic: does the buffer look like a top-level protobuf ModelProto?
 // We scan a few top-level fields and require valid wire types with no overrun.
 // ONNX ModelProto has field 1 (ir_version, varint) or field 7 (graph,
@@ -108,7 +143,7 @@ bool looks_like_onnx_proto(const uint8_t* d, uint64_t size) {
       case 2: {  // length-delimited
         uint64_t len;
         if (!read_varint(d, size, off, len)) return false;
-        if (off + len > size) return false;
+        if (!fits(off, len, size)) return false;
         // graph (7), opset_import (8), metadata_props (14), producer (2/3),
         // etc. are all length-delimited in ModelProto.
         if (field == 7 || field == 8) saw_signal = true;
@@ -255,7 +290,7 @@ bool looks_like_node_def(const uint8_t* d, uint64_t size) {
     if (field != static_cast<uint32_t>(i + 1) || wire != 2) return false;
     uint64_t len = 0;
     if (!read_varint(d, size, off, len)) return false;
-    if (len == 0 || off + len > size) return false;
+    if (len == 0 || !fits(off, len, size)) return false;
     off += len;
     ++seen;
   }
@@ -271,7 +306,7 @@ bool looks_like_graph_def(const uint8_t* d, uint64_t size) {
   if ((tag >> 3) != 1 || (tag & 0x7) != 2) return false;
   uint64_t len = 0;
   if (!read_varint(d, size, off, len)) return false;
-  if (len == 0 || off + len > size) return false;
+  if (len == 0 || !fits(off, len, size)) return false;
   return looks_like_node_def(d + off, len);
 }
 
@@ -291,12 +326,58 @@ bool looks_like_saved_model(const uint8_t* d, uint64_t size) {
   if ((tag >> 3) != 2 || (tag & 0x7) != 2) return false;
   uint64_t len = 0;
   if (!read_varint(d, size, off, len)) return false;
-  if (len == 0 || off + len > size) return false;
+  if (len == 0 || !fits(off, len, size)) return false;
   // First tag inside the MetaGraphDef.
   uint64_t inner = off;
   if (!read_varint(d, off + len, inner, tag)) return false;
   const uint32_t field = static_cast<uint32_t>(tag >> 3);
-  return (field == 1 || field == 2) && (tag & 0x7) == 2;
+  if (!((field == 1 || field == 2) && (tag & 0x7) == 2)) return false;
+  // A SavedModel's top level is ONLY schema_version (1) and meta_graphs (2).
+  // Any other well-formed top-level field means this is some other protobuf
+  // that happens to open the same way - an ONNX ModelProto (graph = 7, ...), or
+  // a CoreML Model (type oneof >= 200) - so refuse it. Bounded scan; a
+  // malformed tail stops the scan and leaves the verdict to the prefix above, so
+  // a truncated SavedModel still reaches the TensorFlow parser's own error.
+  off += len;
+  for (int i = 0; i < 32 && off < size; ++i) {
+    if (!read_varint(d, size, off, tag)) break;
+    const uint32_t f = static_cast<uint32_t>(tag >> 3);
+    if (f != 1 && f != 2) return false;
+    if (!skip_pb_value(d, size, static_cast<uint32_t>(tag & 0x7), off)) break;
+  }
+  return true;
+}
+
+// ---- CoreML (#114) ---------------------------------------------------------
+// A CoreML `Model` opens exactly like a SavedModel and like an ONNX ModelProto:
+//   field 1  specificationVersion  (varint)
+//   field 2  description           (length-delimited; absent from some specs)
+// but the model itself is the `oneof Type`, whose members all live at field
+// numbers >= 200 (pipeline 200.., glm 300.., neuralNetwork 500, mlProgram 502,
+// ...), always length-delimited. Nothing else sniffed here reaches that high:
+// SavedModel uses fields 1-2, GraphDef 1-4, ONNX ModelProto at most the 20s.
+// So that field is a content signal that does not depend on the extension.
+//
+// Fields are emitted in field-number order, so the type member follows only
+// description and isUpdatable (10); a short bounded scan finds it, and skipping
+// each field is O(1) however large its payload is.
+bool looks_like_coreml(const uint8_t* d, uint64_t size) {
+  uint64_t off = 0;
+  uint64_t tag = 0;
+  if (!read_varint(d, size, off, tag)) return false;
+  if ((tag >> 3) != 1 || (tag & 0x7) != 0) return false;
+  uint64_t spec_version = 0;
+  if (!read_varint(d, size, off, spec_version)) return false;
+  for (int i = 0; i < 16 && off < size; ++i) {
+    if (!read_varint(d, size, off, tag)) return false;
+    const uint64_t field = tag >> 3;
+    const uint32_t wire = static_cast<uint32_t>(tag & 0x7);
+    // The member's payload is deliberately not bounds-checked here: a truncated
+    // .mlmodel is still a CoreML file, and the CoreML parser reports the cut.
+    if (field >= 200) return wire == 2;
+    if (!skip_pb_value(d, size, wire, off)) return false;
+  }
+  return false;
 }
 
 }  // namespace
@@ -390,23 +471,45 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::PyTorchLegacy;
   }
 
-  // TensorFlow (#107): a frozen GraphDef, or a SavedModel bundle's saved_model.pb.
-  // Both run BEFORE the ONNX structural sniff — a SavedModel would otherwise be
-  // claimed as ONNX (see looks_like_saved_model).
-  if (looks_like_graph_def(d, size) || looks_like_saved_model(d, size)) {
+  // TensorFlow GraphDef (#107): field 1 is a length-delimited NodeDef. CoreML's
+  // field 1 is a varint, so the two cannot collide, and the content wins over
+  // any extension - a frozen graph that happens to be named *.mlmodel is still
+  // a GraphDef.
+  if (looks_like_graph_def(d, size)) {
     reason = DetectReason::Structure;
     return Format::TensorFlow;
   }
 
-  // CoreML .mlmodel is a bare `Model` protobuf whose first field
-  // (specificationVersion, a field-1 varint) structurally mimics ONNX's
-  // ir_version, so a bare .mlmodel also satisfies looks_like_onnx_proto. The
-  // two are otherwise ambiguous, so the `.mlmodel` extension is the decisive
-  // tiebreaker (spec §5): a file carrying it routes to CoreML before the ONNX
-  // structural sniff below could claim it.
-  if (ext_hint == kCoreMLExtension) {
-    reason = DetectReason::Extension;
+  // CoreML .mlmodel is a bare `Model` protobuf whose first fields
+  // (specificationVersion varint, then a length-delimited `description`)
+  // structurally mimic ONNX's ir_version AND a SavedModel's schema_version, so a
+  // bare .mlmodel satisfies looks_like_onnx_proto and looks_like_saved_model
+  // alike: `description`'s own first field is length-delimited, which is exactly
+  // the shape looks_like_saved_model accepts for meta_graphs[0]. #107 put the
+  // TensorFlow sniff ahead of the extension guard, which routed every ordinary
+  // .mlmodel to the TensorFlow parser and failed the open with "SavedModel
+  // meta_graph carries no graph_def" (#114).
+  //
+  // Two signals, both tested BEFORE the SavedModel and ONNX sniffs:
+  //   - content: the `oneof Type` member at a field number >= 200
+  //     (looks_like_coreml), so a CoreML file is recognised without its suffix
+  //     (renamed, `model.bin`, an .mlpackage whose Manifest names an inner spec
+  //     without one);
+  //   - the `.mlmodel` extension, the tiebreaker for a spec that carries no
+  //     model type at all, which has no content signal to find (spec §5).
+  const bool coreml_ext = ext_hint == kCoreMLExtension;
+  if (coreml_ext || looks_like_coreml(d, size)) {
+    reason = coreml_ext ? DetectReason::Extension : DetectReason::Structure;
     return Format::CoreML;
+  }
+
+  // TensorFlow SavedModel bundle's saved_model.pb (#107). Runs BEFORE the ONNX
+  // structural sniff - a SavedModel would otherwise be claimed as ONNX (see
+  // looks_like_saved_model) - and AFTER the CoreML checks above, which it
+  // collides with.
+  if (looks_like_saved_model(d, size)) {
+    reason = DetectReason::Structure;
+    return Format::TensorFlow;
   }
 
   // ONNX: plausible top-level protobuf ModelProto. Runs after the .mlmodel

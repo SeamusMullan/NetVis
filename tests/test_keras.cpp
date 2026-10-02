@@ -17,6 +17,7 @@
 #include "core/MappedFile.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -102,6 +103,7 @@ TEST_CASE("Keras: truncated / garbage HDF5 fails cleanly, never crashes") {
   {
     std::string path =
         (std::filesystem::temp_directory_path() / "nv_keras_trunc.h5").string();
+    netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
     {
       std::ofstream out(path, std::ios::binary | std::ios::trunc);
       const char sig[9] = {(char)0x89, 'H', 'D', 'F', '\r', '\n', (char)0x1a, '\n', 0};
@@ -116,7 +118,6 @@ TEST_CASE("Keras: truncated / garbage HDF5 fails cleanly, never crashes") {
     if (res) {
       CHECK((*res).flat_tensors.empty());
     }
-    std::filesystem::remove(path);
   }
 
   CHECK(ByteReader::payload_read_counter() == 0);
