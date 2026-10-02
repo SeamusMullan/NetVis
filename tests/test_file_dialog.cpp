@@ -25,6 +25,7 @@ using netvis::detail::case_folded_glob;
 using netvis::detail::first_line;
 using netvis::detail::helper_globs;
 using netvis::detail::kdialog_filter;
+using netvis::detail::zenity_filters;
 using netvis::detail::strip_trailing_separators;
 using netvis::detail::suffix_of;
 using netvis::kDialogOnlyExtensions;
@@ -260,25 +261,74 @@ TEST_CASE("case_folded_glob leaves anything but a simple suffix glob alone") {
   CHECK(case_folded_glob("") == "");
 }
 
-TEST_CASE("helper_globs folds every open-filter glob and joins with spaces") {
-  CHECK(helper_globs({}) == "");
-  CHECK(helper_globs({"*.onnx", "*.h5"}) == "*.[oO][nN][nN][xX] *.[hH]5");
+TEST_CASE("helper_globs for Open folds every glob and joins with spaces") {
+  CHECK(helper_globs({}, true) == "");
+  CHECK(helper_globs({"*.onnx", "*.h5"}, true) == "*.[oO][nN][nN][xX] *.[hH]5");
   // Every extension the dialog offers is reachable in upper case too.
-  const std::string all = helper_globs(openable_patterns());
+  const std::string all = helper_globs(openable_patterns(), true);
   CHECK(all.find("*.[oO][nN][nN][xX]") != std::string::npos);
   CHECK(all.find("*.[mM][lL][pP][aA][cC][kK][aA][gG][eE]") != std::string::npos);
   CHECK(all.find("*.onnx") == std::string::npos);  // no case-sensitive leftovers
 }
 
-TEST_CASE("the kdialog filter offers All files after the model filter") {
-  // kdialog (KDE's first choice) has no second-filter flag: one argument holds
-  // newline-separated "globs|Description" entries. Without the second entry a
-  // plugin-only format could not be picked at all.
-  const std::string f = kdialog_filter("*.a *.b", "All supported models");
-  CHECK(f == "*.a *.b|All supported models\n*|All files");
+TEST_CASE("helper_globs for Save stays plain so the chooser can pick the extension") {
+  // KDE's KFileWidget skips any pattern with '[' or ']' when it decides which
+  // extension to append, and then checks for an existing file under the bare
+  // name; a folded Save glob would let "weights" silently replace weights.npy.
+  CHECK(helper_globs({}, false) == "");
+  CHECK(helper_globs({"*.npy", "*.bin"}, false) == "*.npy *.bin");
+  CHECK(helper_globs({"*.png"}, false) == "*.png");
+  CHECK(helper_globs({"*.netvis-view"}, false) == "*.netvis-view");
+  for (const char* pattern : {"*.npy", "*.bin", "*.png", "*.svg", "*.md", "*.tsv"}) {
+    const std::string g = helper_globs({pattern}, false);
+    CHECK(g == pattern);
+    CHECK(g.find('[') == std::string::npos);
+    CHECK(g.find(']') == std::string::npos);
+  }
+}
+
+TEST_CASE("the kdialog Open filter is Qt-style, with an All files entry after it") {
+  // kdialog turns every '|' into a newline and hands the result to
+  // QFileDialog::setNameFilter, which makes one filter per line. The KDE-style
+  // "globs|Description" would therefore yield a bogus filter named after the
+  // label; the Qt style "Description (globs)" has no '|' and arrives unchanged.
+  const std::string f = kdialog_filter("*.a *.b", "All supported models", true);
+  CHECK(f == "All supported models (*.a *.b)\nAll files (*)");
+  CHECK(f.find('|') == std::string::npos);
   const size_t nl = f.find('\n');
   REQUIRE(nl != std::string::npos);
   CHECK(f.find('\n', nl + 1) == std::string::npos);  // exactly two entries
-  CHECK(f.substr(0, nl) == "*.a *.b|All supported models");
-  CHECK(f.substr(nl + 1) == "*|All files");
+  CHECK(f.substr(0, nl) == "All supported models (*.a *.b)");
+  CHECK(f.substr(nl + 1) == "All files (*)");
+}
+
+TEST_CASE("the kdialog Open filter carries the case-folded globs inside the parentheses") {
+  const std::string f = kdialog_filter(helper_globs({"*.onnx", "*.h5"}, true),
+                                       netvis::kOpenFilterDescription, true);
+  CHECK(f ==
+        "All supported models (*.[oO][nN][nN][xX] *.[hH]5)\nAll files (*)");
+}
+
+TEST_CASE("the kdialog Save filter is the single plain filter, no All files entry") {
+  const std::string f = kdialog_filter("*.npy *.bin", "NumPy array", false);
+  CHECK(f == "*.npy *.bin|NumPy array");
+  CHECK(f.find('\n') == std::string::npos);
+  CHECK(f.find("All files") == std::string::npos);
+}
+
+TEST_CASE("the zenity filters: Open adds All files, Save keeps the model filter only") {
+  const std::vector<std::string> open =
+      zenity_filters("*.a *.b", "All supported models", true);
+  REQUIRE(open.size() == 2);
+  CHECK(open[0] == "--file-filter=All supported models | *.a *.b");
+  CHECK(open[1] == "--file-filter=All files | *");
+
+  const std::vector<std::string> save =
+      zenity_filters("*.npy *.bin", "NumPy array", false);
+  REQUIRE(save.size() == 1);
+  CHECK(save[0] == "--file-filter=NumPy array | *.npy *.bin");
+
+  // No globs, no filter at all (a chooser with nothing to filter on).
+  CHECK(zenity_filters("", "Anything", true).empty());
+  CHECK(zenity_filters("", "Anything", false).empty());
 }

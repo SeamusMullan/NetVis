@@ -87,9 +87,10 @@ inline std::string apply_default_extension(
 // "*.onnx" -> "*.[oO][nN][nN][xX]". The GTK and Qt choosers match a glob
 // case-sensitively on Linux, yet detection lowercases the extension, so
 // `Model.ONNX` opens by drag-and-drop but would be hidden by a plain "*.onnx"
-// filter. Only the Linux helper choosers get this (tinyfd's macOS path slices the
-// plain "*.ext" itself, so openable_patterns() stays plain). Anything that is not
-// a simple suffix glob is returned unchanged.
+// filter. Only the Linux helper choosers get this, and only for Open (see
+// helper_globs); tinyfd's macOS path slices the plain "*.ext" itself, so
+// openable_patterns() stays plain. Anything that is not a simple suffix glob is
+// returned unchanged.
 inline std::string case_folded_glob(const std::string& pattern) {
   if (suffix_of(pattern).empty()) return pattern;
   std::string out = "*.";
@@ -110,24 +111,58 @@ inline std::string case_folded_glob(const std::string& pattern) {
   return out;
 }
 
-// The space-separated, case-folded glob list the Linux helper choosers take.
-inline std::string helper_globs(const std::vector<std::string>& patterns) {
+// The space-separated glob list the Linux helper choosers take.
+//
+// Open (`open` true): case-folded, so `Model.ONNX` is listed under "All supported
+// models" the way detection treats it.
+//
+// Save (`open` false): the plain globs, never folded. A Save chooser uses its
+// filter to pick the extension it appends to a bare name, and KDE's KFileWidget
+// (what kdialog and qarma show on Plasma) deliberately skips any pattern holding
+// '[' or ']' when it works that out. A folded "*.[nN][pP][yY]" therefore stops it
+// appending ".npy" AND makes its overwrite check run on the bare name; NetVis
+// adds the suffix afterwards (apply_default_extension), so an existing "w.npy"
+// would be replaced without a prompt. Plain "*.npy" keeps both working.
+inline std::string helper_globs(const std::vector<std::string>& patterns,
+                                bool open) {
   std::string out;
   for (const std::string& p : patterns) {
     if (!out.empty()) out += ' ';
-    out += case_folded_glob(p);
+    out += open ? case_folded_glob(p) : p;
   }
   return out;
 }
 
-// kdialog takes ONE argument holding newline-separated "globs|Description"
-// entries. The model filter is followed by an "All files" entry so a format with
-// no listed extension (a WASM-plugin format, or a file detection would accept
-// under another name) can still be picked; the zenity family gets the same as a
-// second --file-filter.
+// kdialog takes ONE argument holding newline-separated filters.
+//
+// Open: Qt-style "Description (globs)" followed by "All files (*)", so a format
+// with no listed extension (a WASM-plugin format, or a file detection would
+// accept under another name) can still be picked. The Qt style is deliberate:
+// kdialog hands the argument to QFileDialog::setNameFilter after turning every
+// '|' into a newline, so the KDE-style "globs|Description" would become two
+// filters, the second one a glob list made of the words of the label (it would
+// match files literally named "All" or "files"). A filter without '|' reaches Qt
+// unchanged, and the Plasma platform theme reads the parenthesised globs.
+//
+// Save: the single "globs|Description" filter, as before #135. No "All files"
+// entry (a Save chooser has no use for one) and no change to what KDE's save
+// dialog does with the filter.
 inline std::string kdialog_filter(const std::string& globs,
-                                  const std::string& description) {
-  return globs + "|" + description + "\n*|All files";
+                                  const std::string& description, bool open) {
+  if (!open) return globs + "|" + description;
+  return description + " (" + globs + ")\nAll files (*)";
+}
+
+// The repeated --file-filter arguments of the zenity family. Open gets the model
+// filter followed by an "All files" entry; Save gets the model filter only.
+inline std::vector<std::string> zenity_filters(const std::string& globs,
+                                               const std::string& description,
+                                               bool open) {
+  std::vector<std::string> out;
+  if (globs.empty()) return out;
+  out.push_back("--file-filter=" + description + " | " + globs);
+  if (open) out.emplace_back("--file-filter=All files | *");
+  return out;
 }
 
 }  // namespace detail

@@ -48,8 +48,9 @@ const char* format_name(Format f);
 //
 // detect_format() consults an extension in three places, all routed through
 // names declared here so none can hide a literal:
-//   1. kCoreMLExtension - the early .mlmodel guard (a bare CoreML protobuf looks
-//      like ONNX, so the extension decides before the ONNX sniff);
+//   1. kCoreMLExtension - one of the two signals of the early CoreML guard
+//      (content via looks_like_coreml, OR this extension; a bare CoreML protobuf
+//      looks like ONNX, so the guard decides before the ONNX sniff);
 //   2. kZipExtensionFormats - the tiebreak for a zip no content signal claimed;
 //   3. kExtensionFormats - the final tiebreak for everything else.
 // Every extension used by 1 and 2 must also appear in this table, with the same
@@ -87,7 +88,9 @@ inline constexpr ExtensionFormat kExtensionFormats[] = {
 // narrower than kExtensionFormats: an `.h5` or `.onnx` name on a zip is not
 // evidence of that format, so such a zip falls through to the content default
 // (PyTorch zip) instead. A new zip-based format (say, TorchScript-Lite) adds its
-// extension HERE and in kExtensionFormats; the test fails if it only does one.
+// extension HERE and in kExtensionFormats; the test fails if an extension is in
+// this table but missing from kExtensionFormats (the reverse is allowed: the main
+// table is the wider one).
 inline constexpr ExtensionFormat kZipExtensionFormats[] = {
     {"npz", Format::Npz},
     {"keras", Format::Keras},

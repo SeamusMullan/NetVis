@@ -495,8 +495,9 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
   //     (looks_like_coreml), so a CoreML file is recognised without its suffix
   //     (renamed, `model.bin`, an .mlpackage whose Manifest names an inner spec
   //     without one);
-  //   - the `.mlmodel` extension, the tiebreaker for a spec that carries no
-  //     model type at all, which has no content signal to find (spec §5).
+  //   - the `.mlmodel` extension (kCoreMLExtension, Parser.h), the tiebreaker
+  //     for a spec that carries no model type at all, which has no content
+  //     signal to find (spec §5).
   const bool coreml_ext = ext_hint == kCoreMLExtension;
   if (coreml_ext || looks_like_coreml(d, size)) {
     reason = coreml_ext ? DetectReason::Extension : DetectReason::Structure;

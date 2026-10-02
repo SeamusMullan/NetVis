@@ -88,17 +88,19 @@ const char* helper_binary() {
   return kHelper;
 }
 
-// kdialog wants one string of newline-separated "glob glob|Description" entries;
-// the zenity family wants a repeated --file-filter=Description | glob glob. Both
-// get the model filter followed by an "All files" entry, and both get
-// case-folded globs (detail::case_folded_glob) because their matching is
-// case-sensitive on Linux while detection is not.
+// kdialog wants one string of newline-separated filters; the zenity family wants
+// a repeated --file-filter=Description | glob glob. Open gets the model filter
+// followed by an "All files" entry and case-folded globs (their matching is
+// case-sensitive on Linux while detection is not); Save keeps the plain single
+// filter, which is what lets a Save chooser pick the extension to append. See
+// detail::helper_globs / kdialog_filter for why.
 std::vector<std::string> helper_argv(const char* helper, FileDialog::Mode mode,
                                      const std::string& title,
                                      const std::string& default_path,
                                      const std::vector<std::string>& patterns,
                                      const std::string& description) {
-  const std::string globs = detail::helper_globs(patterns);
+  const bool open = mode == FileDialog::Mode::Open;
+  const std::string globs = detail::helper_globs(patterns, open);
 
   std::vector<std::string> argv{helper};
   if (std::strcmp(helper, "kdialog") == 0) {
@@ -106,7 +108,7 @@ std::vector<std::string> helper_argv(const char* helper, FileDialog::Mode mode,
                                                      : "--getopenfilename");
     argv.emplace_back(default_path.empty() ? "." : default_path);
     if (!globs.empty()) {
-      argv.emplace_back(detail::kdialog_filter(globs, description));
+      argv.emplace_back(detail::kdialog_filter(globs, description, open));
     }
     if (!title.empty()) {
       argv.emplace_back("--title");
@@ -127,9 +129,8 @@ std::vector<std::string> helper_argv(const char* helper, FileDialog::Mode mode,
   }
   if (!title.empty()) argv.emplace_back("--title=" + title);
   if (!default_path.empty()) argv.emplace_back("--filename=" + default_path);
-  if (!globs.empty()) {
-    argv.emplace_back("--file-filter=" + description + " | " + globs);
-    argv.emplace_back("--file-filter=All files | *");
+  for (std::string& f : detail::zenity_filters(globs, description, open)) {
+    argv.push_back(std::move(f));
   }
   return argv;
 }

@@ -337,15 +337,39 @@ std::vector<uint8_t> ambiguous_zip(bool with_directory,
 }
 }  // namespace
 
-TEST_CASE("detect: the .mlmodel guard's extension is in kExtensionFormats") {
-  // The guard in detect_format() routes through kCoreMLExtension, and the chooser
-  // list is built from the table, so the two must agree on name and Format.
-  CHECK(table_format(kCoreMLExtension) == Format::CoreML);
+TEST_CASE("detect: the CoreML guard's extension is kCoreMLExtension, not a literal") {
+  // The guard must compare against the shared name, so renaming it cannot leave
+  // the detector and the chooser list (built from kExtensionFormats) disagreeing.
+  // Behavioural, because the table entry is literally {kCoreMLExtension, CoreML}:
+  // a check on the table alone would pass whatever the guard compares against.
+  //
+  // {field 1 varint, field 7 (graph) empty} is a bare ModelProto that
+  // looks_like_onnx_proto accepts and that carries no CoreML content signal (no
+  // field >= 200), so the extension alone has to decide.
+  const std::vector<uint8_t> bare = {0x08, 0x04, 0x3a, 0x00};
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("coreml_guard_none", bare, "", r) == Format::ONNX);
+  CHECK(r == DetectReason::Structure);
+  CHECK(detect_bytes_reason("coreml_guard_ext", bare,
+                            std::string(kCoreMLExtension), r) == Format::CoreML);
+  CHECK(r == DetectReason::Extension);
+  // The table agrees with the guard on the Format, and the guard only fires for
+  // exactly this extension (not for another table entry that merely looks alike).
+  bool in_table = false;
+  for (const ExtensionFormat& e : kExtensionFormats) {
+    if (e.ext == kCoreMLExtension) {
+      in_table = true;
+      CHECK(e.format == Format::CoreML);
+    }
+  }
+  CHECK(in_table);
+  CHECK(detect_bytes("coreml_guard_other", bare, "onnx") == Format::ONNX);
 }
 
 TEST_CASE("detect: every kZipExtensionFormats entry is in kExtensionFormats") {
   // A zip-only extension that the main table lacks would be detectable but
-  // hidden from the Open dialog (macOS and KDE offer no way around the filter).
+  // missing from the Open dialog's "All supported models" filter (and, on macOS,
+  // from the dialog altogether, since its chooser has no "All files" entry).
   for (const ExtensionFormat& e : kZipExtensionFormats) {
     INFO("zip extension: " << e.ext);
     CHECK(table_format(e.ext) == e.format);
