@@ -99,6 +99,7 @@
 #include "view/DiffPanel.h"
 #include "view/GraphNav.h"
 #include "view/PanelHelpers.h"  // #56: display_index_for_node (re-select on load)
+#include "view/PlatformGestures.h"  // #158: macOS pinch + precise-scroll bridge (stub elsewhere)
 #include "view/PluginsPanel.h"
 #include "view/Onboarding.h"        // #105: empty state + Help menu
 #include "view/PreferencesPanel.h"  // #102: the unified Settings window
@@ -314,6 +315,10 @@ bool App::init(const std::string& initial_path) {
 
   ImGui_ImplGlfw_InitForOpenGL(window_, true);
   ImGui_ImplOpenGL3_Init("#version 330");
+  // #158: macOS trackpad pinch and precise-scroll detection (no-ops elsewhere).
+  // The monitor never swallows an event, so GLFW and ImGui see exactly what they
+  // saw before.
+  platform_gestures_install(window_);
 
   // Pre-bake three font handles for LOD text (spec §8.1). If no TTF is present,
   // fall back to the built-in font and reuse it for all three roles.
@@ -385,6 +390,9 @@ bool App::init(const std::string& initial_path) {
 int App::run() {
   while (!glfwWindowShouldClose(window_)) {
     glfwPollEvents();
+    // #158: take the pinch every frame, even when no canvas draws, so a pinch
+    // made over the tensor table can never be applied to a graph later.
+    frame_pinch_log_ = platform_take_pinch_log();
     // Drain EVERY tab's completions, not just the active one (#62): a background
     // tab's parse/layout/shape jobs must still land so switching to it shows a
     // finished model rather than a frozen loading state.
@@ -409,7 +417,9 @@ int App::run() {
   // cameras still exist. A no-op unless the pref is on.
   save_session_now();
 
-  // Orderly teardown: backends, context, window, GLFW.
+  // Orderly teardown: backends, context, window, GLFW. The gesture monitor goes
+  // first so its block can never run against a window that is being destroyed.
+  platform_gestures_uninstall();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
@@ -611,6 +621,19 @@ void App::frame() {
         if (ImGui::MenuItem("Straight", nullptr, er == 2)) { er = 2; save_prefs(); }
         ImGui::EndMenu();
       }
+      // #158: what a plain scroll does. Persisted, shared by every tab (#151).
+      if (ImGui::BeginMenu("Scroll wheel")) {
+        WheelMode& wm = view().wheel_mode;
+        if (ImGui::MenuItem("Pan (Netron)", nullptr, wm == WheelMode::Pan)) {
+          wm = WheelMode::Pan;
+          save_prefs();
+        }
+        if (ImGui::MenuItem("Zoom", nullptr, wm == WheelMode::Zoom)) {
+          wm = WheelMode::Zoom;
+          save_prefs();
+        }
+        ImGui::EndMenu();
+      }
       ImGui::Separator();
       // #13/#16 (v0.8.1): op-type legend + saved-view bookmarks panels. Held in
       // the per-tab GraphNavState; ensure it exists so the toggle has a target.
@@ -628,6 +651,22 @@ void App::frame() {
         session().collapse_all();
       if (ImGui::MenuItem("Expand all blocks", "E"))
         session().expand_all();
+      ImGui::Separator();
+      // #158: the zoom commands Netron has in its View menu, plus Fit (which it
+      // lacks). The shortcut strings are display-only; handle_shortcuts owns the
+      // keys. Each sets a request the canvas consumes next frame, because only
+      // the canvas knows where the centre of the view is.
+      {
+        const bool has_graph = session().has_graph();
+        if (ImGui::MenuItem("Zoom in", "Shift+Up", false, has_graph))
+          view().request_zoom_steps += 1;
+        if (ImGui::MenuItem("Zoom out", "Shift+Down", false, has_graph))
+          view().request_zoom_steps -= 1;
+        if (ImGui::MenuItem("Actual size", "Shift+Backspace", false, has_graph))
+          view().request_actual_size = true;
+        if (ImGui::MenuItem("Fit to window", "F", false, has_graph))
+          view().request_fit = true;
+      }
       ImGui::Separator();
       // Graph navigation controls (v0.2.0): highlight/focus + category filter.
       if (ImGui::BeginMenu("Navigation")) {
@@ -734,6 +773,46 @@ void App::handle_shortcuts() {
   if (!typing && ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
     view().cam = Camera{};      // Home resets pan/zoom to identity.
     view().animating = false;
+  }
+  // #158 keyboard zoom/pan. These only set requests on the view; the canvas
+  // applies them next frame about its own centre. The arrow-based keys yield to
+  // the search overlay and the palette, which already use Up/Down to step their
+  // result lists (SearchBar.cpp, CommandPalette.cpp), and to Alt, whose
+  // Left/Right is the focus history above. Every one of them is skipped while
+  // typing, like every other single-key binding here.
+  {
+    const bool graph_keys = !typing && session().has_graph();
+    const bool arrows_free = graph_keys && !view().search_open &&
+                             !command_palette_open_ && !io.KeyAlt;
+    ViewState& v = view();
+    // Shift+Up / Shift+Down zoom, Shift+Backspace is actual size (Netron's keys).
+    if (arrows_free && io.KeyShift && !io.KeyCtrl && !io.KeySuper) {
+      if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) v.request_zoom_steps += 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) v.request_zoom_steps -= 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) v.request_actual_size = true;
+    }
+    // Ctrl (Command on macOS: ImGui swaps the two) with =, - and 0, plus the
+    // keypad. No existing binding uses these keys.
+    if (graph_keys && io.KeyCtrl && !io.KeyAlt) {
+      if (ImGui::IsKeyPressed(ImGuiKey_Equal, true) ||
+          ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, true))
+        v.request_zoom_steps += 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_Minus, true) ||
+          ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, true))
+        v.request_zoom_steps -= 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_0, false) ||
+          ImGui::IsKeyPressed(ImGuiKey_Keypad0, false))
+        v.request_actual_size = true;
+    }
+    // Plain arrows pan, 40 px per press or key repeat. No other modifier.
+    if (arrows_free && !io.KeyShift && !io.KeyCtrl && !io.KeySuper) {
+      const PanDelta a = arrow_pan(ImGui::IsKeyPressed(ImGuiKey_UpArrow, true),
+                                   ImGui::IsKeyPressed(ImGuiKey_DownArrow, true),
+                                   ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true),
+                                   ImGui::IsKeyPressed(ImGuiKey_RightArrow, true));
+      v.request_pan_x += a.dx;
+      v.request_pan_y += a.dy;
+    }
   }
   // #17 focus history: Alt+Left / Alt+Right step back/forward through visited
   // nodes (browser-style). Guarded so they no-op at the ends of the history.
@@ -858,6 +937,7 @@ ViewPrefs prefs_from_view(const ViewState& vs) {
   p.heatmap_metric = vs.heatmap_metric;
   p.heatmap_gradient = vs.heatmap_gradient;
   p.edge_routing = vs.edge_routing;
+  p.wheel_mode = vs.wheel_mode;  // #158
   p.accessible_palette = vs.accessible_palette;
   p.ui_scale = vs.ui_scale;
   p.restore_session = vs.restore_session;
@@ -879,6 +959,7 @@ void apply_prefs_to_view(const ViewPrefs& p, ViewState& vs) {
   vs.heatmap_metric = p.heatmap_metric;
   vs.heatmap_gradient = p.heatmap_gradient;
   vs.edge_routing = p.edge_routing;
+  vs.wheel_mode = p.wheel_mode;  // #158
   vs.accessible_palette = p.accessible_palette;
   vs.ui_scale = p.ui_scale;
   vs.restore_session = p.restore_session;
@@ -1597,9 +1678,29 @@ void App::load_prefs() {
   // them is ever consulted at runtime.
   ViewPrefs base = prefs_from_view(view());
   base.plugins = plugin_enabled_;
-  const ViewPrefs p = load_view_prefs(base);
+  ViewPrefsLoadInfo info;
+  const ViewPrefs p = load_view_prefs(base, &info);
   apply_prefs_to_view(p, view());
   plugin_enabled_ = p.plugins;
+  // #158: the wheel default changed from zoom to pan, so an existing user is told
+  // once. "Existing" is NOT "has a view_prefs.json": that file is written only when
+  // a preference changes, so many long-time users never had one. The decision,
+  // including the probe for other NetVis files (recent.json, session.json, cached
+  // layouts, which load_recent has not read yet), is in view/ViewPrefs.cpp so it is
+  // tested; this only acts on it. Both actions stamp "wheel_mode" (and ONLY that
+  // key: save_prefs() would pin today's default for every preference in a file the
+  // user never asked for), so neither can repeat.
+  const bool prior_data =
+      !info.file_present && has_prior_user_data(layout_cache_dir());
+  const WheelDefaultAction act = wheel_default_action(info, prior_data);
+  if (act == WheelDefaultAction::Notify) {
+    add_toast("Scrolling now pans the graph, like Netron. Zoom with Ctrl+scroll "
+              "(Cmd+scroll on macOS). View > Scroll wheel > Zoom restores the old "
+              "behaviour.",
+              false);
+    toasts_.back().ttl = 15.0f;
+  }
+  if (act != WheelDefaultAction::None) stamp_wheel_mode(view().wheel_mode);
 }
 
 void App::reload_plugins() {

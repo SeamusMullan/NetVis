@@ -199,6 +199,7 @@ list(APPEND NETVIS_CORE_SRC
   ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp  # #104: pure colour tables
   ${CMAKE_SOURCE_DIR}/src/view/ViewPrefs.cpp      # #151: JSON + filesystem only
   ${CMAKE_SOURCE_DIR}/src/view/TextContrast.cpp   # #150: WCAG contrast maths
+  ${CMAKE_SOURCE_DIR}/src/view/CanvasInput.cpp    # #158: pure gesture maths
 )
 
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
@@ -313,7 +314,8 @@ if(NETVIS_BUILD_APP)
     ${CMAKE_SOURCE_DIR}/src/view/SessionStore.cpp
     ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp
     ${CMAKE_SOURCE_DIR}/src/view/ViewPrefs.cpp
-    ${CMAKE_SOURCE_DIR}/src/view/TextContrast.cpp)
+    ${CMAKE_SOURCE_DIR}/src/view/TextContrast.cpp
+    ${CMAKE_SOURCE_DIR}/src/view/CanvasInput.cpp)
 
   # WIN32 => link the GUI subsystem so double-clicking the .exe does NOT open a
   # console window alongside the app (CMake keeps `int main` as the entry via
@@ -329,6 +331,26 @@ if(NETVIS_BUILD_APP)
   target_link_libraries(netvis
     PRIVATE netvis_core imgui glfw tinyfiledialogs stb OpenGL::GL netvis_warnings)
   target_include_directories(netvis PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+  # #158: macOS trackpad pinch + precise-scroll bridge. GLFW 3.4 drops
+  # NSEventTypeMagnify and flattens scroll deltas, so an NSEvent local monitor
+  # (Objective-C++, ~70 lines) supplies both. The file is not matched by the
+  # src/view/*.cpp glob above, so non-Apple builds never see it; they compile
+  # PlatformGestures_stub.cpp instead (an empty TU on Apple).
+  #
+  # The .mm is compiled as a CXX source, forced to Objective-C++ with `-x`, rather
+  # than via enable_language(OBJCXX): enabling OBJCXX makes CMake compile GLFW's
+  # own .m files as Objective-C++ too, and they do not build as C++. LANGUAGE CXX
+  # also gives the file the target's C++20 standard and netvis_warnings like every
+  # other source. (CMake puts `-x c++` first; the later `-x objective-c++` wins.)
+  # ARC is per-file, so the rest of the target is untouched.
+  if(APPLE)
+    target_sources(netvis PRIVATE ${CMAKE_SOURCE_DIR}/src/view/PlatformGestures_mac.mm)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/src/view/PlatformGestures_mac.mm
+      PROPERTIES LANGUAGE CXX
+                 COMPILE_OPTIONS "-xobjective-c++;-fobjc-arc")
+    target_link_libraries(netvis PRIVATE "-framework AppKit")
+  endif()
 
   # Build provenance for the About window. Stamped in as strings because none of
   # it is discoverable at runtime — the toolchain that produced the binary is

@@ -18,19 +18,11 @@
 #include <nlohmann/json.hpp>
 
 #include "engine/LayoutCache.h"
+#include "view/CanvasInput.h"  // kMinZoom/kMaxZoom: the one definition (#158); ImGui-free
 
 namespace netvis {
 
 namespace {
-
-// Mirrors GraphCanvas.cpp's kMinZoom/kMaxZoom. Those constants are file-local
-// to the canvas (no header has exported them, since nothing outside the
-// canvas needed the clamp before #103) — duplicated here with the SAME values
-// rather than pulled in via view/GraphCanvas.h, which would drag ImGui into a
-// file this header deliberately keeps free of it (so it can plausibly live in
-// netvis_core; see the test file for the fuller story).
-constexpr float kMinZoom = 0.02f;
-constexpr float kMaxZoom = 4.0f;
 
 // A path this long could not be a real filesystem path on any platform NetVis
 // ships for (Linux/macOS PATH_MAX is 4096; Windows' legacy MAX_PATH is far
