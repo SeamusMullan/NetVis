@@ -17,22 +17,32 @@
 
 namespace netvis {
 
-// Draw the minimap. Called from draw_graph_canvas() while its child region and
-// draw list are still active.
-void draw_minimap(App& app) {
+namespace {
+
+// The minimap's placement, in screen space. ONE definition (#158): draw_minimap
+// paints with it and the canvas asks minimap_rect() for the same rectangle to
+// decide whether a press belongs to the minimap, so the two can never disagree
+// about where the minimap is.
+struct MinimapGeom {
+  ImVec2 map_min, map_max;  // screen-space rect of the panel
+  float scale = 1.0f;       // world units -> minimap px
+};
+
+// Compute the placement. Must run inside the canvas child window (it reads that
+// window's position and size). False when the minimap is hidden or there is
+// nothing to overview.
+bool compute_minimap_geom(App& app, MinimapGeom& g) {
   ViewState& vs = app.view();
-  if (!vs.show_minimap) return;
+  if (!vs.show_minimap) return false;
 
   ModelSession& session = app.session();
   const LayoutResult* layout = session.layout();
   // Guard: nothing to overview until a layout exists with real bounds.
-  if (layout == nullptr || layout->boxes.empty()) return;
+  if (layout == nullptr || layout->boxes.empty()) return false;
 
   const float world_w = layout->bounds_max.x - layout->bounds_min.x;
   const float world_h = layout->bounds_max.y - layout->bounds_min.y;
-  if (world_w < 1e-3f || world_h < 1e-3f) return;
-
-  ImDrawList* dl = ImGui::GetWindowDrawList();
+  if (world_w < 1e-3f || world_h < 1e-3f) return false;
 
   // Position the minimap inset in the bottom-right corner of the canvas child.
   const ImVec2 win_min = ImGui::GetWindowPos();
@@ -41,12 +51,39 @@ void draw_minimap(App& app) {
   const float kMaxW = 220.0f, kMaxH = 160.0f;
 
   // Fit world aspect ratio inside the max box.
-  float scale = std::min(kMaxW / world_w, kMaxH / world_h);
-  float map_w = world_w * scale;
-  float map_h = world_h * scale;
+  g.scale = std::min(kMaxW / world_w, kMaxH / world_h);
+  const float map_w = world_w * g.scale;
+  const float map_h = world_h * g.scale;
 
-  ImVec2 map_max(win_min.x + win_sz.x - kPad, win_min.y + win_sz.y - kPad);
-  ImVec2 map_min(map_max.x - map_w, map_max.y - map_h);
+  g.map_max = ImVec2(win_min.x + win_sz.x - kPad, win_min.y + win_sz.y - kPad);
+  g.map_min = ImVec2(g.map_max.x - map_w, g.map_max.y - map_h);
+  return true;
+}
+
+}  // namespace
+
+bool minimap_rect(App& app, ImVec2& out_min, ImVec2& out_max) {
+  MinimapGeom g;
+  if (!compute_minimap_geom(app, g)) return false;
+  out_min = g.map_min;
+  out_max = g.map_max;
+  return true;
+}
+
+// Draw the minimap. Called from draw_graph_canvas() while its child region and
+// draw list are still active.
+void draw_minimap(App& app) {
+  MinimapGeom geom;
+  if (!compute_minimap_geom(app, geom)) return;
+  const ImVec2 map_min = geom.map_min;
+  const ImVec2 map_max = geom.map_max;
+  const float scale = geom.scale;
+
+  ViewState& vs = app.view();
+  const LayoutResult* layout = app.session().layout();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 win_min = ImGui::GetWindowPos();
+  const ImVec2 win_sz = ImGui::GetWindowSize();
 
   const bool dark = vs.dark_theme;
   ImU32 bg = dark ? IM_COL32(18, 20, 24, 220) : IM_COL32(240, 242, 246, 230);
@@ -98,9 +135,15 @@ void draw_minimap(App& app) {
   const ImVec2 m = io.MousePos;
   const bool over_map = m.x >= map_min.x && m.x <= map_max.x &&
                         m.y >= map_min.y && m.y <= map_max.y;
+  // #158: a drag only counts when its PRESS began in the minimap. The canvas now
+  // pans on a left-drag, so a pan that merely passes over this inset on its way
+  // across the canvas must not be hijacked into a recentre on every frame.
+  const ImVec2 press = io.MouseClickedPos[ImGuiMouseButton_Left];
+  const bool press_in_map = press.x >= map_min.x && press.x <= map_max.x &&
+                            press.y >= map_min.y && press.y <= map_max.y;
   if (over_map &&
       (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-       ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f))) {
+       (press_in_map && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)))) {
     // Map click position back to world coordinates.
     float wx = layout->bounds_min.x + (m.x - map_min.x) / scale;
     float wy = layout->bounds_min.y + (m.y - map_min.y) / scale;

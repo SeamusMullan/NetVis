@@ -36,18 +36,25 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
 
 - **Formats:** ONNX (`.onnx`, incl. sibling external-data), TFLite (`.tflite`),
   SafeTensors (`.safetensors`), GGUF (`.gguf`), PyTorch zip & legacy pickle
-  checkpoints (`.pt` / `.pth` / `.bin`), **OpenVINO IR** (`.xml` + `.bin`),
-  **CoreML** (`.mlmodel`), **Keras** (`.h5` / `.keras`), **NumPy** (`.npz`),
+  checkpoints (`.pt` / `.pth` / `.bin`, `.pkl` / `.pickle`), **OpenVINO IR**
+  (`.xml` + `.bin`), **CoreML** (`.mlmodel` / `.mlpackage`), **Keras**
+  (`.h5` / `.hdf5` / `.keras`), **NumPy** (`.npz`),
   **TensorFlow** (frozen `.pb` GraphDef + `saved_model.pb` bundles, incl. the
   FunctionDef library as drill-down subgraphs), **PyTorch Mobile**
   lite-interpreter archives (`.ptl`, bytecode v6–v9) as real compute graphs, and
   best-effort **TorchScript** desktop-archive op listings. Zip-based formats are
   disambiguated by content, not extension. SavedModel checkpoint weights
-  (`variables/`) are reported as present but not decoded.
+  (`variables/`) are reported as present but not decoded. What each format
+  actually yields — graph, shapes, addressable weights — and where the gaps are
+  is in [`docs/format-support.md`](docs/format-support.md); its support table is
+  checked against the parsers on every test run (the prose around it is not).
 - **Instant open:** memory-mapped I/O; structure parsed off the main thread; the
   window is interactive the moment the `mmap` succeeds.
 - **Compute-graph canvas:** a single custom-drawn region (no per-node widgets) with
-  viewport culling, level-of-detail tiers, pan/zoom, selection, and a minimap.
+  viewport culling, level-of-detail tiers, Netron-style pan/zoom (scroll or a
+  two-finger swipe pans, Ctrl/Cmd+scroll or, on macOS, a trackpad pinch zooms at the
+  pointer; scroll-to-zoom is one preference away, see
+  [canvas controls](docs/canvas-controls.md) for the platform notes), selection, and a minimap.
   Draw cost is O(visible), not O(total).
 - **Collapse tree:** repeated blocks (e.g. 32 identical decoder layers) are detected
   and collapsed into `×N` super-nodes, so even 100k-node graphs lay out in
@@ -197,7 +204,15 @@ ctest --preset core-only
 ```
 
 Open a model via the `File → Open` dialog, by dragging it onto the window, or by
-passing it as a CLI argument.
+passing it as a CLI argument. The dialog's "All supported models" filter covers
+every extension listed under Formats, in either letter case on Linux. Linux and
+Windows add an "All files" entry after it; the macOS chooser takes a list of
+types only, so there a file with another or no extension (which content
+detection would still accept, or a WASM-plugin format) is opened by drag-and-drop
+or on the command line. A CoreML `.mlpackage` is a directory, so the dialog can
+pick it only where the platform treats packages as files (macOS); elsewhere drag
+it onto the window or pass it on the command line. For a TensorFlow SavedModel,
+pick its `saved_model.pb`.
 
 ### Linux: Wayland and X11
 
@@ -268,8 +283,17 @@ cmake --preset tsan  && cmake --build --preset tsan  && ctest --preset tsan
 
 ## CI & releases
 
-`.github/workflows/ci.yml` runs on every push/PR: the ASan+UBSan and TSan
-sanitizer suites plus a headless `core-only` build + `ctest`.
+`.github/workflows/ci.yml` runs on every pull request and every push to master:
+the ASan+UBSan and TSan sanitizer suites, a headless `core-only` build +
+`ctest`, and a Release build of the full GUI app plus `ctest` on **Linux, macOS
+and Windows** (`build + ctest (<runner>, app)`). The app job compiles the ImGui
+app and the test suite with GCC, AppleClang and MSVC, so a break on any platform
+turns the pull-request check red instead of surfacing when a release tag is
+built. Linux is built twice: on `ubuntu-22.04` (GCC 11), the image the release
+package is built on, and on `ubuntu-latest` (newest GCC). The job uses the same
+setup steps and runner images as `package.yml` (kept in sync by hand), is
+skipped on tag pushes because the package job builds the same app for the tag,
+and does not gate releases.
 
 Pushing a `vX.Y.Z` tag additionally builds the per-OS installers and publishes a
 GitHub Release with them attached:

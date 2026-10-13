@@ -16,10 +16,9 @@
 
 namespace netvis {
 
-// Zoom is clamped to this range everywhere a zoom is produced (scroll, fit,
-// animation targets) so the transform can never invert or explode.
-static constexpr float kMinZoom = 0.02f;
-static constexpr float kMaxZoom = 4.0f;
+// Zoom is clamped to [kMinZoom, kMaxZoom] (view/CanvasInput.h, the single
+// definition since #158) everywhere a zoom is produced (scroll, fit, animation
+// targets) so the transform can never invert or explode.
 
 // world -> screen: origin + world*zoom + pan. `origin` is the canvas top-left in
 // screen pixels; pan is an additional screen-space offset.

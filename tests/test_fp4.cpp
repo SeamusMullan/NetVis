@@ -28,6 +28,7 @@
 #include "ir/IR.h"
 #include "parsers/Parser.h"
 #include "parsers/pytorch/PickleVM.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -121,6 +122,7 @@ TEST_CASE("SafeTensors: F4 and F8_E8M0 tensors are labeled, not '?'") {
   file += header;
   file += std::string(38, '\0');
   const std::string path = write_temp("st.safetensors", file);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
 
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
@@ -143,7 +145,6 @@ TEST_CASE("SafeTensors: F4 and F8_E8M0 tensors are labeled, not '?'") {
   CHECK(m.str(sc->dtype_label) == "F8_E8M0");
   CHECK(b->dtype == ir::DType::F32);
   CHECK_FALSE(b->dtype_label.valid());  // mapped types need no label
-  std::filesystem::remove(path);
 }
 
 // --- ONNX: FLOAT4E2M1 / FLOAT8E4M3FN initializers keep their exact label -----
@@ -168,6 +169,7 @@ TEST_CASE("ONNX: FLOAT4E2M1 weight + FLOAT8E4M3FN scale initializers are labeled
   field_varint(model, 1, 10);                  // ir_version
   field_bytes(model, 7, graph);
   const std::string path = write_temp("m.onnx", model);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
 
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
@@ -187,7 +189,6 @@ TEST_CASE("ONNX: FLOAT4E2M1 weight + FLOAT8E4M3FN scale initializers are labeled
   CHECK(m.str(wt->dtype_label) == "float4e2m1");
   CHECK(wt->byte_len == 16);
   CHECK(m.str(st->dtype_label) == "float8e4m3fn");
-  std::filesystem::remove(path);
 }
 
 // --- PyTorch: _rebuild_tensor_v3 carries the dtype as a trailing global -------

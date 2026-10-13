@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 
 #include "engine/plugin/OpHandler.h"
@@ -20,6 +21,7 @@
 #include "engine/plugin/declarative/Dsl.h"
 #include "engine/plugin/declarative/Manifest.h"
 #include "ir/IR.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 using namespace netvis::plugin;
@@ -190,9 +192,12 @@ TEST_CASE("declarative: attr access mirrors built-in getters") {
 
 namespace {
 std::string write_temp(const std::string& body) {
-  std::string path = std::string("/tmp/nv_manifest_") +
-                     std::to_string(body.size()) + "_" +
-                     std::to_string(body.empty() ? 0 : body[0]) + ".json";
+  // temp_directory_path(), not a literal "/tmp": on Windows "/tmp/x" means
+  // C:\tmp\x, a directory that does not exist, so the write would fail.
+  const std::string leaf = "nv_manifest_" + std::to_string(body.size()) + "_" +
+                           std::to_string(body.empty() ? 0 : body[0]) + ".json";
+  std::string path =
+      (std::filesystem::temp_directory_path() / leaf).string();
   std::ofstream f(path, std::ios::binary);
   f << body;
   f.close();
@@ -203,33 +208,33 @@ std::string write_temp(const std::string& body) {
 TEST_CASE("manifest: api_version mismatch rejects the whole file") {
   std::string p = write_temp(R"({ "api_version": 999, "name": "x",
     "ops": [{ "name": "Foo", "category": "MatMul" }] })");
+  netvis_test::TempFileGuard cleanup(p);
   LoadedManifest lm = load_manifest_file(p, /*register_into=*/false);
   CHECK(lm.ok == false);
   CHECK(lm.error.find("api_version") != std::string::npos);
   CHECK(lm.ops.empty());
-  std::remove(p.c_str());
 }
 
 TEST_CASE("manifest: unknown category rejects the op (not the file)") {
   std::string p = write_temp(R"({ "api_version": 1, "name": "x",
     "ops": [{ "name": "Foo", "category": "NotACategory" }] })");
+  netvis_test::TempFileGuard cleanup(p);
   LoadedManifest lm = load_manifest_file(p, false);
   CHECK(lm.ok == true);
   REQUIRE(lm.ops.size() == 1);
   CHECK(lm.ops[0].ok == false);
   CHECK(lm.ops[0].error.find("category") != std::string::npos);
-  std::remove(p.c_str());
 }
 
 TEST_CASE("manifest: cyclic var dependency rejected") {
   std::string p = write_temp(R"({ "api_version": 1, "name": "x", "ops": [{
     "name": "Foo", "category": "MatMul",
     "vars": { "a": "b + 1", "b": "a + 1" }, "flops": "a" }] })");
+  netvis_test::TempFileGuard cleanup(p);
   LoadedManifest lm = load_manifest_file(p, false);
   REQUIRE(lm.ops.size() == 1);
   CHECK(lm.ops[0].ok == false);
   CHECK(lm.ops[0].error.find("cyclic") != std::string::npos);
-  std::remove(p.c_str());
 }
 
 TEST_CASE("manifest: JSONC comments accepted, valid op compiles") {
@@ -242,6 +247,7 @@ TEST_CASE("manifest: JSONC comments accepted, valid op compiles") {
       "flops": "2 * (2 * B * S * S * H)"
     }]
   })json");
+  netvis_test::TempFileGuard cleanup(p);
   LoadedManifest lm = load_manifest_file(p, false);
   CHECK(lm.ok == true);
   CHECK(lm.name == "attn-ops");
@@ -249,7 +255,6 @@ TEST_CASE("manifest: JSONC comments accepted, valid op compiles") {
   CHECK(lm.ops[0].ok == true);
   CHECK(lm.ops[0].op_name == "myattention");
   CHECK(lm.ops[0].category == "Attention");
-  std::remove(p.c_str());
 }
 
 TEST_CASE("declarative: registered plugin op resolves + FLOP-counts through the registry") {
@@ -259,8 +264,8 @@ TEST_CASE("declarative: registered plugin op resolves + FLOP-counts through the 
   std::string p = write_temp(R"json({ "api_version": 1, "name": "test-custom",
     "ops": [{ "name": "CustomThing", "category": "MatMul",
               "flops": "3 * in0.shape[0] * in0.shape[1]" }] })json");
+  netvis_test::TempFileGuard cleanup(p);
   LoadedManifest lm = load_manifest_file(p, /*register_into=*/true);
-  std::remove(p.c_str());
   REQUIRE(lm.ok == true);
   REQUIRE(lm.ops.size() == 1);
   REQUIRE(lm.ops[0].ok == true);
@@ -312,8 +317,8 @@ TEST_CASE("manifest: overrides_builtin flag is surfaced (for the Plugins panel #
   // the Plugins panel can show "overrides built-in".
   std::string p = write_temp(R"json({ "api_version": 1, "name": "ov",
     "ops": [{ "name": "Gelu", "category": "Activation", "override": true, "flops": "O" }] })json");
+  netvis_test::TempFileGuard cleanup(p);
   LoadedManifest lm = load_manifest_file(p, /*register_into=*/false);
-  std::remove(p.c_str());
   REQUIRE(lm.ops.size() == 1);
   CHECK(lm.ops[0].ok == true);
   CHECK(lm.ops[0].overrides_builtin == true);

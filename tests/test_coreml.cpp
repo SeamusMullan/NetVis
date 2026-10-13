@@ -20,6 +20,7 @@
 #include "core/MappedFile.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -130,6 +131,7 @@ TEST_CASE("CoreML: truncated proto yields a clean error, never a crash") {
   for (int k = 1; k <= 7; ++k) {
     size_t n = (bytes.size() * static_cast<size_t>(k)) / 8;
     std::string path = write_prefix(bytes, n);
+    netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
 
     ByteReader::payload_read_counter() = 0;
     auto mf = MappedFile::open(path);
@@ -141,6 +143,5 @@ TEST_CASE("CoreML: truncated proto yields a clean error, never a crash") {
       (void)res;
       CHECK(ByteReader::payload_read_counter() == 0);
     }
-    std::filesystem::remove(path);
   }
 }

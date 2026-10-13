@@ -199,6 +199,7 @@ list(APPEND NETVIS_CORE_SRC
   ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp  # #104: pure colour tables
   ${CMAKE_SOURCE_DIR}/src/view/ViewPrefs.cpp      # #151: JSON + filesystem only
   ${CMAKE_SOURCE_DIR}/src/view/TextContrast.cpp   # #150: WCAG contrast maths
+  ${CMAKE_SOURCE_DIR}/src/view/CanvasInput.cpp    # #158: pure gesture maths
 )
 
 add_library(netvis_core STATIC ${NETVIS_CORE_SRC})
@@ -313,7 +314,8 @@ if(NETVIS_BUILD_APP)
     ${CMAKE_SOURCE_DIR}/src/view/SessionStore.cpp
     ${CMAKE_SOURCE_DIR}/src/view/CategoryStyle.cpp
     ${CMAKE_SOURCE_DIR}/src/view/ViewPrefs.cpp
-    ${CMAKE_SOURCE_DIR}/src/view/TextContrast.cpp)
+    ${CMAKE_SOURCE_DIR}/src/view/TextContrast.cpp
+    ${CMAKE_SOURCE_DIR}/src/view/CanvasInput.cpp)
 
   # WIN32 => link the GUI subsystem so double-clicking the .exe does NOT open a
   # console window alongside the app (CMake keeps `int main` as the entry via
@@ -329,6 +331,26 @@ if(NETVIS_BUILD_APP)
   target_link_libraries(netvis
     PRIVATE netvis_core imgui glfw tinyfiledialogs stb OpenGL::GL netvis_warnings)
   target_include_directories(netvis PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+  # #158: macOS trackpad pinch + precise-scroll bridge. GLFW 3.4 drops
+  # NSEventTypeMagnify and flattens scroll deltas, so an NSEvent local monitor
+  # (Objective-C++, ~70 lines) supplies both. The file is not matched by the
+  # src/view/*.cpp glob above, so non-Apple builds never see it; they compile
+  # PlatformGestures_stub.cpp instead (an empty TU on Apple).
+  #
+  # The .mm is compiled as a CXX source, forced to Objective-C++ with `-x`, rather
+  # than via enable_language(OBJCXX): enabling OBJCXX makes CMake compile GLFW's
+  # own .m files as Objective-C++ too, and they do not build as C++. LANGUAGE CXX
+  # also gives the file the target's C++20 standard and netvis_warnings like every
+  # other source. (CMake puts `-x c++` first; the later `-x objective-c++` wins.)
+  # ARC is per-file, so the rest of the target is untouched.
+  if(APPLE)
+    target_sources(netvis PRIVATE ${CMAKE_SOURCE_DIR}/src/view/PlatformGestures_mac.mm)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/src/view/PlatformGestures_mac.mm
+      PROPERTIES LANGUAGE CXX
+                 COMPILE_OPTIONS "-xobjective-c++;-fobjc-arc")
+    target_link_libraries(netvis PRIVATE "-framework AppKit")
+  endif()
 
   # Build provenance for the About window. Stamped in as strings because none of
   # it is discoverable at runtime — the toolchain that produced the binary is
@@ -389,6 +411,15 @@ if(NETVIS_BUILD_APP)
     # is how compositors find the icon and group the window in the taskbar.
     install(FILES ${CMAKE_SOURCE_DIR}/assets/netvis.desktop
             DESTINATION share/applications)
+  endif()
+  # Windows: the PATH helper the NSIS installer shells out to, at install AND at
+  # uninstall time (#149). It ships inside the payload rather than living only in
+  # the source tree because the uninstaller has to be able to call it on a machine
+  # that never had the repo — CPack's uninstall hook runs before file deletion, so
+  # it is still here when it is needed. See the NSIS packaging block below.
+  if(WIN32)
+    install(FILES ${CMAKE_SOURCE_DIR}/packaging/windows/netvis-path.ps1
+            DESTINATION share/netvis)
   endif()
 endif()
 
@@ -460,6 +491,19 @@ if(NETVIS_BUILD_TESTS)
     # plugins/sdk/netvis_plugin.h (the SDK<->C++ drift guard, #10 Increment D).
     target_include_directories(netvis_tests PRIVATE
       ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    if(MSVC)
+      # doctest 2.4.11 forward-declares std::basic_ostream and friends instead
+      # of including <ostream>. The MSVC STL that ships with Visual Studio 2026
+      # (toolset 14.51) defines inline string_view/iostream operators that need
+      # the complete type, so every test TU failed with C2027/C2065 in
+      # <__msvc_string_view.hpp>. This switch makes doctest include the real
+      # headers; doctest already turns it on by itself under libc++.
+      target_compile_definitions(netvis_tests PRIVATE DOCTEST_CONFIG_USE_STD_HEADERS)
+      # doctest's per-assertion templates plus nlohmann::json can push one test
+      # TU past the default object-file section limit (fatal error C1128).
+      # /bigobj raises it; it only changes the .obj format, never the program.
+      target_compile_options(netvis_tests PRIVATE /bigobj)
+    endif()
 
     # Generate the tiny fixture models at build time (Python 3 stdlib only, no
     # pip) so `ctest` always has them, and run tests from the source root so the
@@ -523,7 +567,41 @@ if(NETVIS_BUILD_APP)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     # ON: the installer offers to add bin/ to PATH, which is what lets an MCP
     # client resolve `netvis_mcp` by bare name after a normal install.
+    #
+    # ON draws the options page and records the choice in the uninstall registry
+    # key. The two hooks below take over the edit itself (#149); the template's own
+    # AddToPath is suppressed once they succeed and only runs as a fallback if the
+    # helper script fails. The template reads PATH into an NSIS string, which
+    # a standard makensis build caps at 1024 characters, so past that it aborts
+    # with "Warning! PATH too long installer unable to modify PATH!". It also
+    # skips the edit silently when `IfFileExists "<dir>\*.*"` or the
+    # `GetFullPathName /SHORT` dedupe cannot see the install directory (the dedupe
+    # when GetShortPathName fails outright), which is a suspected cause of the
+    # "virtual drive" report -- an elevated installer may not see a subst or
+    # mapped drive made in another logon session. packaging/windows/netvis-path.ps1
+    # edits the registry directly and has none of these dependencies.
     set(CPACK_NSIS_MODIFY_PATH ON)
+    # !include rather than an inline NSIS string: CPack round-trips these
+    # variables through a generated CPackConfig.cmake, so an inlined snippet
+    # would need every backslash, double quote and ${...} escaped twice over
+    # before makensis ever saw it. A one-line !include of a real .nsh file needs
+    # none of that, and keeps the NSIS readable as NSIS.
+    #
+    # Two escaping facts, both load-bearing, both verified rather than assumed:
+    #   1. makensis' !include does NOT accept forward slashes on Windows, so
+    #      ${CMAKE_SOURCE_DIR} (always forward-slashed, even on Windows) has to be
+    #      converted. A forward-slashed absolute path fails with
+    #      "!include: could not find" naming a file that plainly exists.
+    #   2. The value survives one CMake round trip (CPack writes these into a
+    #      generated CPackConfig.cmake as `set(VAR "<value>")` and re-reads it),
+    #      so each backslash must be DOUBLED here to arrive single at makensis.
+    # Hence REPLACE "/" -> "\\" (two characters) rather than file(TO_NATIVE_PATH).
+    string(REPLACE "/" "\\\\" NETVIS_NSIS_DIR
+           "${CMAKE_SOURCE_DIR}/packaging/windows")
+    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
+        "  !include '${NETVIS_NSIS_DIR}\\\\nsis-add-to-path.nsh'")
+    set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS
+        "  !include '${NETVIS_NSIS_DIR}\\\\nsis-remove-from-path.nsh'")
     # Installer + Add/Remove-Programs icon (the exe's own icon is embedded via the
     # .rc). MUI_ICON/UNICON must be a valid multi-size .ico.
     set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/assets/netvis.ico")
