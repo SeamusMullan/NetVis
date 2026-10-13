@@ -66,9 +66,20 @@ std::vector<Command> build_commands(App& app) {
       [&v] { v.show_plugins = !v.show_plugins; });
   add(std::string("View: Search overlay ") + (v.search_open ? "OFF" : "ON"),
       [&v] { v.search_open = !v.search_open; });
+  // #158: what a plain scroll does (the label names the mode you would switch TO).
+  add(std::string("View: Scroll wheel -> ") +
+          (v.wheel_mode == WheelMode::Pan ? "Zoom" : "Pan"),
+      [&app, &v] {
+        v.wheel_mode = v.wheel_mode == WheelMode::Pan ? WheelMode::Zoom : WheelMode::Pan;
+        app.save_prefs();
+      });
 
   // Graph navigation.
   add("Graph: Fit to view", [&v] { v.request_fit = true; }, has_graph);
+  // #158: centre-anchored, consumed by the canvas next frame.
+  add("Graph: Zoom in", [&v] { v.request_zoom_steps += 1; }, has_graph);
+  add("Graph: Zoom out", [&v] { v.request_zoom_steps -= 1; }, has_graph);
+  add("Graph: Actual size (100%)", [&v] { v.request_actual_size = true; }, has_graph);
   add("Graph: Reset camera (Home)",
       [&v] { v.cam = Camera{}; v.animating = false; }, has_model);
   add("Graph: Reload plugins", [&app] { app.reload_plugins(); });

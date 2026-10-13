@@ -21,6 +21,7 @@
 #include "engine/OpCategory.h"
 #include "engine/plugin/Registry.h"
 #include "view/App.h"
+#include "view/CanvasInput.h"  // PinnedStripLayout, rect_contains (#158)
 #include "view/PanelHelpers.h"
 
 namespace netvis {
@@ -440,17 +441,62 @@ void nav_toggle_pin(App& app, uint32_t ir_node) {
     pins.push_back(ir_node);
 }
 
-void draw_pinned_strip(App& app, ImVec2 canvas_origin, ImVec2 canvas_size) {
+namespace {
+
+// The label a pin chip shows: the node's name, else its op type, else "node",
+// truncated so the strip stays readable.
+std::string pinned_chip_label(const ir::Model& m, const ir::Graph& g, uint32_t ir_node) {
+  std::string label = "node";
+  if (ir_node < g.nodes.size()) {
+    std::string_view nm = m.str(g.nodes[ir_node].name);
+    if (nm.empty()) nm = m.str(g.nodes[ir_node].op_type);
+    if (!nm.empty()) label.assign(nm);
+  }
+  if (label.size() > 22) { label.resize(21); label += "..."; }
+  return label;
+}
+
+// Walks the chips that fit on the strip, in draw order, calling
+// fn(ir_node, label, chip). Both the drawing and pinned_strip_hit() go through
+// this, so the rectangles a press is tested against are the ones drawn. Returns
+// false (and calls nothing) when there is nothing to draw.
+template <class Fn>
+bool for_each_pinned_chip(App& app, ImVec2 canvas_origin, ImVec2 canvas_size, Fn&& fn) {
   ViewState& vs = app.view();
   GraphNavState* nav = vs.nav.get();
-  if (nav == nullptr || nav->pinned.empty()) return;
+  if (nav == nullptr || nav->pinned.empty()) return false;
   ModelSession& s = app.session();
   const ir::Model* m = s.model();
-  if (m == nullptr) return;
-  uint32_t gi = s.current_graph();
-  if (gi >= m->graphs.size()) return;
-  const auto& nodes = m->graphs[gi].nodes;
+  if (m == nullptr) return false;
+  const uint32_t gi = s.current_graph();
+  if (gi >= m->graphs.size()) return false;
+  const ir::Graph& g = m->graphs[gi];
 
+  PinnedStripLayout layout(canvas_origin.x, canvas_origin.y, canvas_size.x,
+                           ImGui::GetTextLineHeight());
+  for (uint32_t ir_node : nav->pinned) {
+    const std::string label = pinned_chip_label(*m, g, ir_node);
+    PinnedChip chip;
+    // v0.8.1: single-row strip; extra pins just don't show (rare).
+    if (!layout.next(ImGui::CalcTextSize(label.c_str()).x, chip)) break;
+    fn(ir_node, label, chip);
+  }
+  return true;
+}
+
+}  // namespace
+
+bool pinned_strip_hit(App& app, ImVec2 canvas_origin, ImVec2 canvas_size, ImVec2 p) {
+  bool hit = false;
+  for_each_pinned_chip(app, canvas_origin, canvas_size,
+                       [&](uint32_t, const std::string&, const PinnedChip& chip) {
+                         if (rect_contains(chip.box, p.x, p.y)) hit = true;
+                       });
+  return hit;
+}
+
+void draw_pinned_strip(App& app, ImVec2 canvas_origin, ImVec2 canvas_size) {
+  ViewState& vs = app.view();
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const bool dark = vs.dark_theme;
   const ImU32 chip_bg = dark ? IM_COL32(44, 50, 60, 235) : IM_COL32(226, 232, 240, 235);
@@ -458,52 +504,34 @@ void draw_pinned_strip(App& app, ImVec2 canvas_origin, ImVec2 canvas_size) {
   const ImU32 chip_tx = dark ? IM_COL32(226, 232, 240, 255) : IM_COL32(30, 36, 46, 255);
   const ImU32 x_col   = dark ? IM_COL32(200, 120, 120, 255) : IM_COL32(180, 70, 70, 255);
 
-  const float pad = 6.0f;
-  const float gap = 6.0f;
-  float x = canvas_origin.x + pad;
-  const float y = canvas_origin.y + pad;
-  const float line_h = ImGui::GetTextLineHeight();
-  const float chip_h = line_h + 6.0f;
-  const float x_w = line_h;  // click target for the remove "x"
-
   ImGuiIO& io = ImGui::GetIO();
   const ImVec2 mouse = io.MousePos;
   const bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
   uint32_t to_unpin = UINT32_MAX;
   int32_t to_fly = -1;
 
-  for (uint32_t ir_node : nav->pinned) {
-    std::string label = "node";
-    if (ir_node < nodes.size()) {
-      std::string_view nm = m->str(nodes[ir_node].name);
-      if (nm.empty()) nm = m->str(nodes[ir_node].op_type);
-      if (!nm.empty()) label.assign(nm);
-    }
-    // Truncate very long names so the strip stays readable.
-    if (label.size() > 22) { label.resize(21); label += "..."; }
-    ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-    float chip_w = ts.x + 2.0f * pad + x_w;
-    // Wrap to a new row if we'd overflow the canvas width.
-    if (x + chip_w > canvas_origin.x + canvas_size.x - pad &&
-        x > canvas_origin.x + pad) {
-      break;  // v0.8.1: single-row strip; extra pins just don't show (rare).
-    }
-    ImVec2 cmin(x, y), cmax(x + chip_w, y + chip_h);
-    dl->AddRectFilled(cmin, cmax, chip_bg, 4.0f);
-    dl->AddRect(cmin, cmax, chip_bd, 4.0f, 0, 1.0f);
-    dl->AddText(ImVec2(x + pad, y + 3.0f), chip_tx, label.c_str());
-    // "x" remove glyph at the right end of the chip.
-    ImVec2 xpos(cmax.x - x_w + 2.0f, y + 3.0f);
-    dl->AddText(xpos, x_col, "x");
+  for_each_pinned_chip(
+      app, canvas_origin, canvas_size,
+      [&](uint32_t ir_node, const std::string& label, const PinnedChip& chip) {
+        const ImVec2 cmin(chip.box.min_x, chip.box.min_y);
+        const ImVec2 cmax(chip.box.max_x, chip.box.max_y);
+        dl->AddRectFilled(cmin, cmax, chip_bg, 4.0f);
+        dl->AddRect(cmin, cmax, chip_bd, 4.0f, 0, 1.0f);
+        dl->AddText(ImVec2(cmin.x + kPinnedStripPad, cmin.y + 3.0f), chip_tx,
+                    label.c_str());
+        // "x" remove glyph at the right end of the chip.
+        dl->AddText(ImVec2(chip.remove_x + 2.0f, cmin.y + 3.0f), x_col, "x");
 
-    if (clicked && mouse.y >= cmin.y && mouse.y <= cmax.y) {
-      if (mouse.x >= cmax.x - x_w && mouse.x <= cmax.x)
-        to_unpin = ir_node;                 // clicked the x
-      else if (mouse.x >= cmin.x && mouse.x < cmax.x - x_w)
-        to_fly = static_cast<int32_t>(ir_node);  // clicked the label
-    }
-    x += chip_w + gap;
-  }
+        // The strip acts on the PRESS. The canvas selects on RELEASE, so it asks
+        // pinned_strip_hit() about the same rectangles and leaves a press that
+        // began on a chip alone (see draw_graph_canvas).
+        if (clicked && rect_contains(chip.box, mouse.x, mouse.y)) {
+          if (mouse.x >= chip.remove_x)
+            to_unpin = ir_node;                       // clicked the x
+          else
+            to_fly = static_cast<int32_t>(ir_node);   // clicked the label
+        }
+      });
 
   if (to_unpin != UINT32_MAX) nav_toggle_pin(app, to_unpin);
   else if (to_fly >= 0) nav_jump_to_ir_node(app, static_cast<uint32_t>(to_fly));
