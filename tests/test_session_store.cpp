@@ -197,7 +197,7 @@ TEST_CASE("SessionStore: an out-of-range zoom drops only that entry") {
   SessionFileBackup backup;
 
   // "/bad" has a finite but out-of-clamp-range zoom (camera zoom is clamped to
-  // [0.02, 4.0] — see GraphCanvas.cpp's kMinZoom/kMaxZoom); "/good" is valid.
+  // [0.02, 4.0] — see view/CanvasInput.h's kMinZoom/kMaxZoom); "/good" is valid.
   // A corrupt/hostile entry must not take its siblings down with it.
   write_raw_session_file(R"({
     "tabs": [
