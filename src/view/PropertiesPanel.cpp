@@ -27,6 +27,7 @@
 #include "engine/LayoutEngine.h"
 #include "engine/CostModel.h"   // #32: compute_receptive_fields / NodeReceptiveField
 #include "engine/OpCategory.h"
+#include "engine/ViewFile.h"  // kAttrFilterUiBytes
 #include "engine/plugin/Registry.h"
 #include "ir/IR.h"
 #include "parsers/gguf/GgufMetadata.h"  // #44: well-known GGUF KV grouping
@@ -101,9 +102,8 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
 
   // Reset the filter when the selected node changes so the box never carries a
   // stale filter onto a different node. Keyed by (graph,node).
-  const uint64_t this_key =
-      (static_cast<uint64_t>(app.session().current_graph()) << 32) |
-      static_cast<uint64_t>(&node - g.nodes.data());
+  const uint64_t this_key = panel_detail::attr_filter_key(
+      app.session().current_graph(), static_cast<uint32_t>(&node - g.nodes.data()));
   if (this_key != vs.attr_filter_key) {
     vs.attr_filter_key = this_key;
     vs.attr_filter.clear();
@@ -114,7 +114,7 @@ void draw_attributes(App& app, const ir::Model& model, const ir::Graph& g,
   // tensor table.
   const bool show_filter = node.attributes.count > 6;
   if (show_filter) {
-    char filter_buf[64];
+    char filter_buf[kAttrFilterUiBytes];  // a restored filter is cut to fit (ViewFile.h)
     std::snprintf(filter_buf, sizeof(filter_buf), "%s", vs.attr_filter.c_str());
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::InputTextWithHint("##attr_filter", "filter attributes...",

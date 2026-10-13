@@ -14,6 +14,7 @@
 
 #include "core/ByteReader.h"
 #include "engine/plugin/Registry.h"   // v0.7.0 #10: WASM parser fallback (Unknown branch)
+#include "parsers/caffe/CaffeSniff.h"  // #138: Caffe text + binary NetParameter sniffs
 
 namespace netvis {
 
@@ -30,6 +31,7 @@ const char* format_name(Format f) {
     case Format::Keras:         return "Keras";
     case Format::CoreML:        return "CoreML";
     case Format::TensorFlow:    return "TensorFlow";
+    case Format::Caffe:         return "Caffe";
     case Format::Unknown:       return "Unknown";
   }
   return "Unknown";
@@ -504,6 +506,17 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::OpenVINO;
   }
 
+  // Caffe text NetParameter (.prototxt, #138). A text file cannot match the magic-byte
+  // formats above, but it CAN satisfy the protobuf sniffs below by accident: a valid
+  // prototxt that starts with a blank line and 4-space indentation walks
+  // looks_like_onnx_proto onto ':' (0x3A == field 7, length-delimited) and is claimed as
+  // ONNX. So this runs ahead of every protobuf sniff. Placed after OpenVINO, whose
+  // '<net' + version gate a prototxt does not satisfy.
+  if (caffe::looks_like_prototxt(d, size)) {
+    reason = DetectReason::Structure;
+    return Format::Caffe;
+  }
+
   // Legacy pickle: opcode PROTO (0x80) followed by protocol byte 2..5.
   if (size >= 2 && d[0] == 0x80 && d[1] >= 0x02 && d[1] <= 0x05) {
     reason = DetectReason::Magic;
@@ -552,6 +565,20 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::TensorFlow;
   }
 
+  // Caffe binary NetParameter (.caffemodel, #138). Runs BEFORE looks_like_onnx_proto:
+  // a NetParameter carrying input_shape (field 8, length-delimited) satisfies that loose
+  // sniff outright. It peeks one level deeper (the first layer's `type` string, or a V1
+  // LayerType enum <= 39) and rejects a field-1 varint, so ONNX, SavedModel and CoreML
+  // can never reach a Caffe verdict. After TensorFlow, whose sniffs are stricter. A
+  // GraphDef that the TF sniff misses (no leading NodeDef) is still refused: its
+  // repeated `node` (field 1) fails the singular-name rule, and its `library`
+  // (field 2, a FunctionDefLibrary) fails the V0 peek, whose OpDef signature is a
+  // message, not a printable layer name.
+  if (caffe::looks_like_caffemodel(d, size)) {
+    reason = DetectReason::Structure;
+    return Format::Caffe;
+  }
+
   // ONNX: plausible top-level protobuf ModelProto. Runs after the .mlmodel
   // guard because a bare CoreML protobuf would otherwise be misread as ONNX;
   // ONNX carries the ir_version/graph structural signal for extension-less
@@ -596,6 +623,7 @@ Result<ir::Model> parse_model(const MappedFile& file, const std::string& ext_hin
     case Format::Keras:         return keras::parse(file, progress);
     case Format::CoreML:        return coreml::parse(file, progress);
     case Format::TensorFlow:    return tensorflow::parse(file, progress);
+    case Format::Caffe:         return caffe::parse(file, progress);
     case Format::Unknown:
       // v0.7.0 (#10): a file no built-in format claimed may still be handled by an
       // enabled WASM parser plugin (structurally absent when disabled, §0.4). Only

@@ -215,6 +215,19 @@ TEST_CASE("formats that used to be missing from the dialogs are listed") {
   CHECK(openable("ptl"));
 }
 
+TEST_CASE("both Caffe files are offered by the open dialogs (#138)") {
+  // The Caffe branch once kept its own hand-written dialog lists; after #171 the
+  // dialogs read kExtensionFormats, so the extensions must live in that table.
+  for (const char* ext : {"prototxt", "caffemodel"}) {
+    INFO("extension: " << ext);
+    CHECK(detector_extension(ext));
+    CHECK(openable(ext));
+    bool listed = false;
+    for (const std::string& p : openable_patterns()) listed = listed || p == std::string("*.") + ext;
+    CHECK(listed);
+  }
+}
+
 TEST_CASE("openable extensions are well-formed and unique") {
   std::set<std::string_view> seen;
   for (const std::string_view e : openable_extensions()) {

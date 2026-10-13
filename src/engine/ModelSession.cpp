@@ -87,6 +87,7 @@ void ModelSession::open_async(const std::string& path) {
   current_graph_ = 0;
   graph_stack_.clear();
   timings_ = StageTimings{};
+  shapes_pending_ = false;  // set again below if this model gets a shape job
   progress_.set(0.0f, "mapping");
   path_ = path;
 
@@ -191,6 +192,12 @@ void ModelSession::open_async(const std::string& path) {
       // acts as the happens-before publication point for those writes.
       if (is_onnx) {
         stage_ = LoadStage::Enriching;
+        // #170: the layout completions decide Ready-vs-Enriching from THIS flag,
+        // not from stage_. Reading stage_ lost the race when shape inference
+        // finished before the first layout: the shape completion saw no layout
+        // and left stage_ at Enriching, and the layout completion then saw
+        // Enriching and never advanced it, so the load stayed "Enriching" forever.
+        shapes_pending_ = true;
         // Snapshot the mapping (main thread) so the worker holds it alive even
         // if the primary is reopened mid-inference — reading file_ off-thread
         // would otherwise race a munmap.
@@ -206,7 +213,10 @@ void ModelSession::open_async(const std::string& path) {
             // anything derived from ValueInfo shapes (cost report) must know to
             // recompute — the model pointer and generation_ are unchanged.
             ++enrich_generation_;
-            // Enrichment done; if layout has already landed we are Ready.
+            shapes_pending_ = false;
+            // Enrichment done; if layout has already landed we are Ready. If it has
+            // not, the layout completion sees shapes_pending_ == false and goes
+            // Ready itself.
             if (stage_ == LoadStage::Enriching && layout_) stage_ = LoadStage::Ready;
           });
         });
@@ -227,11 +237,16 @@ void ModelSession::request_layout() {
   const uint64_t gen = generation_;
   const uint64_t structure_hash = collapse_.structure_hash();
   const uint64_t collapse_hash = collapse_.collapse_hash();
+  const bool use_cache = use_layout_cache_;  // snapshot on the main thread (#170)
 
-  jobs_.submit([this, gen, structure_hash, collapse_hash] {
+  jobs_.submit([this, gen, structure_hash, collapse_hash, use_cache] {
     // First try the persistent layout cache keyed by (structure, collapse).
     // Weights never enter the key, so a re-export with identical topology hits.
-    Result<LayoutResult> cached = load_cached_layout(structure_hash, collapse_hash);
+    // #170: `--screenshot --no-layout-cache` skips both the load and the store, so
+    // a before/after image of a layout change cannot be served a stale .nvl.
+    Result<LayoutResult> cached = use_cache
+        ? load_cached_layout(structure_hash, collapse_hash)
+        : Result<LayoutResult>(err("layout cache disabled"));
     if (cached) {
       auto layout = std::make_shared<LayoutResult>(cached.take());
       layout->from_cache = true;
@@ -245,7 +260,7 @@ void ModelSession::request_layout() {
           return;
         }
         layout_ = std::make_unique<LayoutResult>(std::move(*layout));
-        if (stage_ != LoadStage::Enriching) stage_ = LoadStage::Ready;
+        stage_ = shapes_pending_ ? LoadStage::Enriching : LoadStage::Ready;
       });
       return;
     }
@@ -258,7 +273,7 @@ void ModelSession::request_layout() {
 
     // Best-effort persist; a write failure is non-fatal (spec §7.2.7). Skip when
     // cancelled — a partial/empty result must never enter the persistent cache.
-    if (!result.cancelled) store_cached_layout(result);
+    if (!result.cancelled && use_cache) store_cached_layout(result);
 
     auto layout = std::make_shared<LayoutResult>(std::move(result));
     jobs_.post_to_main([this, gen, layout_ms, layout]() mutable {
@@ -282,8 +297,8 @@ void ModelSession::request_layout() {
       }
       timings_.layout_ms = layout_ms;
       layout_ = std::make_unique<LayoutResult>(std::move(*layout));
-      // Ready unless we are still enriching (ONNX shapes not done yet).
-      if (stage_ != LoadStage::Enriching) stage_ = LoadStage::Ready;
+      // Ready unless ONNX shape inference is still pending (see shapes_pending_).
+      stage_ = shapes_pending_ ? LoadStage::Enriching : LoadStage::Ready;
     });
   });
 }

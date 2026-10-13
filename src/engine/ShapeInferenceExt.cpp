@@ -15,6 +15,14 @@
 // LIMITATION: only initializers stored as raw_data (a contiguous mmap range) are
 // readable. Shape tensors packed into ONNX int64_data/int32_data protobuf fields
 // have no recorded offset (parser sets file_offset=UINT64_MAX) and stay Unknown.
+//
+// HONEST EDGES (#138): MaxPool/AveragePool/LpPool honour `ceil_mode` (Caffe's
+// default rounding is CEIL, and ONNX ceil_mode=1 was silently floored). Where
+// runtimes disagree — the last ceil-mode window would start inside the right
+// padding — the dimension is -1, not a guess. A pool or conv window larger than
+// its padded input (and a ConvTranspose whose formula gives <= 0) leaves the
+// output unknown instead of writing a 0 or negative dimension. LRN and
+// MeanVarianceNormalization are shape-preserving by the ONNX spec.
 #include "engine/ShapeInferenceExt.h"
 
 #include <algorithm>
@@ -237,10 +245,13 @@ std::optional<Shape> conv_output_shape(const Model& m, const Graph& g,
     int64_t eff_k = di * (k - 1) + 1;
     int64_t o;
     if (!transpose) {
-      o = (in_dim + p_begin + p_end - eff_k) / st + 1;
+      const int64_t span = in_dim + p_begin + p_end - eff_k;
+      if (span < 0) { ok = false; break; }   // window larger than padded input
+      o = span / st + 1;
     } else {
       int64_t op_pad = out_pad.size() > d ? out_pad[d] : 0;
       o = st * (in_dim - 1) + op_pad + eff_k - p_begin - p_end;
+      if (o <= 0) { ok = false; break; }     // never report a 0/negative dim
     }
     out.push_back(o);
   }
@@ -471,7 +482,8 @@ uint32_t infer_shapes_ext(Model& model, uint32_t graph_index,
         op == "Asin" || op == "Acos" || op == "Atan" || op == "Asinh" ||
         op == "Acosh" || op == "Atanh" || op == "Mish" ||
         op == "ThresholdedRelu" || op == "Celu" || op == "Shrink" ||
-        op == "QuickGelu" || op == "BitwiseNot") {
+        op == "QuickGelu" || op == "BitwiseNot" ||
+        op == "LRN" || op == "MeanVarianceNormalization") {
       // BitwiseNot preserves the integer input dtype, like the transcendentals.
       if (!s0.empty()) { if (set_shape(outv, s0, dt0)) ++resolved; }
       else carry_dtype(outv, dt0);
@@ -567,6 +579,7 @@ uint32_t infer_shapes_ext(Model& model, uint32_t graph_index,
         auto strides = attr_ints(model, g, n, "strides");
         auto pads = attr_ints(model, g, n, "pads");
         auto dil = attr_ints(model, g, n, "dilations");
+        const int64_t ceil_mode = attr_int(model, g, n, "ceil_mode", 0);
         Shape out; out.push_back(s0[0]); out.push_back(s0[1]);
         bool ok = true;
         for (size_t d = 0; d < spatial; ++d) {
@@ -580,7 +593,17 @@ uint32_t infer_shapes_ext(Model& model, uint32_t graph_index,
           int64_t p_begin = pads.size() > d ? pads[d] : 0;
           int64_t p_end = pads.size() > spatial + d ? pads[spatial + d] : 0;
           int64_t eff_k = di * (k - 1) + 1;
-          out.push_back((in_dim + p_begin + p_end - eff_k) / st + 1);
+          const int64_t span = in_dim + p_begin + p_end - eff_k;
+          if (span < 0) { ok = false; break; }          // window larger than padded input
+          int64_t o = span / st + 1;                     // floor (ceil_mode == 0, unchanged)
+          if (ceil_mode != 0) {
+            o = (span + st - 1) / st + 1;                // ceil(span/st) + 1
+            // The last window would start inside the right padding. Runtimes disagree
+            // here (ONNX opset>=19 and PyTorch drop it; Caffe drops it only when
+            // pad > 0), so the dimension is honest-unknown rather than a guess.
+            if ((o - 1) * st >= in_dim + p_begin) { out.push_back(-1); continue; }
+          }
+          out.push_back(o);
         }
         if (ok) { if (set_shape(outv, out, dt0)) ++resolved; }
         else carry_dtype(outv, dt0);

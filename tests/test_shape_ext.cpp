@@ -447,3 +447,105 @@ TEST_CASE("ShapeExt: gap-fill unary Mish is shape-preserving") {
   CHECK(ov.shape[2] == 7);
   CHECK(ov.dtype == ir::DType::F32);
 }
+
+// ---------------------------------------------------------------------------
+// #138 engine fixes: pool ceil_mode, windows larger than the padded input, and
+// LRN / MeanVarianceNormalization shape propagation. Each is ONNX-valid on its
+// own; the Caffe parser depends on them because Caffe's default pool rounding
+// is CEIL.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Append Int / Ints attributes to the node at `node_idx` (which must be the last
+// node added, so its attribute range stays contiguous).
+void add_attr_int(ir::Model& m, ir::Graph& g, uint32_t node_idx,
+                  const std::string& name, int64_t v) {
+  ir::Node& n = g.nodes[node_idx];
+  if (n.attributes.count == 0)
+    n.attributes.begin = static_cast<uint32_t>(g.attributes.size());
+  ir::Attribute a;
+  a.name = m.intern(name);
+  a.value.kind = ir::AttrValue::Kind::Int;
+  a.value.i = v;
+  g.attributes.push_back(std::move(a));
+  ++n.attributes.count;
+}
+
+void add_attr_ints(ir::Model& m, ir::Graph& g, uint32_t node_idx,
+                   const std::string& name, const std::vector<int64_t>& v) {
+  ir::Node& n = g.nodes[node_idx];
+  if (n.attributes.count == 0)
+    n.attributes.begin = static_cast<uint32_t>(g.attributes.size());
+  ir::Attribute a;
+  a.name = m.intern(name);
+  a.value.kind = ir::AttrValue::Kind::Ints;
+  a.value.ints = v;
+  g.attributes.push_back(std::move(a));
+  ++n.attributes.count;
+}
+
+// One MaxPool over `in_shape` with kernel k, stride s and the given ceil_mode
+// (-1 = attribute absent). Returns the inferred output shape.
+std::vector<int64_t> maxpool_shape(const std::vector<int64_t>& in_shape, int64_t k,
+                                   int64_t s, int64_t ceil_mode) {
+  ir::Model m;
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+  uint32_t x = add_value(m, g, "x", ir::DType::F32, in_shape);
+  uint32_t out = add_value(m, g, "out", ir::DType::Unknown, {});
+  uint32_t ni = add_node(m, g, "MaxPool", {x}, {out});
+  add_attr_ints(m, g, ni, "kernel_shape", {k, k});
+  add_attr_ints(m, g, ni, "strides", {s, s});
+  if (ceil_mode >= 0) add_attr_int(m, g, ni, "ceil_mode", ceil_mode);
+  infer_shapes_ext(m, 0, nullptr, 0, nullptr);
+  const ir::ValueInfo& ov = g.values[out];
+  return std::vector<int64_t>(ov.shape.begin(), ov.shape.end());
+}
+
+}  // namespace
+
+TEST_CASE("ShapeExt: MaxPool honours ceil_mode (floor stays the default)") {
+  CHECK(maxpool_shape({1, 1, 8, 8}, 3, 2, 1) == std::vector<int64_t>{1, 1, 4, 4});
+  CHECK(maxpool_shape({1, 1, 8, 8}, 3, 2, 0) == std::vector<int64_t>{1, 1, 3, 3});
+  CHECK(maxpool_shape({1, 1, 8, 8}, 3, 2, -1) == std::vector<int64_t>{1, 1, 3, 3});
+}
+
+TEST_CASE("ShapeExt: ceil_mode window starting in the padding is honest-unknown") {
+  // span = 4, ceil(4/3) + 1 = 3 windows, the last starting at 6 >= 5: runtimes
+  // disagree on keeping it, so the dimension is -1 rather than a guess.
+  CHECK(maxpool_shape({1, 1, 5, 5}, 1, 3, 1) == std::vector<int64_t>{1, 1, -1, -1});
+}
+
+TEST_CASE("ShapeExt: a window larger than the padded input gives no shape") {
+  // Pool: kernel 3 over a 2x2 input used to produce [1,1,0,0].
+  CHECK(maxpool_shape({1, 1, 2, 2}, 3, 1, -1).empty());
+
+  // Conv: weight [1,1,3,3] over a 2x2 input used to produce [1,1,0,0].
+  ir::Model m;
+  m.graphs.emplace_back();
+  ir::Graph& g = m.graphs[0];
+  uint32_t x = add_value(m, g, "x", ir::DType::F32, {1, 1, 2, 2});
+  uint32_t w = add_value(m, g, "w", ir::DType::F32, {1, 1, 3, 3});
+  uint32_t out = add_value(m, g, "out", ir::DType::Unknown, {});
+  add_node(m, g, "Conv", {x, w}, {out});
+  infer_shapes_ext(m, 0, nullptr, 0, nullptr);
+  CHECK(g.values[out].shape.empty());
+  CHECK(g.values[out].dtype == ir::DType::F32);  // dtype still carried
+}
+
+TEST_CASE("ShapeExt: LRN and MeanVarianceNormalization preserve shape and dtype") {
+  for (const char* op : {"LRN", "MeanVarianceNormalization"}) {
+    ir::Model m;
+    m.graphs.emplace_back();
+    ir::Graph& g = m.graphs[0];
+    uint32_t x = add_value(m, g, "x", ir::DType::F32, {1, 4, 5, 5});
+    uint32_t out = add_value(m, g, "out", ir::DType::Unknown, {});
+    add_node(m, g, op, {x}, {out});
+    infer_shapes_ext(m, 0, nullptr, 0, nullptr);
+    const ir::ValueInfo& ov = g.values[out];
+    const std::vector<int64_t> want = {1, 4, 5, 5};
+    const std::vector<int64_t> got(ov.shape.begin(), ov.shape.end());
+    CHECK_MESSAGE(got == want, op);
+    CHECK(ov.dtype == ir::DType::F32);
+  }
+}
