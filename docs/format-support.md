@@ -68,6 +68,8 @@ Two rules apply to every row:
 | GGUF | `tests/fixtures/model_quant.gguf` | no | yes | all | all |
 | PyTorch | `tests/fixtures/model.pt` | no | yes | all | all |
 | PyTorch | `tests/fixtures/model_ts.pt` | no | yes | all | all |
+| PyTorch | `tests/fixtures/model_mobile.ptl` | yes | yes | all | all |
+| PyTorch | `tests/fixtures/model_mobile_v4.ptl` | no | yes | all | all |
 | OpenVINO | `tests/fixtures/model.xml` | yes | yes | all | all |
 | OpenVINO | `tests/fixtures/model_quant.xml` | yes | yes | all | all |
 | NumPy npz | `tests/fixtures/model.npz` | no | yes | all | all |
@@ -130,12 +132,32 @@ type id, decodable only in the inspector's one-block preview.
 
 **PyTorch** — `.pt`/`.pth`/`.bin` open as a tensor table of the state dict, via
 the restricted non-executing `PickleVM`. `float4_e2m1fn_x2` and `float8_*` tensors
-are carried as a label with `DType::Unknown`, as above (no histogram). **A
-TorchScript archive does not yield a compute graph.** `scan_torchscript_code()` is a
-bounded text scan over `code/*.py` that harvests an op *inventory* into
-`torchscript.ops` / `torchscript.methods` metadata; `has_graph` stays `false`. That
-is why `model_ts.pt` sits in the table with `Graph = no`. Issues #108 / #136 / #137
-cover the real parse.
+are carried as a label with `DType::Unknown`, as above (no histogram). TorchScript
+archives pickle the module object itself; its parameters (including tensors kept
+in the state of packed objects such as prepacked conv/linear contexts) are listed
+by module path.
+
+*PyTorch Mobile `.ptl`* (lite-interpreter, `bytecode.pkl`, #137): bytecode v6–v9
+opens as a compute graph. The main method (`forward`) is rebuilt by symbolically
+executing the interpreter's instructions; operators keep their exact
+`aten::`/`prim::` names, module parameters become initializers named by module
+path, and `if`/loops become `prim::If`/`prim::Loop` subgraphs. That is
+`model_mobile.ptl`, `Graph = yes`. Bytecode v3–v5 does not record operator arity,
+so those files (and any stream that contradicts the TorchScript emitter, or holds
+an unknown instruction) show the exact operator inventory from `bytecode.pkl` and
+the reason instead of a guessed graph: `model_mobile_v4.ptl`, `Graph = no`. Known
+gaps: activation dtypes and shapes are unknown (the format records none); the
+flatbuffer container (`PTMF`) is reported as unsupported; methods other than the
+main one are listed, not graphed. Weights inside packed objects that NetVis cannot
+decode (for example quantized tensors in `*PackedParamsBase`) are counted in
+`torchscript.packed_unlocated`, and the parameter totals are then shown as a lower
+bound.
+
+*Desktop TorchScript* (`torch.jit.save`): **does not yield a compute graph.**
+`scan_torchscript_code()` is a bounded text scan over `code/*.py` that harvests an
+op *inventory* into `torchscript.ops` / `torchscript.methods` metadata; `has_graph`
+stays `false`. That is why `model_ts.pt` sits in the table with `Graph = no`.
+Issues #108 / #136 cover the real parse.
 
 **OpenVINO** — full graph from the `.xml`, weights recorded into the sibling
 `.bin` through the same external-data plumbing ONNX uses. Sub-byte element types
@@ -195,7 +217,7 @@ has an open issue:
 | Caffe (`.prototxt` + `.caffemodel`) | #109, #138 |
 | Darknet (`.cfg` + `.weights`) | #110, #139 |
 | torch.export (`.pt2`) / ExecuTorch (`.pte`) | #111, #140, #141 |
-| TorchScript compute graph (desktop archive and mobile `.ptl`) | #108, #136, #137 |
+| TorchScript compute graph from a desktop `torch.jit.save` archive (mobile `.ptl` opens; see above) | #108, #136 |
 | MLIR | #132, #144 |
 
 A file none of the built-in formats claims is offered to registered parser
