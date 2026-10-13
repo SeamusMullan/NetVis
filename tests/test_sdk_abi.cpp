@@ -2,14 +2,26 @@
 // tests/test_sdk_abi.cpp — SDK-header <-> C++-contract drift guard (#10, Increment D).
 //
 // Includes the shipped SDK header in HOST-BRIDGE mode (imports excluded) alongside
-// the real C++ headers and static_asserts that every wire enum / version / cap in
-// plugins/sdk/netvis_plugin.h matches its C++ source of truth. Any drift (a new
-// DType, a renumbered OpCategory, a bumped ABI version, a changed cap) fails the
-// host build here — so the SDK we ship can never silently diverge from the host.
+// the real C++ headers and static_asserts that every wire enum / version in
+// plugins/sdk/netvis_plugin.h matches its C++ source of truth, and that the wire
+// struct's layout (size, alignment, every member offset) is the one the header
+// documents. Any drift (a new DType, a renumbered OpCategory, a bumped ABI version, a
+// reshuffled struct) fails the host build here — so the SDK we ship can never
+// silently diverge from the host.
+//
+// The marshalling/sandbox CAPS are not copied into a second place to be compared:
+// the host takes them straight from the header (src/engine/plugin/wasm/SdkCaps.h)
+// and static_asserts its per-facet budgets against the header's ceilings, so a cap
+// edited in the header changes the host in the same commit. What each import's
+// SIGNATURE and each guest export's NAME must be is held by
+// tests/test_plugin_abi_freeze.cpp against plugins/sdk/abi-v1-surface.txt.
 #define NETVIS_SDK_HOST_BRIDGE 1
 #include "plugins/sdk/netvis_plugin.h"
 
 #include <doctest/doctest.h>
+
+#include <cstddef>
+#include <cstdint>
 
 #include "engine/OpCategory.h"
 #include "engine/plugin/OpHandler.h"
@@ -60,6 +72,18 @@ static_assert((int)NV_CAT_OTHER == 14, "OpCategory count/Other drift");
 static_assert(NETVIS_OP_ABI_VERSION == plugin::kOpHandlerAbiVersion, "op abi");
 static_assert(NETVIS_PARSER_ABI_VERSION == plugin::kParserPluginAbiVersion, "parser abi");
 static_assert(NETVIS_PASS_ABI_VERSION == plugin::kPassPluginAbiVersion, "pass abi");
+
+// --- nv_tensor_hdr_t: layout. The header asserts only the total size; two int32_t
+// members swapped keep the size, so the members are pinned individually here. The
+// header says the struct is documentation-only in v1 (no import takes it), but its
+// layout is frozen so a later import that does pass it inherits one that never moved.
+static_assert(sizeof(nv_tensor_hdr_t) == 24, "nv_tensor_hdr_t size");
+static_assert(alignof(nv_tensor_hdr_t) == 8, "nv_tensor_hdr_t alignment");
+static_assert(offsetof(nv_tensor_hdr_t, off) == 0, "nv_tensor_hdr_t::off");
+static_assert(offsetof(nv_tensor_hdr_t, len) == 8, "nv_tensor_hdr_t::len");
+static_assert(offsetof(nv_tensor_hdr_t, dtype) == 16, "nv_tensor_hdr_t::dtype");
+static_assert(offsetof(nv_tensor_hdr_t, rank) == 20, "nv_tensor_hdr_t::rank");
+static_assert(sizeof(nv_strid_t) == 4, "nv_strid_t is a 32-bit interned-string id");
 
 // A trivial runtime case so the TU registers with doctest (the real coverage is the
 // static_asserts above, checked at compile time).

@@ -27,3 +27,6 @@ metric appears in the analyzer's pass-metrics list.
   no pointer to host state crosses the sandbox.
 - A trap or fuel-exhaustion mid-run simply yields whatever metrics were emitted; the
   app always survives.
+- `netvis_pass_abi_version` declares the ABI the pass was built against. It is
+  optional for a pass (older passes lack it and are taken to be ABI v1), but a pass
+  that declares a version other than the host's is refused rather than run.

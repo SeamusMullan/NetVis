@@ -15,6 +15,13 @@
 
 #include <stdint.h>
 
+/* Declare the ABI this pass was built against. Optional for a pass (the facet
+ * shipped in v0.6.0 before this export existed, so a pass without it is taken to be
+ * ABI v1), but a pass that declares it is refused by a host speaking a different
+ * version instead of being run as if the two agreed. */
+NV_EXPORT("netvis_pass_abi_version")
+int32_t netvis_pass_abi_version(void) { return NETVIS_PASS_ABI_VERSION; }
+
 NV_EXPORT("run")
 int32_t run(void) {
   nv_arena_reset();
