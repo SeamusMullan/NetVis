@@ -48,6 +48,14 @@ uint32_t resolve_edge_value(const ir::Graph& g, const ir::Range& r, uint32_t slo
 // node for that group. Returns -1 if not currently displayed.
 int32_t display_index_for_node(const CollapseTree& collapse, uint32_t ir_node);
 
+// The key an attribute filter is tied to: "typed against THIS node of THIS graph".
+// PropertiesPanel clears ViewState::attr_filter whenever the node it draws no longer
+// has this key; whoever restores a filter together with a selection (a loaded view
+// file) sets ViewState::attr_filter_key to the key of the node it selected.
+inline uint64_t attr_filter_key(uint32_t graph, uint32_t ir_node) {
+  return (static_cast<uint64_t>(graph) << 32) | static_cast<uint64_t>(ir_node);
+}
+
 // World-space center of the layout box for `display_id`, or {0,0} if the id is
 // out of range / no layout. Hoisted here (was private to SearchBar.cpp) so
 // search, navigation jump-to, and the diff panel can share one fly-to helper.

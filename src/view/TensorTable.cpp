@@ -25,6 +25,7 @@
 // LayoutEngine.h defines SizeFn, referenced by the frozen ModelSession.h that
 // App.h pulls in without including it; include it first so App.h compiles.
 #include "engine/LayoutEngine.h"
+#include "engine/ViewFile.h"  // kTableFilterUiBytes
 #include "ir/IR.h"
 #include "view/App.h"
 #include "view/PanelHelpers.h"
@@ -163,7 +164,7 @@ void draw_tensor_table(App& app) {
   ImGui::BeginGroup();
 
   // Name filter (char buffer synced to vs.table_filter; imgui_stdlib not built).
-  static char filter_buf[256];
+  static char filter_buf[kTableFilterUiBytes];  // a restored filter is cut to fit (ViewFile.h)
   std::snprintf(filter_buf, sizeof(filter_buf), "%s", vs.table_filter.c_str());
   ImGui::SetNextItemWidth(240.0f);
   if (ImGui::InputTextWithHint("##filter", "filter name...", filter_buf,
