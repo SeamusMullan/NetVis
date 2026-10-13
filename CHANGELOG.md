@@ -30,9 +30,12 @@ This file starts at the relicensing; earlier history is in the git tags and GitH
   version their module declared, so the Registry's own version check applies to them.
   That load-time probe runs guest code (the module's start section, then its
   ABI-version export) wherever plugins are loaded, so it has its own 50,000-step
-  budget, far below the run budgets: a module whose start section or ABI export does
-  not finish within it is refused, with the budget named in the Plugins panel, instead
-  of freezing start-up for as long as the module's run budget lasts. A pass whose ABI
+  budget, far below the run budgets, shared by the two (the budget is not refilled
+  between them): a module whose start section and ABI export do not finish within it
+  together is refused, with the budget named in the Plugins panel, instead of freezing
+  start-up for as long as the module's run budget lasts. The budget counts steps, not
+  wall-clock time: a module that spends it on bulk-memory instructions can still stall
+  the probe for seconds (see `docs/plugin-abi.md`; a fix is tracked in #182). A pass whose ABI
   export is present but broken is refused rather than taken for a pre-negotiation v1
   pass, and a refused pass reports no metrics.
   Negotiation is tested for the manifest (all three loaders), the module (op, parser

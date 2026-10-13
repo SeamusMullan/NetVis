@@ -74,19 +74,35 @@ therefore runs under its own step budget, `kAbiProbeStepBudget` =
 **50,000 steps**, far below the parse/run and sniff budgets above. A step is one
 function call or one loop iteration.
 
-**The module's start section and its ABI-version export must each finish within that
-budget.** A version read is a constant function and a toolchain-built start section is
-a handful of calls, so neither comes close; a module whose start section loops, or that
-does real work there, is refused — not registered — with this reason in the plugin
-load diagnostics (the Plugins panel's error text):
+**The module's start section and its ABI-version export share that budget: together
+they must finish within it.** wasm3 runs the start section inside the lookup of the
+first export, and the budget is not refilled for the export call that follows, so a
+module cannot spend it twice. A version read is a constant function and a
+toolchain-built start section is a handful of calls, so neither comes close; a module
+whose start section loops, or that does real work there, is refused — not registered —
+with this reason in the plugin load diagnostics (the Plugins panel's error text):
 
 > module exceeded the ABI probe budget (50000 steps): its start section and
-> `netvis_op_abi_version` must each finish within it
+> `netvis_op_abi_version` must finish within it together
 
 Put real initialisation in the entry points (`netvis_op_*`, `netvis_parse`, `run`),
 which run under the facet budgets above, not in the start section. (A pass that does
 not export the optional `netvis_pass_abi_version` has nothing for the probe to call, so
 its start section first runs in `run()`, under the pass's own budget.)
+
+**What the budget does not bound: wall-clock time.** The budget counts steps — function
+calls and loop iterations — not work done inside a step. A bulk-memory instruction
+(`memory.fill`, `memory.copy`) touches up to the whole linear memory in one step, and
+the host does not charge it by bytes. A hostile module can therefore spend its 50,000
+steps on `memory.fill` over its whole memory and hold the thread that loads plugins
+(the UI thread) for seconds. Measured with the whole budget spent that way: about 5 s
+at the op handler's 64 pages, about 0.3 s at the parser's 4 pages and about 20 s at the
+pass's 256 pages (16 MiB). These figures move by a factor of two or more with machine
+load. The module is still refused when the budget runs out, and a plugin that is not
+adversarial never comes near this. Closing the gap — charging bulk-memory fuel by
+bytes, a wall-clock deadline in the step hook, and probing off the UI thread — is
+tracked in #182. Until then, do not enable a
+WASM plugin whose source you do not trust.
 
 ## Compatibility promise (ABI v1)
 
@@ -229,8 +245,9 @@ that a gate which refuses everything cannot pass:
   must keep running). A WASM parser with a missing export is covered by its own
   fixture.
 - **ABI probe budget**: for each facet, a start section that never ends, an ABI export
-  that never returns, and a start section that finishes but needs far more steps than
-  the budget — each refused with the budget named (and, for the op handler, shown
+  that never returns, a start section that finishes but needs far more steps than the
+  budget, and a module whose start section and ABI export each fit the budget (40,000
+  steps) but not together — each refused with the budget named (and, for the op handler, shown
   through `discover_and_load_plugins`), next to a control whose short start section is
   admitted. A pass's ABI export that emits a metric before returning an unsupported
   version leaves `run()` with no metrics, and one whose export is present but broken

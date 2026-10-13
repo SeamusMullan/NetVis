@@ -1915,7 +1915,7 @@ def build_wasm_pass(abi_version=None, abi_emits_metric=False, abi_broken=False):
     return bytes(out)
 
 
-def build_wasm_abi_probe(abi_export, start=None, export_loops=False):
+def build_wasm_abi_probe(abi_export, start=None, export_loops=False, export_count=None):
     """A module for the ABI PROBE's step budget (#113 review): the probe is the one-off
     load that asks a module which ABI it was built for, and it runs on the thread that
     loads plugins, so a module whose start section (or ABI export) never ends must be
@@ -1929,6 +1929,9 @@ def build_wasm_abi_probe(abi_export, start=None, export_loops=False):
                    "forever" a start section that loops forever (loop; br 0)
                    N (int)   a start section that loops N times (a counted loop)
       export_loops the ABI export itself loops forever before returning 1
+      export_count N (int) the ABI export loops N times (a counted loop), then returns 1.
+                   With `start` = N too, a module whose phases each fit the probe budget
+                   but not together: the budget is shared, not refilled for the export.
 
     wasm3 runs the start function lazily on the first m3_FindFunction, and checks
     `if (module->startFunction)` - truthiness - so the start function's index must be
@@ -1939,17 +1942,22 @@ def build_wasm_abi_probe(abi_export, start=None, export_loops=False):
     nm = abi_export.encode()
     exports = _uleb(1) + _uleb(len(nm)) + nm + b"\x00" + _uleb(0)
     forever = b"\x03\x40" + b"\x0c" + _uleb(0) + b"\x0b"          # loop; br 0; end
-    b_abi = _uleb(0) + (forever if export_loops else b"") + b"\x41\x01\x0b"
+    def counted(n):
+        # i32.const N; local.set 0; loop; local.get 0; i32.const 1; i32.sub;
+        # local.tee 0; br_if 0; end   (needs one i32 local)
+        return (b"\x41" + _sleb(n) + b"\x21\x00" +
+                b"\x03\x40" + b"\x20\x00" + b"\x41\x01" + b"\x6b" +
+                b"\x22\x00" + b"\x0d" + _uleb(0) + b"\x0b")
+    one_i32_local = _uleb(1) + _uleb(1) + b"\x7f"
+    if export_count is not None:
+        b_abi = one_i32_local + counted(export_count) + b"\x41\x01\x0b"
+    else:
+        b_abi = _uleb(0) + (forever if export_loops else b"") + b"\x41\x01\x0b"
     bodies = [b_abi]
     if start == "forever":
         bodies.append(_uleb(0) + forever + b"\x0b")
     elif start is not None:
-        # one i32 local; i32.const N; local.set 0; loop; local.get 0; i32.const 1;
-        # i32.sub; local.tee 0; br_if 0; end; end
-        bodies.append(_uleb(1) + _uleb(1) + b"\x7f" +
-                      b"\x41" + _sleb(start) + b"\x21\x00" +
-                      b"\x03\x40" + b"\x20\x00" + b"\x41\x01" + b"\x6b" +
-                      b"\x22\x00" + b"\x0d" + _uleb(0) + b"\x0b" + b"\x0b")
+        bodies.append(one_i32_local + counted(start) + b"\x0b")
     code = _uleb(len(bodies))
     for body in bodies:
         code += _uleb(len(body)) + body
@@ -2346,6 +2354,12 @@ def main():
         write("plugin_probe_%s_export_loop.wasm" % facet, build_wasm_abi_probe(export, export_loops=True))
         write("plugin_probe_%s_start_long.wasm" % facet, build_wasm_abi_probe(export, start=1000000))
         write("plugin_probe_%s_start_short.wasm" % facet, build_wasm_abi_probe(export, start=1000))
+        # The budget is ONE budget for the start section plus the export (50,000 steps):
+        # 40,000 iterations in one phase fits; 40,000 in each does not.
+        write("plugin_probe_%s_start_most.wasm" % facet, build_wasm_abi_probe(export, start=40000))
+        write("plugin_probe_%s_export_most.wasm" % facet, build_wasm_abi_probe(export, export_count=40000))
+        write("plugin_probe_%s_shared.wasm" % facet,
+              build_wasm_abi_probe(export, start=40000, export_count=40000))
     # Link-time fixtures (#113): an SDK-signature import that must bind, a real name
     # with a wrong signature, and an import this host has no function for.
     write("plugin_ophandler_const_ints.wasm", build_wasm_op_link_probe("const_ints"))

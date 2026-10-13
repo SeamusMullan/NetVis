@@ -150,7 +150,10 @@ RunResult WasmModule::call_i32(const char* export_name, int32_t* out_ret) {
     return r;
   }
 
-  g_fuel = impl_->lim.max_steps;   // refresh for the actual call
+  // Refill for the actual call - except under a shared budget (an ABI probe), where the
+  // start section run by the lookup above and this call draw on one max_steps, so a
+  // module cannot spend the budget twice.
+  if (!impl_->lim.share_start_budget) g_fuel = impl_->lim.max_steps;
   err = m3_CallV(fn);
   g_fuel_armed = false;
 

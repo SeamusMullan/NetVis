@@ -1219,7 +1219,7 @@ TEST_CASE("ABI v1: a WASM pass plugin is gated on the ABI it declares") {
     CHECK(pass.api_version() == 0);
     const std::string why =
         pass.probe().refusal(kPassPluginAbiVersion, "netvis_pass_abi_version");
-    CHECK_MESSAGE(why.find("present but failed") != std::string::npos, "refusal said: " << why);
+    CHECK_MESSAGE(why.find("export failed") != std::string::npos, "refusal said: " << why);
     CHECK(pass.run(m, 0, report).metrics.empty());
     reg.register_pass(std::make_unique<wasm::WasmPassPlugin>(
         "broken-abi-pass", read_bytes("tests/fixtures/plugin_pass_abi_broken.wasm")));
@@ -1416,6 +1416,71 @@ TEST_CASE("ABI v1: a module that cannot answer the ABI question within the probe
     reg.register_pass(std::make_unique<wasm::WasmPassPlugin>(
         "probe-pass-ok", read_bytes("tests/fixtures/plugin_probe_pass_start_short.wasm")));
     CHECK(reg.snapshot()->passes.count("probe-pass-ok") == 1);
+  }
+
+  // The start section and the ABI export draw on ONE budget. wasm3 runs the start
+  // section inside the export's lookup, and the call used to be given a fresh budget
+  // after it, so a module could spend the budget twice (twice the worst-case stall).
+  // Each fixture below runs a counted loop of 40,000 iterations: `start_most` in its
+  // start section only, `export_most` in the ABI export only - each fits the 50,000
+  // budget alone, so each is admitted - and `shared` runs both, 80,000 steps in all,
+  // which fits only if the budget is refilled between them.
+  SUBCASE("op handler: a start section and an export that each fit but not together") {
+    CHECK(wasm::load_wasm_op_plugin(
+              PluginDir("probe_op_most_s", op_manifest(current),
+                        "plugin_probe_op_start_most.wasm").manifest).empty());
+    reg.reset_to_builtins();
+    CHECK(wasm::load_wasm_op_plugin(
+              PluginDir("probe_op_most_e", op_manifest(current),
+                        "plugin_probe_op_export_most.wasm").manifest).empty());
+    reg.reset_to_builtins();
+
+    PluginDir pd("probe_op_shared", op_manifest(current), "plugin_probe_op_shared.wasm");
+    const std::string why = wasm::load_wasm_op_plugin(pd.manifest);
+    CHECK_MESSAGE(why.find(reason) != std::string::npos, "loader said: " << why);
+    CHECK(reg.resolve_op("matmul").origin == Origin::Builtin);
+    auto image = load_image("plugin_probe_op_shared.wasm");
+    REQUIRE(image != nullptr);
+    const wasm::WasmAbiProbe probe = wasm::probe_op_module(*image);
+    CHECK(probe.loaded);
+    CHECK(probe.abi.fuel_exhausted);
+    CHECK_FALSE(probe.compatible(kOpHandlerAbiVersion));
+  }
+
+  SUBCASE("parser: a start section and an export that each fit but not together") {
+    const size_t before = reg.snapshot()->parsers.size();
+    CHECK(wasm::load_wasm_parser_plugin(
+              PluginDir("probe_parser_most_s", parser_manifest(current),
+                        "plugin_probe_parser_start_most.wasm").manifest).empty());
+    CHECK(wasm::load_wasm_parser_plugin(
+              PluginDir("probe_parser_most_e", parser_manifest(current),
+                        "plugin_probe_parser_export_most.wasm").manifest).empty());
+    CHECK(reg.snapshot()->parsers.size() == before + 2);
+
+    PluginDir pd("probe_parser_shared", parser_manifest(current),
+                 "plugin_probe_parser_shared.wasm");
+    const std::string why = wasm::load_wasm_parser_plugin(pd.manifest);
+    CHECK_MESSAGE(why.find(reason) != std::string::npos, "loader said: " << why);
+    CHECK(reg.snapshot()->parsers.size() == before + 2);
+  }
+
+  SUBCASE("pass: a start section and an export that each fit but not together") {
+    for (const char* ok : {"plugin_probe_pass_start_most.wasm",
+                           "plugin_probe_pass_export_most.wasm"}) {
+      CAPTURE(ok);
+      wasm::WasmPassPlugin pass("probe-pass-most", read_bytes(std::string("tests/fixtures/") + ok));
+      CHECK(pass.api_version() == kPassPluginAbiVersion);
+      CHECK(pass.probe().refusal(kPassPluginAbiVersion, "netvis_pass_abi_version").empty());
+    }
+    wasm::WasmPassPlugin pass("probe-pass-shared",
+                              read_bytes("tests/fixtures/plugin_probe_pass_shared.wasm"));
+    CHECK(pass.probe().loaded);
+    CHECK(pass.probe().abi.fuel_exhausted);
+    CHECK(pass.api_version() == 0);
+    const std::string why =
+        pass.probe().refusal(kPassPluginAbiVersion, "netvis_pass_abi_version");
+    CHECK_MESSAGE(why.find(reason) != std::string::npos, "refusal said: " << why);
+    CHECK_MESSAGE(why.find("together") != std::string::npos, "refusal said: " << why);
   }
 
   reg.reset_to_builtins();

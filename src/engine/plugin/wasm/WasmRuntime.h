@@ -25,6 +25,10 @@ namespace netvis::plugin::wasm {
 struct SandboxLimits {
   uint32_t max_memory_pages = 256;    // 256 * 64KiB = 16 MiB linear-memory cap
   uint64_t max_steps = 200'000'000;   // fuel: yield-check decrements; 0 => trap
+  // false: call_i32 refills the fuel between the lookup (which is where wasm3 runs the
+  // module's start section) and the call itself, so each gets max_steps. true: they
+  // draw on ONE max_steps - an ABI probe sets this (abi_probe_limits).
+  bool share_start_budget = false;
 };
 
 // The step budget of an ABI PROBE: the one-off load a plugin adapter does to ask a
@@ -36,15 +40,18 @@ struct SandboxLimits {
 // app for as long as that budget lasts. Reading a version is a constant function and
 // a legitimate start section is a handful of calls, so this is deliberately tiny.
 // A "step" is one function call or one loop iteration (the m3_Yield points).
-// The module's start section and its ABI-version export each get this many; a module
-// that needs more is refused, with that reason (docs/plugin-abi.md, "ABI probe
-// budget"). Every probe takes its limits from abi_probe_limits() below.
+// The module's start section and its ABI-version export SHARE this many (the fuel is not
+// refilled between them); a module that needs more is refused, with that reason
+// (docs/plugin-abi.md, "ABI probe budget"). Every probe takes its limits from
+// abi_probe_limits() below.
 // This bounds STEPS, not wall-clock time: a guest that does bulk-memory work in every
 // step (memory.fill over its whole memory) makes a step cost as much as the memory is
-// large, so an adversarial module can still stretch a probe to seconds (measured: ~5 s
-// at the op cap, ~0.3 s at the parser's, ~20 s at the pass's 16 MiB). Closing that
-// needs a wall-clock deadline in m3_Yield and/or probing off the UI thread; both are
-// follow-ups, not done here.
+// large, so an adversarial module can still stretch a probe to seconds (measured with
+// the whole budget spent on memory.fill: ~5 s at the op cap, ~0.3 s at the parser's,
+// ~20 s at the pass's 16 MiB; machine load moves these by a factor of two or more).
+// Closing that needs a wall-clock deadline in m3_Yield, fuel charged by bytes for the
+// bulk-memory ops, and/or probing off the UI thread; those are a follow-up (#182), not
+// done here.
 inline constexpr uint64_t kAbiProbeStepBudget = 50'000;
 // Far below every budget a facet runs under (the smallest, the parser sniff, is
 // 500,000 steps; the op handler gets 2,000,000 and parse/run the 200M ceiling).
@@ -57,6 +64,7 @@ inline SandboxLimits abi_probe_limits(uint32_t max_memory_pages) {
   SandboxLimits lim;
   lim.max_memory_pages = max_memory_pages;
   lim.max_steps = kAbiProbeStepBudget;
+  lim.share_start_budget = true;
   return lim;
 }
 
@@ -194,13 +202,15 @@ struct WasmAbiProbe {
         // The probe is bounded so that loading a plugin cannot hang the app.
         return "module exceeded the ABI probe budget (" +
                std::to_string(kAbiProbeStepBudget) + " steps): its start section and `" +
-               abi_export + "` must each finish within it";
+               abi_export + "` must finish within it together";
       }
       if (!abi.export_missing) {
         // Present but unusable (traps, will not compile, wrong signature): not the
-        // same as a module that never declared a version.
-        return std::string("module's `") + abi_export + "` export is present but " +
-               "failed (" + abi.message + "); this NetVis speaks ABI v" +
+        // same as a module that never declared a version. wasm3 runs the start
+        // section inside the export's lookup, so a trap there reaches us as this
+        // export failing; name both rather than send the author to the wrong one.
+        return std::string("module's start section or `") + abi_export +
+               "` export failed (" + abi.message + "); this NetVis speaks ABI v" +
                std::to_string(host_version);
       }
       return std::string("module does not declare an ABI version (no usable `") +
