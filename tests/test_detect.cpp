@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -685,8 +686,11 @@ TEST_CASE("detect #137 T-D6/T-D7/T-D8: .ptl is a tiebreak, never beats content")
 }
 
 TEST_CASE("detect #137 T-D9: a PTMF flatbuffer is routed to an honest error") {
+  // Root table at 28, its vtable at 20 (soffset 8): 8-byte vtable, 8-byte table.
   std::vector<uint8_t> b = {0x1c, 0, 0, 0, 'P', 'T', 'M', 'F'};
   b.resize(64, 0);
+  const uint8_t vtable[] = {8, 0, 8, 0, 4, 0, 0, 0, 8, 0, 0, 0};
+  std::memcpy(b.data() + 20, vtable, sizeof(vtable));
   for (const char* ext : {"ptl", ""}) {
     DetectReason r = DetectReason::None;
     CHECK(detect_bytes_reason(std::string("d9") + ext, b, ext, r) == Format::PyTorchZip);
@@ -701,6 +705,29 @@ TEST_CASE("detect #137 T-D9: a PTMF flatbuffer is routed to an honest error") {
   REQUIRE_FALSE(res);
   CHECK(res.error().message.find("flatbuffer") != std::string::npos);
   CHECK(res.error().offset == 4);
+}
+
+TEST_CASE("detect #137: \"PTMF\" at bytes 4..8 without a flatbuffer root is not PyTorch") {
+  // An ONNX ModelProto: ir_version 7 (08 07), then producer_name (12 07) whose
+  // first four characters land on bytes 4..8. The root uoffset this implies
+  // (0x07120708) is far past the end of the file.
+  std::vector<uint8_t> onnx = {0x08, 0x07, 0x12, 0x07, 'P', 'T', 'M', 'F', 'e', 'x', 'p'};
+  onnx.resize(96, 0);
+  for (const char* ext : {"onnx", ""}) {
+    DetectReason r = DetectReason::None;
+    INFO("ext: " << ext);
+    CHECK(detect_bytes_reason(std::string("ptmf_onnx") + ext, onnx, ext, r) !=
+          Format::PyTorchZip);
+  }
+  // A plausible root offset whose table points at a vtable outside the file.
+  std::vector<uint8_t> bad = {0x10, 0, 0, 0, 'P', 'T', 'M', 'F'};
+  bad.resize(32, 0);
+  bad[16] = 0x00;
+  bad[17] = 0x00;
+  bad[18] = 0x00;
+  bad[19] = 0x80;  // soffset INT32_MIN: vtable far past the end
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("ptmf_badvt", bad, "", r) != Format::PyTorchZip);
 }
 
 TEST_CASE("detect #137: a zip with neither pickle keeps the no-data.pkl error") {

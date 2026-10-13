@@ -384,6 +384,30 @@ bool looks_like_coreml(const uint8_t* d, uint64_t size) {
   return false;
 }
 
+// PyTorch Mobile flatbuffer (_use_flatbuffer=True): file identifier "PTMF" at
+// bytes [4..8) AND a structurally valid flatbuffer root. The identifier alone
+// is only four bytes: an ONNX ModelProto with a one-byte ir_version and a
+// producer_name starting "PTMF" has them at the same place. So the root uoffset
+// (u32 LE at 0) must be 4-aligned and inside the file, and the root table's
+// vtable (root - soffset) must be inside the file with sane vtable/table sizes.
+bool looks_like_ptmf(const uint8_t* d, uint64_t size) {
+  if (size < 8 || std::memcmp(d + 4, "PTMF", 4) != 0) return false;
+  auto u16 = [d](uint64_t o) { return static_cast<uint32_t>(d[o] | (d[o + 1] << 8)); };
+  auto u32 = [d](uint64_t o) {
+    return static_cast<uint32_t>(d[o]) | (static_cast<uint32_t>(d[o + 1]) << 8) |
+           (static_cast<uint32_t>(d[o + 2]) << 16) | (static_cast<uint32_t>(d[o + 3]) << 24);
+  };
+  const uint64_t root = u32(0);
+  if (root < 8 || root % 4 != 0 || root + 4 > size) return false;
+  const int64_t soff = static_cast<int32_t>(u32(root));
+  const int64_t vt = static_cast<int64_t>(root) - soff;
+  if (vt < 8 || vt % 2 != 0 || static_cast<uint64_t>(vt) + 4 > size) return false;
+  const uint64_t vt_size = u16(static_cast<uint64_t>(vt));
+  const uint64_t tbl_size = u16(static_cast<uint64_t>(vt) + 2);
+  return vt_size >= 4 && vt_size % 2 == 0 && static_cast<uint64_t>(vt) + vt_size <= size &&
+         tbl_size >= 4 && root + tbl_size <= size;
+}
+
 }  // namespace
 
 Format detect_format(const MappedFile& file, const std::string& ext_hint,
@@ -407,12 +431,12 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
     return Format::TFLite;
   }
 
-  // PyTorch Mobile flatbuffer (_use_flatbuffer=True): file identifier "PTMF" at
-  // bytes [4..8). Not parsed; routed to the PyTorch zip parser so the user gets
-  // its honest "flatbuffer not supported" error instead of "unrecognized". It
-  // cannot reach the SafeTensors check below: its u64 header-length field is
-  // uoffset | 'PTMF' << 32, larger than any real file.
-  if (size >= 8 && std::memcmp(d + 4, "PTMF", 4) == 0) {
+  // PyTorch Mobile flatbuffer (looks_like_ptmf). Not parsed; routed to the
+  // PyTorch zip parser so the user gets its honest "flatbuffer not supported"
+  // error instead of "unrecognized". It cannot reach the SafeTensors check
+  // below: its u64 header-length field is uoffset | 'PTMF' << 32, larger than
+  // any real file.
+  if (looks_like_ptmf(d, size)) {
     reason = DetectReason::Magic;
     return Format::PyTorchZip;
   }
