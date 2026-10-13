@@ -332,6 +332,9 @@ void draw_model_root(App& app, const ir::Model& model) {
   stat("nodes", "nodes:   ", grouped_count(static_cast<int64_t>(node_count)));
   stat("edges", "edges:   ", grouped_count(static_cast<int64_t>(edge_count)));
   stat("params", "params:  ", grouped_count(total_params));
+  if (model.unlocated_weights > 0)
+    ImGui::TextDisabled("(lower bound: %llu packed value(s) not located)",
+                        static_cast<unsigned long long>(model.unlocated_weights));
 
   // v0.3.0 analyzer: model-wide cost totals + quant-coverage + heatmap toggle.
   draw_cost_section(app);

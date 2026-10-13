@@ -783,7 +783,9 @@ TEST_CASE("Caffe J: fork and unknown layer types stay unresolved") {
 
   // Display names for types NetVis does not know.
   CHECK(caffe::safe_display_name("Upsample") == "Upsample");
-  CHECK(caffe::safe_display_name("Permute") == "Permute");
+  // "permute" became an OpCategory key with TorchScript (#137), so Caffe's SSD
+  // Permute layer is neutralised like any other colliding name.
+  CHECK(caffe::safe_display_name("Permute") == "CaffePermute");
   CHECK(caffe::safe_display_name("Transpose") == "CaffeTranspose");
   CHECK(caffe::safe_display_name("Identity") == "CaffeIdentity");
   CHECK(caffe::safe_display_name("ReduceAll") == "CaffeReduceAll");

@@ -211,6 +211,8 @@ TEST_CASE("formats that used to be missing from the dialogs are listed") {
     INFO("extension: " << ext);
     CHECK(openable(ext));
   }
+  // #137: PyTorch Mobile lite-interpreter archives.
+  CHECK(openable("ptl"));
 }
 
 TEST_CASE("both Caffe files are offered by the open dialogs (#138)") {

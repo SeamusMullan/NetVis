@@ -42,10 +42,11 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   **TensorFlow** (frozen `.pb` GraphDef + `saved_model.pb` bundles, incl. the
   FunctionDef library as drill-down subgraphs), **Caffe** (`.prototxt` +
   `.caffemodel`, current and legacy V1 schemas; a `.prototxt` picks up weights
-  from a `.caffemodel` beside it), and best-effort **TorchScript** archive op
-  listings. Zip-based formats are disambiguated by content, not extension.
-  SavedModel checkpoint weights (`variables/`) are reported as present but not
-  decoded. What each format actually yields — graph, shapes, addressable
+  from a `.caffemodel` beside it), **PyTorch Mobile** lite-interpreter archives
+  (`.ptl`, bytecode v6–v9) as real compute graphs, and best-effort **TorchScript**
+  desktop-archive op listings. Zip-based formats are disambiguated by content, not
+  extension. SavedModel checkpoint weights (`variables/`) are reported as present
+  but not decoded. What each format actually yields — graph, shapes, addressable
   weights — and where the gaps are is in
   [`docs/format-support.md`](docs/format-support.md); its support table is checked
   against the parsers on every test run (the prose around it is not).
@@ -117,6 +118,9 @@ convolutions (green) stand out from memory-bound activations/pooling (purple).*
   virtualized, sortable tensor table with a dotted-key module hierarchy.
 - **Safety:** the PyTorch pickle reader is a *restricted VM* with an explicit
   allowlist — unknown reduce targets become inert placeholders, never executed.
+  It records pickled object state but never calls into it; the only identity
+  helpers it interprets beyond tensor reconstruction are torch's
+  `torch.jit._pickle` list/dict wrappers.
 - **Export & sharing:** PNG and **vector SVG/PDF** export of the current view,
   shareable view-state files, copy-node-as-JSON, TSV cost summaries, a diff change
   report (Markdown/TSV), a **headless report CLI** that emits a JSON model
@@ -336,7 +340,8 @@ rationale behind every performance-relevant choice.
 `tools/gen_fixtures.py` (Python 3 stdlib only) hand-encodes tiny fixture models for
 each format. The doctest suite covers each parser (asserting zero payload reads),
 format detection, layout determinism, the pickle VM opcode set + allowlist
-rejection, NPY export round-trip, and truncation resilience.
+rejection, the mobile bytecode decoder (including per-byte truncation and
+corruption sweeps), NPY export round-trip, and truncation resilience.
 
 ```sh
 python3 tools/gen_fixtures.py tests/fixtures
@@ -399,9 +404,10 @@ opt-in, **view-only** single-block preview inside the weight inspector is in sco
 (#49) — it reads no more bytes than the inspector already does and produces no
 artifact.
 
-**TorchScript** currently ships as a best-effort op *inventory*, not a compute
-graph; full graph reconstruction is planned for v0.9.4 rather than excluded (see
-`docs/v1.0-plan.md`).
+**TorchScript**: PyTorch Mobile `.ptl` archives open as graphs decoded from
+`bytecode.pkl` (v6–v9; older bytecode does not record operator arity and gets
+an exact op inventory instead). Desktop `torch.jit.save` archives still ship as
+a best-effort op inventory until the `code/` front-end (#136) lands.
 
 ## License
 

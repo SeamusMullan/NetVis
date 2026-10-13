@@ -1126,12 +1126,15 @@ std::vector<CategoryCost> rollup_by_category(const ir::Model& model,
 CostReport compute_cost(const ir::Model& model, uint32_t graph_index) {
   // Table mode: has_graph == false or graph_index out of range.
   if (!model.has_graph || graph_index >= model.graphs.size()) {
-    return build_table_report(model);
+    CostReport table = build_table_report(model);
+    table.unlocated_weights = model.unlocated_weights;
+    return table;
   }
 
   const ir::Graph& g = model.graphs[graph_index];
   CostReport report;
   report.from_graph = true;
+  report.unlocated_weights = model.unlocated_weights;
 
   // Compute per-node costs and totals.
   GraphCostSummary summary = compute_graph_costs(model, g);

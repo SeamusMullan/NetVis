@@ -10,6 +10,7 @@ tests/fixtures/*.tflite
 tests/fixtures/*.safetensors
 tests/fixtures/*.gguf
 tests/fixtures/*.pt
+tests/fixtures/*.ptl
 tests/fixtures/*.xml
 tests/fixtures/*.bin
 tests/fixtures/*.mlmodel

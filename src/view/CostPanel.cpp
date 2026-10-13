@@ -455,6 +455,9 @@ void draw_cost_section(App& app) {
   }
   kv_u64("total params", report->total_params);
   kv_bytes("total weights", report->total_weight_bytes);
+  if (report->unlocated_weights > 0)
+    ImGui::TextDisabled("params/weights are lower bounds: %llu packed value(s) not located",
+                        static_cast<unsigned long long>(report->unlocated_weights));
   kv_bytes("peak activations", report->peak_activation_bytes);
 
   // Honesty line: "FLOPs unknown for k / N nodes".

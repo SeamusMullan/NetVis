@@ -132,6 +132,26 @@ Result<int64_t> PickleVM::rd_long(uint64_t n) {
   return static_cast<int64_t>(v);
 }
 
+// ---- value allocation --------------------------------------------------------
+ValuePtr PickleVM::make(Value::Kind kind) {
+  auto v = std::make_shared<Value>();
+  v->kind = kind;
+  v->src_pos = op_start_;
+  ++value_count_;
+  return v;
+}
+
+// torch.jit._pickle helpers (torch/jit/_pickle.py). Every one of them is a pure
+// identity function on its argument; they exist only to carry a static type tag
+// for TorchScript's unpickler. Interpreting them is therefore inert.
+static bool is_jit_pickle_identity(const std::string& module,
+                                   const std::string& name) {
+  return module == "torch.jit._pickle" &&
+         (name == "build_intlist" || name == "build_doublelist" ||
+          name == "build_boollist" || name == "build_tensorlist" ||
+          name == "restore_type_tag");
+}
+
 // ---- stack helpers -----------------------------------------------------------
 Result<ValuePtr> PickleVM::pop() {
   if (stack_.empty()) return underflow();
@@ -153,7 +173,6 @@ Result<std::vector<ValuePtr>> PickleVM::pop_to_mark() {
 // ---- global resolution (ALLOWLIST) ------------------------------------------
 Result<ValuePtr> PickleVM::resolve_global(const std::string& module,
                                           const std::string& name) {
-  auto v = std::make_shared<Value>();
   // Allowlisted torch/collections symbols become interpretable Globals; the
   // REDUCE/BUILD handlers know how to act on them. Everything else is inert
   // Opaque and is NEVER executed.
@@ -174,17 +193,13 @@ Result<ValuePtr> PickleVM::resolve_global(const std::string& module,
     allow = true;
   } else if (module == "torch" && torch_dtype_global(name, dt, esz, lbl)) {
     allow = true;  // a dtype NAME (v3 trailing arg), inert data
+  } else if (is_jit_pickle_identity(module, name)) {
+    allow = true;  // #137: identity helpers, see is_jit_pickle_identity
   }
-  if (allow) {
-    v->kind = Value::Kind::Global;
-    v->module = module;
-    v->name = name;
-  } else {
-    // Recorded but inert. Non-negotiable: no import, no call.
-    v->kind = Value::Kind::Opaque;
-    v->module = module;
-    v->name = name;
-  }
+  // Non-allowlisted: recorded but inert. Non-negotiable: no import, no call.
+  auto v = make(allow ? Value::Kind::Global : Value::Kind::Opaque);
+  v->module = module;
+  v->name = name;
   return v;
 }
 
@@ -193,29 +208,45 @@ Result<ValuePtr> PickleVM::do_reduce(const ValuePtr& callable,
                                      std::vector<ValuePtr> args) {
   if (!callable) return err("REDUCE on null callable", pos_);
 
-  // Non-allowlisted callable: return an Opaque result, never execute.
+  // Non-allowlisted callable: return an Opaque result, never execute. The
+  // arguments are kept as inert data (#137) so e.g. torch.device('cpu') can be
+  // rendered; nothing is ever called with them.
   if (callable->kind != Value::Kind::Global) {
-    auto v = std::make_shared<Value>();
-    v->kind = Value::Kind::Opaque;
+    auto v = make(Value::Kind::Opaque);
     v->module = callable->module;
     v->name = callable->name;
+    v->items = std::move(args);
     return v;
   }
 
   const std::string& mod = callable->module;
   const std::string& nm = callable->name;
 
+  if (is_jit_pickle_identity(mod, nm)) {
+    // restore_type_tag(obj, type_str) -> obj.
+    if (nm == "restore_type_tag") {
+      if (!args.empty() && args[0]) return args[0];
+      return make(Value::Kind::None);
+    }
+    // build_{int,double,bool,tensor}list(list) -> list.
+    if (!args.empty() && args[0] && args[0]->kind == Value::Kind::List)
+      return args[0];
+    auto v = make(Value::Kind::Opaque);  // not a list: inert, never executed
+    v->module = mod;
+    v->name = nm;
+    v->items = std::move(args);
+    return v;
+  }
+
   if (mod == "collections" && nm == "OrderedDict") {
     // OrderedDict(...) -> empty ordered dict; state applied later via BUILD.
-    auto v = std::make_shared<Value>();
-    v->kind = Value::Kind::Dict;
+    auto v = make(Value::Kind::Dict);
     return v;
   }
 
   if (mod == "torch" && nm == "Size") {
     // torch.Size(iterable) -> tuple of ints.
-    auto v = std::make_shared<Value>();
-    v->kind = Value::Kind::Tuple;
+    auto v = make(Value::Kind::Tuple);
     if (!args.empty() && args[0] &&
         (args[0]->kind == Value::Kind::Tuple ||
          args[0]->kind == Value::Kind::List)) {
@@ -232,8 +263,7 @@ Result<ValuePtr> PickleVM::do_reduce(const ValuePtr& callable,
     //        ("storage", <StorageType global>, key, device, numel).
     // v3 appends a torch.<dtype> global at args[6] and its storage type is
     // UntypedStorage, so the dtype comes from that argument instead.
-    auto tref = std::make_shared<Value>();
-    tref->kind = Value::Kind::Tensor;
+    auto tref = make(Value::Kind::Tensor);
     ir::TensorRef& t = tref->tensor;
 
     if (args.empty()) return tref;
@@ -305,12 +335,11 @@ Result<ValuePtr> PickleVM::do_reduce(const ValuePtr& callable,
   if (mod == "torch._utils" && nm == "_rebuild_parameter") {
     // _rebuild_parameter(tensor, requires_grad, backward_hooks) -> the tensor.
     if (!args.empty() && args[0]) return args[0];
-    return Value::make_none();
+    return make(Value::Kind::None);
   }
 
   // Allowlisted but unhandled -> inert Opaque.
-  auto v = std::make_shared<Value>();
-  v->kind = Value::Kind::Opaque;
+  auto v = make(Value::Kind::Opaque);
   v->module = mod;
   v->name = nm;
   return v;
@@ -320,27 +349,26 @@ Result<ValuePtr> PickleVM::do_newobj(const ValuePtr& cls, const ValuePtr& args) 
   // NEWOBJ(cls, argtuple). For our allowlist, cls of interest is OrderedDict.
   if (cls && cls->kind == Value::Kind::Global && cls->module == "collections" &&
       cls->name == "OrderedDict") {
-    auto v = std::make_shared<Value>();
-    v->kind = Value::Kind::Dict;
+    auto v = make(Value::Kind::Dict);
     return v;
   }
   if (cls && cls->kind == Value::Kind::Global && cls->module == "torch" &&
       cls->name == "Size") {
-    auto v = std::make_shared<Value>();
-    v->kind = Value::Kind::Tuple;
+    auto v = make(Value::Kind::Tuple);
     if (args && (args->kind == Value::Kind::Tuple ||
                  args->kind == Value::Kind::List)) {
       v->items = args->items;
     }
     return v;
   }
-  // Anything else -> inert Opaque object.
-  auto v = std::make_shared<Value>();
-  v->kind = Value::Kind::Opaque;
+  // Anything else -> inert Opaque object. Its constructor arguments are kept
+  // as data (#137); the class is never instantiated.
+  auto v = make(Value::Kind::Opaque);
   if (cls) {
     v->module = cls->module;
     v->name = cls->name;
   }
+  if (args && args->kind == Value::Kind::Tuple) v->items = args->items;
   return v;
 }
 
@@ -350,15 +378,19 @@ Result<bool> PickleVM::do_build(const ValuePtr& obj, const ValuePtr& state) {
   // OrderedDict __setstate__ / __reduce__ typically carries items as a dict.
   if (obj->kind == Value::Kind::Dict && state->kind == Value::Kind::Dict) {
     for (auto& kv : state->pairs) obj->pairs.push_back(kv);
+  } else if (obj->kind == Value::Kind::Opaque) {
+    // #137: RECORD the object's state as inert data (the last BUILD wins).
+    // TorchScript module objects carry their attributes here, in class slot
+    // order. __setstate__ is never executed.
+    obj->inner = state;
   }
-  // Other objects: state ignored (inert). Never executes __setstate__.
+  // Other objects: state ignored (inert).
   return true;
 }
 
 // ---- BINPERSID ---------------------------------------------------------------
 Result<ValuePtr> PickleVM::do_persid(const ValuePtr& pid) {
-  auto v = std::make_shared<Value>();
-  v->kind = Value::Kind::Persistent;
+  auto v = make(Value::Kind::Persistent);
   v->inner = pid;
   return v;
 }
@@ -367,6 +399,10 @@ Result<ValuePtr> PickleVM::do_persid(const ValuePtr& pid) {
 Result<ValuePtr> PickleVM::run() {
   for (;;) {
     if (++op_count_ > kMaxOps) return err("pickle opcode cap exceeded", pos_);
+    // The previous opcode is complete: enforce the value cap at its offset.
+    if (value_count_ > limits_.max_values)
+      return err("pickle value cap exceeded", op_start_);
+    op_start_ = pos_;
     auto op_r = rd_u8();
     if (!op_r) return op_r.error();
     uint8_t op = *op_r;
@@ -443,8 +479,7 @@ Result<ValuePtr> PickleVM::run() {
       case 'J': {  // BININT (signed 4-byte)
         auto r = rd_u32();
         if (!r) return r.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Int;
+        auto v = make(Value::Kind::Int);
         v->i = static_cast<int32_t>(*r);
         push(v);
         break;
@@ -452,8 +487,7 @@ Result<ValuePtr> PickleVM::run() {
       case 'K': {  // BININT1 (unsigned 1-byte)
         auto r = rd_u8();
         if (!r) return r.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Int;
+        auto v = make(Value::Kind::Int);
         v->i = *r;
         push(v);
         break;
@@ -461,8 +495,7 @@ Result<ValuePtr> PickleVM::run() {
       case 'M': {  // BININT2 (unsigned 2-byte)
         auto r = rd_u16();
         if (!r) return r.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Int;
+        auto v = make(Value::Kind::Int);
         v->i = *r;
         push(v);
         break;
@@ -472,8 +505,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto r = rd_long(*n);
         if (!r) return r.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Int;
+        auto v = make(Value::Kind::Int);
         v->i = *r;
         push(v);
         break;
@@ -483,28 +515,25 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto r = rd_long(*n);
         if (!r) return r.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Int;
+        auto v = make(Value::Kind::Int);
         v->i = *r;
         push(v);
         break;
       }
       case 0x88: {  // NEWTRUE
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Bool;
+        auto v = make(Value::Kind::Bool);
         v->b = true;
         push(v);
         break;
       }
       case 0x89: {  // NEWFALSE
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Bool;
+        auto v = make(Value::Kind::Bool);
         v->b = false;
         push(v);
         break;
       }
       case 'N': {  // NONE
-        push(Value::make_none());
+        push(make(Value::Kind::None));
         break;
       }
       case 'X': {  // BINUNICODE (LE u32 len)
@@ -512,8 +541,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto s = rd_bytes(*n);
         if (!s) return s.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Str;
+        auto v = make(Value::Kind::Str);
         v->s = std::move(*s);
         push(v);
         break;
@@ -523,8 +551,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto s = rd_bytes(*n);
         if (!s) return s.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Str;
+        auto v = make(Value::Kind::Str);
         v->s = std::move(*s);
         push(v);
         break;
@@ -534,8 +561,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto s = rd_bytes(*n);
         if (!s) return s.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Str;
+        auto v = make(Value::Kind::Str);
         v->s = std::move(*s);
         push(v);
         break;
@@ -545,8 +571,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto s = rd_bytes(*n);
         if (!s) return s.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Bytes;
+        auto v = make(Value::Kind::Bytes);
         v->s = std::move(*s);
         push(v);
         break;
@@ -556,8 +581,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto s = rd_bytes(*n);
         if (!s) return s.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Bytes;
+        auto v = make(Value::Kind::Bytes);
         v->s = std::move(*s);
         push(v);
         break;
@@ -567,35 +591,30 @@ Result<ValuePtr> PickleVM::run() {
         if (!n) return n.error();
         auto s = rd_bytes(*n);
         if (!s) return s.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Bytes;
+        auto v = make(Value::Kind::Bytes);
         v->s = std::move(*s);
         push(v);
         break;
       }
       case '}': {  // EMPTY_DICT
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Dict;
+        auto v = make(Value::Kind::Dict);
         push(v);
         break;
       }
       case ']': {  // EMPTY_LIST
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::List;
+        auto v = make(Value::Kind::List);
         push(v);
         break;
       }
       case ')': {  // EMPTY_TUPLE
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Tuple;
+        auto v = make(Value::Kind::Tuple);
         push(v);
         break;
       }
       case 't': {  // TUPLE
         auto items = pop_to_mark();
         if (!items) return items.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Tuple;
+        auto v = make(Value::Kind::Tuple);
         v->items = std::move(*items);
         push(v);
         break;
@@ -603,8 +622,7 @@ Result<ValuePtr> PickleVM::run() {
       case 0x85: {  // TUPLE1
         auto a = pop();
         if (!a) return a.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Tuple;
+        auto v = make(Value::Kind::Tuple);
         v->items = {*a};
         push(v);
         break;
@@ -614,8 +632,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!b) return b.error();
         auto a = pop();
         if (!a) return a.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Tuple;
+        auto v = make(Value::Kind::Tuple);
         v->items = {*a, *b};
         push(v);
         break;
@@ -627,8 +644,7 @@ Result<ValuePtr> PickleVM::run() {
         if (!b) return b.error();
         auto a = pop();
         if (!a) return a.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Tuple;
+        auto v = make(Value::Kind::Tuple);
         v->items = {*a, *b, *c};
         push(v);
         break;
@@ -674,8 +690,7 @@ Result<ValuePtr> PickleVM::run() {
       case 'G': {  // BINFLOAT (big-endian double)
         auto r = rd_f64be();
         if (!r) return r.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Double;
+        auto v = make(Value::Kind::Double);
         v->d = *r;
         push(v);
         break;
@@ -745,8 +760,7 @@ Result<ValuePtr> PickleVM::run() {
       case 'P': {  // PERSID (text pid, newline-terminated)
         auto line = rd_line();
         if (!line) return line.error();
-        auto pidv = std::make_shared<Value>();
-        pidv->kind = Value::Kind::Str;
+        auto pidv = make(Value::Kind::Str);
         pidv->s = *line;
         auto res = do_persid(pidv);
         if (!res) return res.error();
@@ -756,8 +770,7 @@ Result<ValuePtr> PickleVM::run() {
       case 'l': {  // LIST (from mark)
         auto items = pop_to_mark();
         if (!items) return items.error();
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::List;
+        auto v = make(Value::Kind::List);
         v->items = std::move(*items);
         push(v);
         break;
@@ -766,8 +779,7 @@ Result<ValuePtr> PickleVM::run() {
         auto items = pop_to_mark();
         if (!items) return items.error();
         if (items->size() % 2 != 0) return err("DICT odd count", pos_);
-        auto v = std::make_shared<Value>();
-        v->kind = Value::Kind::Dict;
+        auto v = make(Value::Kind::Dict);
         for (size_t k = 0; k + 1 < items->size(); k += 2)
           v->pairs.emplace_back((*items)[k], (*items)[k + 1]);
         push(v);

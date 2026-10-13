@@ -69,6 +69,7 @@ std::string build_report_json(const ir::Model& model) {
   cost["total_flops"] = r.total_flops;
   cost["total_params"] = r.total_params;
   cost["total_weight_bytes"] = r.total_weight_bytes;
+  cost["unlocated_weights"] = r.unlocated_weights;
   cost["peak_activation_bytes"] = r.peak_activation_bytes;
   cost["nodes_total"] = r.nodes_total;
   cost["nodes_flops_known"] = r.nodes_flops_known;
