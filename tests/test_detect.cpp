@@ -704,7 +704,50 @@ TEST_CASE("detect Caffe D4: near-misses are not Caffe by content") {
   CHECK(detect_bytes("caffe_v0", bytes_of("layers { layer { name: \"a\" } }\n"), "") ==
         Format::Caffe);
 
-  // name + field 2 holding {field 1 varint} (a GraphDef VersionDef's shape).
+  // name + field 2 holding {field 1 varint} (a VersionDef's shape).
   const std::vector<uint8_t> versions = {0x0A, 0x01, 'n', 0x12, 0x02, 0x08, 0x01};
   CHECK(detect_bytes("caffe_versions", versions, "") != Format::Caffe);
+}
+
+TEST_CASE("detect Caffe D5: a GraphDef the TF sniff misses is still not Caffe") {
+  // GraphDef.library is field 2, the V1 `layers` slot; its FunctionDefLibrary
+  // starts with field 1 (function), the V0 `layer` slot, whose FunctionDef starts
+  // with field 1 (signature, an OpDef message) where a V0 layer has its name.
+  //   GraphDef { library { function { signature { name: "f" } } } versions { producer: 27 } }
+  const std::vector<uint8_t> lib_only = {0x12, 0x07, 0x0A, 0x05, 0x0A, 0x03, 0x0A, 0x01,
+                                         'f',  0x22, 0x02, 0x08, 0x1B};
+  CHECK_FALSE(caffe::looks_like_caffemodel(lib_only.data(), lib_only.size()));
+  for (const char* ext : {"", "pb"}) {
+    CHECK_MESSAGE(detect_bytes("caffe_tf_lib", lib_only, ext) != Format::Caffe, ext);
+  }
+  // An empty signature has no printable name either.
+  const std::vector<uint8_t> empty_sig = {0x12, 0x04, 0x0A, 0x02, 0x0A, 0x00};
+  CHECK_FALSE(caffe::looks_like_caffemodel(empty_sig.data(), empty_sig.size()));
+
+  // NodeDefs whose name is empty (proto3 omits it) start with `op`, so the TF
+  // sniff misses them; the repeated field 1 is not a singular NetParameter.name.
+  const std::vector<uint8_t> node = {0x0A, 0x06, 0x12, 0x04, 'N', 'o', 'O', 'p'};
+  std::vector<uint8_t> two_nodes = node;
+  two_nodes.insert(two_nodes.end(), node.begin(), node.end());
+  two_nodes.insert(two_nodes.end(), lib_only.begin(), lib_only.end());
+  CHECK_FALSE(caffe::looks_like_caffemodel(two_nodes.data(), two_nodes.size()));
+  // One such node plus a library: field 1 once, then the V0 peek refuses the OpDef.
+  std::vector<uint8_t> one_node = node;
+  one_node.insert(one_node.end(), lib_only.begin(), lib_only.end());
+  CHECK_FALSE(caffe::looks_like_caffemodel(one_node.data(), one_node.size()));
+  CHECK(detect_bytes("caffe_tf_node", one_node, "pb") != Format::Caffe);
+
+  // A genuine binary V0 layer (pre-2014: layers { layer { name type } }) still is.
+  //   NetParameter { layers { layer { name: "conv1" type: "conv" } } }
+  const std::vector<uint8_t> v0 = {0x12, 0x0F, 0x0A, 0x0D, 0x0A, 0x05, 'c', 'o', 'n',
+                                   'v',  '1',  0x12, 0x04, 'c',  'o',  'n', 'v'};
+  CHECK(caffe::looks_like_caffemodel(v0.data(), v0.size()));
+  CHECK(detect_bytes("caffe_v0_bin", v0, "") == Format::Caffe);
+  // ...and a V0 layer that leads with its type.
+  const std::vector<uint8_t> v0t = {0x12, 0x08, 0x0A, 0x06, 0x12, 0x04, 'c', 'o', 'n', 'v'};
+  CHECK(caffe::looks_like_caffemodel(v0t.data(), v0t.size()));
+  // Caffe writes NetParameter.name once; a second one is not a NetParameter.
+  std::vector<uint8_t> two_names = {0x0A, 0x01, 'a', 0x0A, 0x01, 'b'};
+  two_names.insert(two_names.end(), v0.begin(), v0.end());
+  CHECK_FALSE(caffe::looks_like_caffemodel(two_names.data(), two_names.size()));
 }

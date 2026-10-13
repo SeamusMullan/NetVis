@@ -25,8 +25,9 @@ bool looks_like_prototxt(const uint8_t* d, uint64_t n);
 
 // Binary NetParameter: only NetParameter field numbers with their schema wire
 // types at the top level (a field-1 VARINT — ONNX ir_version, SavedModel
-// schema_version, CoreML specificationVersion — is rejected), and the first
-// layer peek finds a plausible type.
+// schema_version, CoreML specificationVersion — is rejected, and so is a second
+// field 1, e.g. a GraphDef's repeated `node`), and the first layer peek finds a
+// plausible type (or, for a V0 layer, a printable name / plausible type string).
 bool looks_like_caffemodel(const uint8_t* d, uint64_t n);
 
 }  // namespace netvis::caffe

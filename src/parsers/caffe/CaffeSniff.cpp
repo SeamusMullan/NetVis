@@ -32,6 +32,18 @@ bool plausible_type(const uint8_t* p, uint64_t len) {
   return true;
 }
 
+// A non-empty name string: no C0 control byte and no DEL (UTF-8 is fine). A
+// nested protobuf message whose first field is 1-3 starts with a tag byte below
+// 0x20, so this tells a V0 layer's `name` apart from a message that only shares
+// its field number (a TF FunctionDef's OpDef signature, which leads with its
+// own field-1 name).
+bool plausible_name(const uint8_t* p, uint64_t len) {
+  if (len == 0 || len > 4096) return false;
+  for (uint64_t i = 0; i < len; ++i)
+    if (p[i] < 0x20 || p[i] == 0x7F) return false;
+  return true;
+}
+
 // ---- text -----------------------------------------------------------------------
 
 // Token stream with one-token lookahead and a hard token budget.
@@ -199,14 +211,18 @@ bool peek_v1_layer(const onnx::SubRange& sr) {
       auto v = r.read_varint();
       return v && *v <= static_cast<uint64_t>(kMaxV1LayerType);
     }
-    if (fn == 1) {   // V0 layer: its first field must be name (1) or type (2)
+    if (fn == 1) {   // V0 layer: its first field must be a name (1) or type (2) string
       if (!ld) return false;
       auto s = r.read_len_delim();
       if (!s) return false;
       WireReader vr = WireReader::sub(*s);
       auto vh = vr.read_tag();
-      return vh && (vh->field_number == 1 || vh->field_number == 2) &&
-             vh->wire_type == WireType::LenDelim;
+      if (!vh || vh->wire_type != WireType::LenDelim) return false;
+      if (vh->field_number != 1 && vh->field_number != 2) return false;
+      auto v = vr.read_len_delim();
+      if (!v) return false;
+      return vh->field_number == 1 ? plausible_name(v->ptr, v->len)
+                                   : plausible_type(v->ptr, v->len);
     }
     bool ok = false;
     if (fn == 2 || fn == 3 || fn == 4 || fn == 6) ok = ld;
@@ -256,12 +272,19 @@ bool looks_like_prototxt(const uint8_t* d, uint64_t n) {
 bool looks_like_caffemodel(const uint8_t* d, uint64_t n) {
   if (d == nullptr || n == 0) return false;
   WireReader r(d, n, 0);
+  bool seen_name = false;
   for (int i = 0; i < kBinaryTopFields && !r.at_end(); ++i) {
     auto h = r.read_tag();
     if (!h) return false;
     const uint32_t fn = h->field_number;
     const WireType w = h->wire_type;
     const bool ld = w == WireType::LenDelim;
+    // NetParameter.name is singular and Caffe writes it once; a repeated field 1
+    // is some other message's list (a TF GraphDef's `node`).
+    if (fn == 1) {
+      if (seen_name) return false;
+      seen_name = true;
+    }
     switch (fn) {
       case 2:
       case 100: {

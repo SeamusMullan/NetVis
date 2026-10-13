@@ -1122,3 +1122,108 @@ TEST_CASE("Caffe K2: an unresolvable convolution geometry is never defaulted") {
     CHECK_FALSE_MESSAGE(compute_cost(*r, 0).per_node[1].flops_known, c.name);
   }
 }
+
+// ---------------------------------------------------------------------------
+// M. Caffe's own load semantics: recorded phase, legacy blob dims, pairing order
+// ---------------------------------------------------------------------------
+TEST_CASE("Caffe M: recorded phase, legacy dims and pairing follow Caffe") {
+  TempDir d("semantics");
+
+  SUBCASE("a snapshot's layers record the phase its net was filtered for") {
+    // Net::Init stamps LayerParameter.phase (10) on every layer, so a TRAIN
+    // snapshot keeps its TRAIN-only data layer instead of being re-filtered as TEST.
+    const std::string train_rule = pb_len(8, pb_varint(1, 0));
+    const std::string test_rule = pb_len(8, pb_varint(1, 1));
+    const std::string net =
+        pb_len(1, "snap") +
+        pb_len(100, layer_bin("data", "Input", {}, {"data"}, train_rule + pb_varint(10, 0))) +
+        pb_len(100, layer_bin("r", "ReLU", {"data"}, {"r"}, pb_varint(10, 0))) +
+        pb_len(100, layer_bin("acc", "ReLU", {"r"}, {"acc"}, test_rule + pb_varint(10, 0)));
+    d.put("snap.caffemodel", net);
+    auto r = parse_path(d.file("snap.caffemodel"));
+    REQUIRE_MESSAGE(r, (r ? "" : r.error().message));
+    CHECK(find_node(*r, r->graphs[0], "data") != nullptr);
+    CHECK(find_node(*r, r->graphs[0], "acc") == nullptr);
+    CHECK_MESSAGE(meta(*r, "phase_filter") ==
+                      "TRAIN, as recorded on the layers (excluded 1 layer: acc)",
+                  meta(*r, "phase_filter"));
+
+    // Layers that disagree record nothing usable: Caffe's TEST default applies.
+    const std::string mixed =
+        pb_len(1, "mixed") +
+        pb_len(100, layer_bin("data", "Input", {}, {"data"}, train_rule + pb_varint(10, 0))) +
+        pb_len(100, layer_bin("r", "ReLU", {"data"}, {"r"}, pb_varint(10, 1)));
+    d.put("mixed.caffemodel", mixed);
+    auto m = parse_path(d.file("mixed.caffemodel"));
+    REQUIRE_MESSAGE(m, (m ? "" : m.error().message));
+    CHECK(find_node(*m, m->graphs[0], "data") == nullptr);
+    CHECK(meta(*m, "phase_filter") == "TEST (excluded 1 layer: data)");
+
+    // A .prototxt is filtered by the phase its caller passes (TEST by default),
+    // never by layer fields, exactly as Caffe's Net(param_file, phase) does.
+    d.put("phase.prototxt",
+          "layer { name: \"data\" type: \"Input\" top: \"data\" phase: TRAIN "
+          "include { phase: TRAIN } }\n"
+          "layer { name: \"r\" type: \"ReLU\" bottom: \"data\" top: \"r\" phase: TRAIN }\n");
+    auto t = parse_path(d.file("phase.prototxt"));
+    REQUIRE_MESSAGE(t, (t ? "" : t.error().message));
+    CHECK(find_node(*t, t->graphs[0], "data") == nullptr);
+    CHECK(meta(*t, "phase_filter") == "TEST (excluded 1 layer: data)");
+  }
+
+  SUBCASE("legacy num/channels/height/width win over `shape`, as in Blob::FromProto") {
+    const std::string blob = pb_varint(1, 1) + pb_varint(2, 1) + pb_varint(3, 2) +
+                             pb_varint(4, 3) + pb_len(5, std::string(24, '\0')) +
+                             pb_len(7, pb_len(1, varint(6)));
+    const std::string net = pb_len(1, "n") + pb_len(3, "data") +
+                            pb_len(100, layer_bin("x", "PReLU", {"data"}, {"x"}, pb_len(7, blob)));
+    d.put("legacy.caffemodel", net);
+    auto r = parse_path(d.file("legacy.caffemodel"));
+    REQUIRE_MESSAGE(r, (r ? "" : r.error().message));
+    const ir::TensorRef* t = find_init(*r, "x/slope");
+    REQUIRE(t != nullptr);
+    CHECK(std::vector<int64_t>(t->shape.begin(), t->shape.end()) ==
+          std::vector<int64_t>{1, 1, 2, 3});
+    CHECK(meta(*r, "blob_size_mismatch").empty());
+
+    d.put("legacy.prototxt",
+          "input: \"data\"\ninput_shape { dim: 1 dim: 2 }\n"
+          "layer { name: \"y\" type: \"PReLU\" bottom: \"data\" top: \"y\"\n"
+          "  blobs { shape { dim: 2 } num: 1 channels: 2 height: 1 width: 1 } }\n");
+    auto p = parse_path(d.file("legacy.prototxt"));
+    REQUIRE_MESSAGE(p, (p ? "" : p.error().message));
+    const ir::TensorRef* y = find_init(*p, "y/slope");
+    REQUIRE(y != nullptr);
+    CHECK(std::vector<int64_t>(y->shape.begin(), y->shape.end()) ==
+          std::vector<int64_t>{1, 2, 1, 1});
+  }
+
+  SUBCASE("pairing: the last duplicate source wins and replaces inline text blobs") {
+    TempDir p("pair_order");
+    // Two source layers named "x": a 1-value slope, then a 3-value one.
+    const std::string one = pb_len(5, std::string(4, '\0')) + pb_len(7, pb_len(1, varint(1)));
+    const std::string three = pb_len(5, std::string(12, '\0')) + pb_len(7, pb_len(1, varint(3)));
+    const std::string net =
+        pb_len(1, "n") + pb_len(3, "data") +
+        pb_len(100, layer_bin("x", "PReLU", {"data"}, {"x"}, pb_len(7, one))) +
+        pb_len(100, layer_bin("x", "PReLU", {"data"}, {"x"}, pb_len(7, three)));
+    p.put("net.caffemodel", net);
+    p.put("net.prototxt",
+          "input: \"data\"\ninput_shape { dim: 1 dim: 3 }\n"
+          "layer { name: \"x\" type: \"PReLU\" bottom: \"data\" top: \"x\"\n"
+          "  blobs { shape { dim: 2 } data: 1 data: 2 } }\n");
+    ByteReader::payload_read_counter() = 0;
+    auto r = parse_path(p.file("net.prototxt"));
+    REQUIRE_MESSAGE(r, (r ? "" : r.error().message));
+    CHECK_MESSAGE(starts_with(meta(*r, "weights"), "paired with net.caffemodel: 1 layer"),
+                  meta(*r, "weights"));
+    const ir::TensorRef* t = find_init(*r, "x/slope");
+    REQUIRE(t != nullptr);
+    CHECK(std::vector<int64_t>(t->shape.begin(), t->shape.end()) == std::vector<int64_t>{3});
+    CHECK(t->byte_len == 12);
+    CHECK(t->file_offset != UINT64_MAX);
+    CHECK(r->str(t->external_path) == "net.caffemodel");
+    CHECK(r->graphs[0].initializers.size() == 1);
+    CHECK(ByteReader::payload_read_counter() == 0);
+  }
+}

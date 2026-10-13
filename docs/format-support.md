@@ -193,7 +193,9 @@ them, along with `.pbtxt` and multi-`meta_graph` files.
 **Caffe** — `.prototxt` and `.caffemodel` both yield graphs, in the current `layer`
 schema and the legacy V1 `layers` schema (`schema` in the metadata says which). A
 `.prototxt` takes its weights from a `.caffemodel` beside it — same name, same name
-without `_deploy`, or the only one in the folder — matched by layer name. A layer whose
+without `_deploy`, or the only one in the folder — matched by layer name the way Caffe's
+own loader does it (the last of duplicate names wins, and the `.caffemodel` replaces
+weights written inline in the `.prototxt`). A layer whose
 weights do not fit its definition is left unpaired and listed in `unpaired_layers`. The
 `.caffemodel` itself records weights as file offsets. Caffe declares only input shapes, so
 every other shape is inferred, and **only through layers with an exact ONNX equivalent**:
@@ -206,7 +208,8 @@ opened without weights has no shapes past its first convolution or inner product
 because the weight blob is what fixes the output channels. Activation element types are
 known only when weights are present: Caffe stores float weights as `data` and double
 weights as `double_data`, and activations share that type. Train/test files are shown as
-the TEST phase (or the net's own `state`), and the metadata lists what was excluded. Not
+the TEST phase (or the net's own `state`; a `.caffemodel` snapshot uses the phase its
+layers record), and the metadata lists what was excluded. Not
 decoded, and counted in the metadata: V0 (pre-2014) layer parameters, weights written as text
 inside a `.prototxt` (shaped but not addressable), unpacked or non-BVLC blob storage, and
 fork parameter messages in a `.caffemodel` (a `.prototxt` shows every field).

@@ -530,8 +530,11 @@ Format detect_format(const MappedFile& file, const std::string& ext_hint,
   // a NetParameter carrying input_shape (field 8, length-delimited) satisfies that loose
   // sniff outright. It peeks one level deeper (the first layer's `type` string, or a V1
   // LayerType enum <= 39) and rejects a field-1 varint, so ONNX, SavedModel and CoreML
-  // can never reach a Caffe verdict. After TensorFlow, whose sniffs are stricter; a
-  // GraphDef's `versions` (field 2) fails the V1 peek on its field-1 varint.
+  // can never reach a Caffe verdict. After TensorFlow, whose sniffs are stricter. A
+  // GraphDef that the TF sniff misses (no leading NodeDef) is still refused: its
+  // repeated `node` (field 1) fails the singular-name rule, and its `library`
+  // (field 2, a FunctionDefLibrary) fails the V0 peek, whose OpDef signature is a
+  // message, not a printable layer name.
   if (caffe::looks_like_caffemodel(d, size)) {
     reason = DetectReason::Structure;
     return Format::Caffe;

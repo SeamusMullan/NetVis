@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -37,6 +38,7 @@
 #include "parsers/Parser.h"
 #include "parsers/caffe/CaffeNet.h"
 #include "parsers/caffe/CaffeOps.h"
+#include "parsers/caffe/CaffeSchema.h"
 #include "parsers/caffe/CaffeSniff.h"
 
 namespace netvis::caffe {
@@ -95,10 +97,33 @@ bool meets(const NetRaw& net, const std::unordered_set<std::string>& stages, int
   return true;
 }
 
+// The phase recorded on the layers themselves. Net::Init stamps
+// LayerParameter.phase (field 10) on every layer it instantiates, so a modern
+// .caffemodel snapshot says which phase its net was filtered for (TRAIN, for a
+// training snapshot). Returns that phase when at least one layer records one and
+// none disagrees; else nullopt (V1 layers have no such field).
+std::optional<int32_t> recorded_phase(const NetRaw& net, const ir::Model& model) {
+  std::optional<int32_t> found;
+  for (const LayerRaw& L : net.layers) {
+    const ir::AttrValue* a = layer_attr(L, model, "phase");
+    if (a == nullptr || a->kind != ir::AttrValue::Kind::String) continue;
+    const auto p = enum_number(phase_enum(), model.str(a->s));
+    if (!p) return std::nullopt;   // an unknown phase: do not guess
+    if (found && *found != *p) return std::nullopt;
+    found = *p;
+  }
+  return found;
+}
+
 // Drops the layers the state excludes; returns the metadata note ("" when no
-// layer carries a rule).
-std::string apply_phase_filter(NetRaw& net) {
-  const int32_t phase = net.has_state ? net.state_phase : 1;   // NetState default: TEST
+// layer carries a rule). Without a NetState, a .caffemodel's recorded layer
+// phase wins over Caffe's TEST default. A .prototxt keeps the default: Caffe
+// filters a definition by the phase its caller passes, never by layer fields.
+std::string apply_phase_filter(NetRaw& net, const ir::Model& model, bool binary) {
+  std::optional<int32_t> from_layers;
+  if (!net.has_state && binary) from_layers = recorded_phase(net, model);
+  const int32_t phase = net.has_state ? net.state_phase
+                                      : from_layers.value_or(1);   // NetState default: TEST
   const std::unordered_set<std::string> stages(net.state_stages.begin(),
                                                net.state_stages.end());   // lookup only
   bool any_rules = false;
@@ -118,8 +143,8 @@ std::string apply_phase_filter(NetRaw& net) {
   }
   net.layers = std::move(kept);
   if (!any_rules) return {};
-  std::string note =
-      phase_label(phase) + " (excluded " + plural(excluded.size(), "layer", "layers");
+  std::string note = phase_label(phase) + (from_layers ? ", as recorded on the layers" : "") +
+                     " (excluded " + plural(excluded.size(), "layer", "layers");
   for (size_t i = 0; i < excluded.size() && i < 8; ++i)
     note += (i == 0 ? ": " : ", ") + excluded[i];
   if (excluded.size() > 8) note += ", ...";
@@ -265,8 +290,9 @@ fs::path find_sibling(const fs::path& model_path, std::string& note) {
 
 void pair_sibling_weights(const std::string& path, NetRaw& net, const ir::Model& model,
                           PairInfo& info) {
-  // Caffe's CopyTrainedLayersFrom matches by layer name; on duplicates the first
-  // occurrence wins (and the rest are counted).
+  // Caffe's CopyTrainedLayersFrom matches by layer name: each source layer is
+  // copied into the FIRST net layer of that name (duplicate net names are
+  // counted), overwriting whatever that layer holds.
   std::unordered_map<std::string, size_t> first_index;   // lookup only
   for (size_t i = 0; i < net.layers.size(); ++i)
     if (!first_index.emplace(net.layers[i].name, i).second) ++info.duplicates;
@@ -297,7 +323,11 @@ void pair_sibling_weights(const std::string& path, NetRaw& net, const ir::Model&
     return;
   }
 
-  std::vector<uint8_t> attempted(net.layers.size(), 0);
+  // Source layers are walked in file order and each copy overwrites the last,
+  // so a later duplicate source layer wins; the caffemodel also replaces any
+  // inline text blobs (Caffe loads those first, then copies the trained ones
+  // over them).
+  std::vector<LayerRaw*> source(net.layers.size(), nullptr);
   size_t paired = 0, not_here = 0;
   for (LayerRaw& S : sr->layers) {
     if (S.blobs.empty()) continue;   // blob-less layers (relu1, ...) count nowhere
@@ -306,20 +336,21 @@ void pair_sibling_weights(const std::string& path, NetRaw& net, const ir::Model&
       ++not_here;
       continue;
     }
-    const size_t idx = it->second;
-    if (attempted[idx]) continue;
+    source[it->second] = &S;
+  }
+  for (size_t idx = 0; idx < net.layers.size(); ++idx) {
+    LayerRaw* S = source[idx];
+    if (S == nullptr) continue;
     LayerRaw& P = net.layers[idx];
-    if (!P.blobs.empty()) continue;   // inline text blobs win
-    attempted[idx] = 1;
-    if (!verify_pair(P, S.blobs, model)) {
+    if (!verify_pair(P, S->blobs, model)) {
       info.rejected.push_back(layer_label(P, idx));
       continue;
     }
-    for (BlobRaw& b : S.blobs) {
+    for (BlobRaw& b : S->blobs) {
       b.external = true;
       if (b.unpacked) ++net.unpacked_blobs;
     }
-    P.blobs = std::move(S.blobs);
+    P.blobs = std::move(S->blobs);
     ++paired;
   }
   info.sibling = base;
@@ -617,7 +648,7 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
 
   auto ok = validate(net, text);
   if (!ok) return ok.error();
-  const std::string phase_note = apply_phase_filter(net);
+  const std::string phase_note = apply_phase_filter(net, model, !text);
 
   PairInfo pair;
   if (text) {

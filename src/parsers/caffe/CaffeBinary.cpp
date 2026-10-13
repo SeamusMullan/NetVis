@@ -370,7 +370,10 @@ Result<BlobRaw> read_blob(const Ctx& c, const SubRange& sr) {
     }
   }
 
-  if (!shape_seen && legacy_seen) {
+  // Blob::FromProto (and Blob::ShapeEquals) use the legacy num/channels/height/
+  // width whenever ANY of them is present, and ignore `shape` then.
+  if (legacy_seen) {
+    b.shape.clear();
     for (int64_t v : legacy) b.shape.push_back(v);
     b.legacy_dims = true;
     shape_seen = true;

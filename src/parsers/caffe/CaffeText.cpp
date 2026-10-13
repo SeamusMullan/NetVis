@@ -348,7 +348,10 @@ Result<BlobRaw> read_text_blob(const Ctx& c, const TextNode& m) {
     b.dtype = ir::DType::F32;
     b.value_count = n_f32;
   }
-  if (!shape_seen && legacy_seen) {
+  // Blob::FromProto (and Blob::ShapeEquals) use the legacy num/channels/height/
+  // width whenever ANY of them is present, and ignore `shape` then.
+  if (legacy_seen) {
+    b.shape.clear();
     for (int64_t v : legacy) b.shape.push_back(v);
     b.legacy_dims = true;
     shape_seen = true;
