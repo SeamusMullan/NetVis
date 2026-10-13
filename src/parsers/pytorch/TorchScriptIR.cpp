@@ -24,6 +24,11 @@ bool is_torch_object(const Value& v) {
          v.inner && v.inner->kind == Value::Kind::Dict;
 }
 
+bool is_packed_object(const Value& v) {
+  return v.kind == Value::Kind::Opaque && v.module.rfind("__torch__", 0) == 0 &&
+         v.inner && v.inner->kind != Value::Kind::Dict;
+}
+
 // ---- deterministic tensor traversal -----------------------------------------
 namespace {
 
@@ -33,11 +38,23 @@ std::string dict_key(const ValuePtr& k) {
   return "";
 }
 
+// A leaf inside packed state that may hold weights NetVis cannot locate.
+bool unlocatable_leaf(const Value& v) {
+  if (v.kind == Value::Kind::Persistent || v.kind == Value::Kind::Bytes) return true;
+  return v.kind == Value::Kind::Opaque && v.module.rfind("torch", 0) == 0 &&
+         v.name.rfind("_rebuild", 0) == 0;
+}
+
 void walk_tensors(
     const ValuePtr& v, const std::string& prefix,
     std::unordered_set<const Value*>& visited, int depth,
-    const std::function<void(const std::string&, const Value&)>& fn) {
+    const std::function<void(const std::string&, const Value&)>& fn,
+    ModuleEnv::PackedStats* stats = nullptr, bool in_packed = false) {
   if (!v || depth > kMaxTraversalDepth) return;
+  if (in_packed && stats && unlocatable_leaf(*v)) {
+    if (visited.insert(v.get()).second) ++stats->unlocated;
+    return;
+  }
   // Containers and objects can recurse / be shared through the memo; gating
   // them on `visited` breaks cycles and dedups shared subtrees without
   // suppressing repeated leaf tensors.
@@ -49,11 +66,12 @@ void walk_tensors(
     for (const auto& kv : ps) {
       std::string key = dict_key(kv.first);
       std::string child = prefix.empty() ? key : prefix + "." + key;
-      walk_tensors(kv.second, child, visited, depth + 1, fn);
+      walk_tensors(kv.second, child, visited, depth + 1, fn, stats, in_packed);
     }
   };
   switch (v->kind) {
     case Value::Kind::Tensor:
+      if (in_packed && stats) ++stats->tensors;
       fn(prefix, *v);
       break;
     case Value::Kind::Dict:
@@ -64,14 +82,21 @@ void walk_tensors(
       for (size_t k = 0; k < v->items.size(); ++k) {
         std::string child =
             prefix.empty() ? std::to_string(k) : prefix + "." + std::to_string(k);
-        walk_tensors(v->items[k], child, visited, depth + 1, fn);
+        walk_tensors(v->items[k], child, visited, depth + 1, fn, stats, in_packed);
       }
       break;
     case Value::Kind::Opaque:
       // A TorchScript object: its recorded state dict lists the attributes in
-      // slot order; descend exactly like a Dict (#137). Any other Opaque is an
+      // slot order; descend exactly like a Dict (#137). A packed object's
+      // non-dict state is descended in place ("<path>.0", ...): prepacked
+      // conv/linear contexts keep their weights there. Any other Opaque is an
       // inert placeholder and is not descended.
-      if (is_torch_object(*v)) pairs(v->inner->pairs);
+      if (is_torch_object(*v)) {
+        pairs(v->inner->pairs);
+      } else if (is_packed_object(*v)) {
+        if (stats) ++stats->objects;
+        walk_tensors(v->inner, prefix, visited, depth + 1, fn, stats, true);
+      }
       break;
     default:
       break;
@@ -135,10 +160,13 @@ std::string py_float(double d) {
   return std::string(neg ? "-" : "") + out;
 }
 
-void quote_into(std::string& out, const std::string& s) {
+// Stops as soon as `out` is longer than `limit`: constant_repr then truncates
+// at limit, so the rest of a huge string is never copied or escaped.
+void quote_into(std::string& out, const std::string& s, size_t limit) {
   static const char* kHex = "0123456789abcdef";
   out.push_back('\'');
   for (unsigned char c : s) {
+    if (out.size() > limit) return;
     if (c == '\\') {
       out += "\\\\";
     } else if (c == '\'') {
@@ -216,10 +244,10 @@ struct ReprWriter {
       case Value::Kind::Bool: out += v->b ? "True" : "False"; return;
       case Value::Kind::Int: out += std::to_string(v->i); return;
       case Value::Kind::Double: out += py_float(v->d); return;
-      case Value::Kind::Str: quote_into(out, v->s); return;
+      case Value::Kind::Str: quote_into(out, v->s, lim.max_repr); return;
       case Value::Kind::Bytes:
         out += "b";
-        quote_into(out, v->s);
+        quote_into(out, v->s, lim.max_repr);
         return;
       case Value::Kind::Tensor: out += tensor_label(*v); return;
       case Value::Kind::Persistent: out += "<persistent>"; return;
@@ -301,15 +329,18 @@ bool constant_to_attr(const Value& v, ir::Model& m, ir::AttrValue& out,
       break;
     case Value::Kind::List:
     case Value::Kind::Tuple: {
-      bool all_int = !v.items.empty(), all_dbl = !v.items.empty();
-      for (const auto& it : v.items) {
+      // The cap first: an over-long list is never scanned element by element.
+      const bool fits = v.items.size() <= lim.max_list;
+      bool all_int = fits && !v.items.empty(), all_dbl = all_int;
+      for (size_t k = 0; fits && k < v.items.size(); ++k) {
+        const auto& it = v.items[k];
         all_int = all_int && it && it->kind == Value::Kind::Int;
         all_dbl = all_dbl && it && it->kind == Value::Kind::Double;
       }
-      if (v.items.size() <= lim.max_list && all_int) {
+      if (all_int) {
         a.kind = K::Ints;
         for (const auto& it : v.items) a.ints.push_back(it->i);
-      } else if (v.items.size() <= lim.max_list && all_dbl) {
+      } else if (all_dbl) {
         a.kind = K::Floats;
         for (const auto& it : v.items) a.floats.push_back(it->d);
       } else {
@@ -362,9 +393,13 @@ ModuleEnv::ModuleEnv(const ValuePtr& data_pkl_root)
   if (!data_pkl_root || !is_torch_object(*data_pkl_root)) return;
   root_ = data_pkl_root.get();
   root_class_ = qualified(*data_pkl_root);
-  for_each_tensor(data_pkl_root, [this](const std::string& path, const Value& t) {
-    paths_.emplace(&t, path);  // first path wins
-  });
+  std::unordered_set<const Value*> visited;
+  walk_tensors(
+      data_pkl_root, "", visited, 0,
+      [this](const std::string& path, const Value& t) {
+        paths_.emplace(&t, path);  // first path wins
+      },
+      &packed_);
 }
 
 ModuleEnv::Attr ModuleEnv::by_slot(const Value* obj, int64_t slot) const {
@@ -457,31 +492,40 @@ uint32_t GraphBuilder::add_input(std::string_view name) {
   return v;
 }
 
-uint32_t GraphBuilder::initializer(std::string_view name, const ir::TensorRef& t) {
-  std::string base = name.empty() ? names_.next() : std::string(name);
-  for (uint32_t k = 1;; ++k) {
-    std::string cand = k == 1 ? base : base + "#" + std::to_string(k);
-    auto it = by_name_.find(cand);
-    if (it == by_name_.end()) {
-      ir::ValueInfo vi;
-      vi.name = m_.intern(cand);
-      vi.dtype = t.dtype;
-      vi.shape = t.shape;
-      auto idx = static_cast<uint32_t>(values_.size());
-      values_.push_back(std::move(vi));
-      by_name_.emplace(cand, idx);
-      ir::TensorRef r = t;
-      r.name = values_[idx].name;
-      init_of_value_.emplace(idx, static_cast<uint32_t>(inits_.size()));
-      inits_.push_back(std::move(r));
-      return idx;
-    }
-    auto ii = init_of_value_.find(it->second);
-    if (ii != init_of_value_.end() &&
-        inits_[ii->second].file_offset == t.file_offset &&
-        inits_[ii->second].byte_len == t.byte_len)
-      return it->second;
+uint32_t GraphBuilder::initializer(std::string_view name, const ir::TensorRef& t,
+                                   const void* identity) {
+  if (identity) {
+    auto id = init_by_identity_.find(identity);
+    if (id != init_by_identity_.end()) return id->second;
   }
+  std::string base = name.empty() ? names_.next() : std::string(name);
+  // (requested name, located record) -> value; unlocated refs never merge.
+  std::string rec_key;
+  if (t.file_offset != UINT64_MAX) {
+    rec_key = base;
+    rec_key.push_back('\0');
+    rec_key += std::to_string(t.file_offset) + ":" + std::to_string(t.byte_len);
+    auto rk = init_by_record_.find(rec_key);
+    if (rk != init_by_record_.end()) {
+      if (identity) init_by_identity_.emplace(identity, rk->second);
+      return rk->second;
+    }
+  }
+  std::string cand = unique_name(base);
+  ir::ValueInfo vi;
+  vi.name = m_.intern(cand);
+  vi.dtype = t.dtype;
+  vi.shape = t.shape;
+  auto idx = static_cast<uint32_t>(values_.size());
+  values_.push_back(std::move(vi));
+  by_name_.emplace(std::move(cand), idx);
+  ir::TensorRef r = t;
+  r.name = values_[idx].name;
+  init_of_value_.emplace(idx, static_cast<uint32_t>(inits_.size()));
+  inits_.push_back(std::move(r));
+  if (identity) init_by_identity_.emplace(identity, idx);
+  if (!rec_key.empty()) init_by_record_.emplace(std::move(rec_key), idx);
+  return idx;
 }
 
 uint32_t GraphBuilder::capture(uint32_t parent_value_idx, std::string_view name) {

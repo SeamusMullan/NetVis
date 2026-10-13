@@ -115,11 +115,39 @@ Result<const std::vector<ValuePtr>*> tuple_items(const ValuePtr& v, const char* 
   return &v->items;
 }
 
+// Whole-module decode budget (BytecodeLimits::max_total_*). Charged before the
+// matching allocation; never exceeds its cap.
+struct DecodeBudget {
+  const BytecodeLimits& lim;
+  uint64_t entries = 0;
+  uint64_t bytes = 0;
+  Result<bool> charge_entries(uint64_t n, uint64_t pos) {
+    if (n > lim.max_total_entries - entries)
+      return err("bytecode.pkl: decoded tables exceed the total budget of " +
+                     std::to_string(lim.max_total_entries) +
+                     " entries (instructions, operators, constants, types, "
+                     "schema arguments across all methods)",
+                 pos);
+    entries += n;
+    return true;
+  }
+  Result<bool> charge_bytes(uint64_t n, uint64_t pos) {
+    if (n > lim.max_total_string_bytes - bytes)
+      return err("bytecode.pkl: decoded strings exceed the total budget of " +
+                     std::to_string(lim.max_total_string_bytes) + " bytes",
+                 pos);
+    bytes += n;
+    return true;
+  }
+};
+
 Result<bool> decode_args(const ValuePtr& list, const char* what,
                          const std::string& method, const BytecodeLimits& lim,
-                         std::vector<BcArg>& out) {
+                         DecodeBudget& budget, std::vector<BcArg>& out) {
   auto items = tuple_items(list, what, method, lim.max_schema_args);
   if (!items) return items.error();
+  auto ce = budget.charge_entries((*items)->size(), pos_of(list));
+  if (!ce) return ce.error();
   out.reserve((*items)->size());
   for (const ValuePtr& a : **items) {
     auto name = table_row(a, 0, "name", method);
@@ -131,13 +159,15 @@ Result<bool> decode_args(const ValuePtr& list, const char* what,
     if (!is(*name, Value::Kind::Str) || !is(*type, Value::Kind::Str) ||
         (*name)->s.size() > lim.max_string || (*type)->s.size() > lim.max_string)
       return err("method " + method + ": malformed schema argument", pos_of(a));
+    auto cb = budget.charge_bytes((*name)->s.size() + (*type)->s.size(), pos_of(a));
+    if (!cb) return cb.error();
     out.push_back(BcArg{(*name)->s, (*type)->s, *dflt});
   }
   return true;
 }
 
 Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
-                                   const BytecodeLimits& lim) {
+                                   const BytecodeLimits& lim, DecodeBudget& budget) {
   if (!is(mv, Value::Kind::Tuple) || mv->items.size() < 2)
     return err("bytecode.pkl: method entry is not a (name, code[, schema]) tuple",
                pos_of(mv));
@@ -146,6 +176,10 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
     return err("bytecode.pkl: method name is not a string of 1-" +
                    std::to_string(lim.max_string) + " bytes",
                pos_of(nv ? nv : mv));
+  {
+    auto cb = budget.charge_bytes(nv->s.size(), pos_of(nv));
+    if (!cb) return cb.error();
+  }
   BcFunction f;
   f.qualified_name = nv->s;
   f.pos = mv->src_pos;
@@ -168,6 +202,8 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
   {
     auto items = tuple_items(rows[0], "instructions", name, lim.max_instructions);
     if (!items) return items.error();
+    auto ce = budget.charge_entries((*items)->size(), pos_of(rows[0]));
+    if (!ce) return ce.error();
     f.instructions.reserve((*items)->size());
     std::unordered_map<std::string, uint32_t> unknown_ids;
     for (size_t i = 0; i < (*items)->size(); ++i) {
@@ -203,6 +239,8 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
       if (in.op == BcOp::Unknown) {
         auto it = unknown_ids.find(raw);
         if (it == unknown_ids.end()) {
+          auto cb = budget.charge_bytes(raw.size(), t->src_pos);
+          if (!cb) return cb.error();
           it = unknown_ids.emplace(raw, static_cast<uint32_t>(f.unknown_opcodes.size()))
                    .first;
           f.unknown_opcodes.push_back(raw);
@@ -217,6 +255,8 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
   {
     auto items = tuple_items(rows[1], "operators", name, lim.max_operators);
     if (!items) return items.error();
+    auto ce = budget.charge_entries((*items)->size(), pos_of(rows[1]));
+    if (!ce) return ce.error();
     f.operators.reserve((*items)->size());
     for (const ValuePtr& o : **items) {
       BcOperator op;
@@ -225,6 +265,8 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
       if (tup && o->items.size() >= 2 && is(o->items[0], Value::Kind::Str) &&
           is(o->items[1], Value::Kind::Str) && o->items[0]->s.size() <= lim.max_string &&
           o->items[1]->s.size() <= lim.max_string) {
+        auto cb = budget.charge_bytes(o->items[0]->s.size() + o->items[1]->s.size(), op.pos);
+        if (!cb) return cb.error();
         op.name = o->items[0]->s;
         op.overload = o->items[1]->s;
       } else {
@@ -242,6 +284,8 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
   {
     auto items = tuple_items(rows[2], "constants", name, lim.max_constants);
     if (!items) return items.error();
+    auto ce = budget.charge_entries((*items)->size(), pos_of(rows[2]));
+    if (!ce) return ce.error();
     f.constants = **items;
   }
 
@@ -249,10 +293,14 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
   {
     auto items = tuple_items(rows[3], "types", name, lim.max_types);
     if (!items) return items.error();
+    auto ce = budget.charge_entries((*items)->size(), pos_of(rows[3]));
+    if (!ce) return ce.error();
     f.types.reserve((*items)->size());
     f.type_ok.reserve((*items)->size());
     for (const ValuePtr& t : **items) {
       if (is(t, Value::Kind::Str) && t->s.size() <= lim.max_string) {
+        auto cb = budget.charge_bytes(t->s.size(), pos_of(t));
+        if (!cb) return cb.error();
         f.types.push_back(t->s);
         f.type_ok.push_back(1);
       } else {
@@ -277,9 +325,9 @@ Result<BcFunction> decode_function(const ValuePtr& mv, int64_t version,
     if (!args) return args.error();
     auto rets = table_row(schema, 1, "returns", name);
     if (!rets) return rets.error();
-    auto a = decode_args(*args, "arguments", name, lim, f.arguments);
+    auto a = decode_args(*args, "arguments", name, lim, budget, f.arguments);
     if (!a) return a.error();
-    auto r = decode_args(*rets, "returns", name, lim, f.returns);
+    auto r = decode_args(*rets, "returns", name, lim, budget, f.returns);
     if (!r) return r.error();
   }
   return f;
@@ -312,8 +360,9 @@ Result<BcModule> decode_bytecode(const ValuePtr& root, const BytecodeLimits& lim
                    " functions exceed the cap of " + std::to_string(lim.max_functions),
                root->src_pos);
   m.functions.reserve(nfn);
+  DecodeBudget budget{lim};
   for (size_t i = first; i < root->items.size(); ++i) {
-    auto f = decode_function(root->items[i], m.version, lim);
+    auto f = decode_function(root->items[i], m.version, lim, budget);
     if (!f) return f.error();
     m.functions.push_back(f.take());
   }
@@ -516,6 +565,21 @@ class Executor {
   Error internal(const std::string& msg) const {
     return err("internal: " + msg, f_.pos);
   }
+  // Whole-method work budget (BytecodeLimits::max_exec_work). Every unit of
+  // graph growth is charged BEFORE it is allocated; set_reg and new captures
+  // only accumulate (each is bounded by an earlier charged push), so the next
+  // charge() fails once the total is spent.
+  Error too_large(int64_t pc) const {
+    return fail(pc, "method too large: symbolic execution exceeds the work budget of " +
+                        std::to_string(lim_.max_exec_work) +
+                        " (values, register writes, captures, attribute elements)");
+  }
+  Result<bool> charge(uint64_t n, int64_t pc) {
+    if (work_ > lim_.max_exec_work || n > lim_.max_exec_work - work_)
+      return too_large(pc);
+    work_ += n;
+    return true;
+  }
 
   GraphBuilder& B(uint32_t id) { return *builders_[id]; }
 
@@ -552,6 +616,8 @@ class Executor {
   Result<bool> push(const Sym& s, int64_t pc) {
     if (st_.size() >= lim_.max_stack)
       return fail(pc, "symbolic stack deeper than " + std::to_string(lim_.max_stack));
+    auto c = charge(1, pc);
+    if (!c) return c.error();
     uint32_t prev = pend_prefix_.empty() ? 0 : pend_prefix_.back();
     st_.push_back(s);
     pend_prefix_.push_back(prev + (s.kind == Sym::Kind::Pending ? 1u : 0u));
@@ -595,8 +661,11 @@ class Executor {
   Result<bool> checkpoint(size_t base, int64_t pc, BcOp op);
 
   // --- registers (undo journal) ---
+  // Journaled only inside a branch or loop body: at the top level no mark is
+  // open, so nothing would ever roll those entries back.
   void set_reg(uint32_t r, const Sym& s) {
-    journal_.push_back({r, regs_[r]});
+    ++work_;
+    if (cf_depth_ > 0) journal_.push_back({r, regs_[r]});
     regs_[r] = s;
   }
   std::vector<std::pair<uint32_t, Sym>> collect_writes(size_t mark) {
@@ -631,7 +700,16 @@ class Executor {
   Result<bool> push_sn(GraphBuilder& b, uint32_t node, int64_t pc, int64_t hi,
                        size_t base);
   Result<bool> type_attr(int64_t x, int64_t pc, std::vector<ir::Attribute>& pre);
+  StringId type_id(size_t i);
   uint32_t const_name(size_t x);
+  // A folded constant's attribute, computed once per pickled Value (a constant
+  // referenced by many instructions is rendered once, not once per use).
+  ir::AttrValue const_attr(const Value* v);
+  // Distinct tensors held by a packed object's state or a constant container,
+  // in traversal order; cached per Value. The walk is charged to the budget.
+  Result<const std::vector<const Value*>*> held_tensors(const Value* v, int64_t pc);
+  bool walk_held(const Value* v, int depth, std::unordered_set<const Value*>& seen,
+                 std::vector<const Value*>& out);
 
   // --- execution ---
   Result<bool> exec_block(GraphBuilder& b, int64_t lo, int64_t hi, size_t base);
@@ -671,6 +749,10 @@ class Executor {
   uint32_t cf_depth_ = 0;
   uint32_t control_ord_ = 0;
   bool returned_ = false;
+  uint64_t work_ = 0;
+  std::unordered_map<size_t, StringId> type_ids_;            // types[] idx -> id
+  std::unordered_map<const Value*, ir::AttrValue> const_attrs_;
+  std::unordered_map<const Value*, std::vector<const Value*>> held_;
 };
 
 // ---- pending resolution -----------------------------------------------------
@@ -778,7 +860,10 @@ Result<uint32_t> Executor::resolve(GraphBuilder& b, uint32_t scope, uint32_t idx
   if (!p) return internal("value used outside its scope");
   auto pv = resolve(*p, scope, idx);
   if (!pv) return pv.error();
-  return b.capture(*pv, p->value_name(*pv));
+  const size_t before = b.captured_parent_values().size();
+  const uint32_t v = b.capture(*pv, p->value_name(*pv));
+  if (b.captured_parent_values().size() != before) ++work_;
+  return v;
 }
 
 Result<uint32_t> Executor::use_edge(GraphBuilder& b, const Sym& s0) {
@@ -789,10 +874,8 @@ Result<uint32_t> Executor::use_edge(GraphBuilder& b, const Sym& s0) {
     case Sym::Kind::Edge:
       return resolve(b, s.scope, s.idx);
     case Sym::Kind::Const: {
-      ir::AttrValue av;
-      ts::constant_to_attr(*s.v, model_, av);
       uint32_t n = b.node(ts::kind::kConstant);
-      b.add_attr(n, make_attr(model_, ts::attr::kValue, std::move(av)));
+      b.add_attr(n, make_attr(model_, ts::attr::kValue, const_attr(s.v)));
       return b.add_output(n);
     }
     case Sym::Kind::TensorConst:
@@ -807,7 +890,59 @@ Result<uint32_t> Executor::use_edge(GraphBuilder& b, const Sym& s0) {
 uint32_t Executor::tensor_init(GraphBuilder& b, const Sym& s) {
   ir::TensorRef t = s.v->tensor;
   if (!s.v->dtype_label.empty()) t.dtype_label = model_.intern(s.v->dtype_label);
-  return b.initializer(strs_[s.path], t);
+  return b.initializer(strs_[s.path], t, s.v);
+}
+
+ir::AttrValue Executor::const_attr(const Value* v) {
+  auto it = const_attrs_.find(v);
+  if (it != const_attrs_.end()) return it->second;
+  ir::AttrValue av;
+  ts::constant_to_attr(*v, model_, av);
+  const_attrs_.emplace(v, av);
+  return av;
+}
+
+// One step per visited Value, charged to the work budget; false when it is spent.
+bool Executor::walk_held(const Value* v, int depth, std::unordered_set<const Value*>& seen,
+                         std::vector<const Value*>& out) {
+  if (!v || depth > ts::kMaxTraversalDepth) return true;
+  if (work_ >= lim_.max_exec_work) return false;
+  ++work_;
+  switch (v->kind) {
+    case Value::Kind::Tensor:
+      if (seen.insert(v).second) out.push_back(v);
+      return true;
+    case Value::Kind::List:
+    case Value::Kind::Tuple:
+      if (!seen.insert(v).second) return true;
+      for (const ValuePtr& it : v->items)
+        if (!walk_held(it.get(), depth + 1, seen, out)) return false;
+      return true;
+    case Value::Kind::Dict:
+      if (!seen.insert(v).second) return true;
+      for (const auto& kv : v->pairs)
+        if (!walk_held(kv.second.get(), depth + 1, seen, out)) return false;
+      return true;
+    case Value::Kind::Opaque:
+      if (!seen.insert(v).second) return true;
+      if (ts::is_torch_object(*v)) return walk_held(v->inner.get(), depth + 1, seen, out);
+      if (ts::is_packed_object(*v)) return walk_held(v->inner.get(), depth + 1, seen, out);
+      return true;
+    default:
+      return true;
+  }
+}
+
+Result<const std::vector<const Value*>*> Executor::held_tensors(const Value* v,
+                                                                 int64_t pc) {
+  auto it = held_.find(v);
+  if (it != held_.end()) return &it->second;
+  std::vector<const Value*> out;
+  std::unordered_set<const Value*> seen;
+  // A packed object's state, or a constant container itself.
+  const Value* start = ts::is_packed_object(*v) ? v->inner.get() : v;
+  if (!walk_held(start, 0, seen, out)) return too_large(pc);
+  return &held_.emplace(v, std::move(out)).first->second;
 }
 
 Result<uint32_t> Executor::materialize_module(GraphBuilder& b, const Sym& s) {
@@ -847,10 +982,8 @@ Result<uint32_t> Executor::make_node(GraphBuilder& b, std::string_view op_type,
   for (size_t k = 0; k < inputs.size(); ++k) {
     const Sym& s = inputs[k];
     if (s.kind == Sym::Kind::Const) {
-      ir::AttrValue av;
-      ts::constant_to_attr(*s.v, model_, av);
       args.push_back(make_attr(model_, ts::arg_attr_name(static_cast<uint32_t>(k)),
-                               std::move(av)));
+                               const_attr(s.v)));
       continue;
     }
     auto e = use_edge(b, s);
@@ -868,6 +1001,10 @@ Result<bool> Executor::push_outputs(GraphBuilder& b, uint32_t node, int64_t coun
                                     int64_t pc) {
   if (count < 0 || static_cast<uint64_t>(count) > lim_.max_stack - st_.size())
     return fail(pc, "symbolic stack deeper than " + std::to_string(lim_.max_stack));
+  // Each push charges 1; refuse up front so no output value is created first.
+  if (work_ > lim_.max_exec_work ||
+      static_cast<uint64_t>(count) > lim_.max_exec_work - work_)
+    return too_large(pc);
   for (int64_t i = 0; i < count; ++i) {
     auto p = push(edge_sym(b.id(), b.add_output(node)), pc);
     if (!p) return p.error();
@@ -902,13 +1039,24 @@ Result<bool> Executor::type_attr(int64_t x, int64_t pc, std::vector<ir::Attribut
     return fail(pc, "types index " + std::to_string(x) + " out of range");
   auto i = static_cast<size_t>(x);
   if (f_.type_ok[i]) {
-    pre.push_back(attr_str(model_, ts::attr::kType, f_.types[i]));
+    ir::AttrValue v;
+    v.kind = ir::AttrValue::Kind::String;
+    v.s = type_id(i);
+    pre.push_back(make_attr(model_, ts::attr::kType, std::move(v)));
   } else {
     pre.push_back(attr_str(model_, ts::attr::kType, "?"));
     pre.push_back(attr_str(model_, ts::attr::kUnresolved,
                            "types[" + std::to_string(x) + "] is not a string"));
   }
   return true;
+}
+
+StringId Executor::type_id(size_t i) {
+  auto it = type_ids_.find(i);
+  if (it != type_ids_.end()) return it->second;
+  StringId id = model_.intern(f_.types[i]);
+  type_ids_.emplace(i, id);
+  return id;
 }
 
 uint32_t Executor::const_name(size_t x) {
@@ -963,6 +1111,15 @@ Result<bool> Executor::exec_get_attr(GraphBuilder& b, const BcInstruction& in,
         return push(s, pc);
       }
       case AK::Constant: {
+        // Tensors inside a folded List/Tuple/Dict constant ARE read by forward:
+        // they render in the repr, so they count as referenced, not unreferenced.
+        if (a.value->kind == Value::Kind::List || a.value->kind == Value::Kind::Tuple ||
+            a.value->kind == Value::Kind::Dict) {
+          auto held = held_tensors(a.value, pc);
+          if (!held) return held.error();
+          for (const Value* t : **held)
+            if (bound_seen_.insert(t).second) result_.bound_module_tensors.push_back(t);
+        }
         Sym s;
         s.kind = Sym::Kind::Const;
         s.v = a.value;
@@ -980,6 +1137,24 @@ Result<bool> Executor::exec_get_attr(GraphBuilder& b, const BcInstruction& in,
   const bool named = bound_receiver && a.kind == AK::Opaque;
   if (named) b.add_attr(n, attr_str(model_, ts::attr::kName, child));
   b.add_attr(n, attr_int(model_, ts::attr::kSlot, X));
+  // A packed object (torchbind context: prepacked conv/linear, ...) keeps its
+  // weights in its state. They become initializers feeding the GetAttr, named
+  // by their module path ("conv.packed.0"), so they are located and counted.
+  if (named && ts::is_packed_object(*a.value)) {
+    auto held = held_tensors(a.value, pc);
+    if (!held) return held.error();
+    auto c = charge((*held)->size(), pc);
+    if (!c) return c.error();
+    size_t k = 0;
+    for (const Value* t : **held) {
+      if (bound_seen_.insert(t).second) result_.bound_module_tensors.push_back(t);
+      Sym ts_sym;
+      ts_sym.kind = Sym::Kind::TensorConst;
+      ts_sym.v = t;
+      ts_sym.path = intern_str(ctx_.env.tensor_path(t, child + "." + std::to_string(k++)));
+      b.add_edge(n, tensor_init(b, ts_sym));
+    }
+  }
   return push(edge_sym(b.id(), b.add_output(n, named ? child : std::string())), pc);
 }
 
@@ -1103,6 +1278,14 @@ Result<int64_t> Executor::exec_loop(GraphBuilder& b, int64_t s, int64_t hi, size
     return fail(s, "control flow nested deeper than " + std::to_string(lim_.max_cf_depth));
 
   // [iter0, max_trip, cond, carried...]; iter0 (the emitter's LOADC 0) is dropped.
+  // Anything else in that slot contradicts the emitter (I7): checked BEFORE the
+  // pop, which would confirm a pending op there and give it a phantom output.
+  if (static_cast<uint64_t>(N) + 1 <= st_.size() - base) {
+    const Sym& it0 = st_[st_.size() - static_cast<size_t>(N) - 1];
+    if (it0.kind != Sym::Kind::Const || !it0.v || it0.v->kind != Value::Kind::Int ||
+        it0.v->i != 0)
+      return fail(s, "malformed loop (iteration counter is not the constant 0)");
+  }
   auto popped = pop_n(N + 1, base, s);
   if (!popped) return popped.error();
   std::vector<uint32_t> operands;
@@ -1388,11 +1571,13 @@ Result<bool> Executor::exec_block(GraphBuilder& b, int64_t lo, int64_t hi, size_
       case BcOp::ISINSTANCE: {
         if (X < 0 || X + N > static_cast<int64_t>(f_.types.size()))
           return fail(pc, "ISINSTANCE types range out of bounds");
+        auto c = charge(static_cast<uint64_t>(N), pc);
+        if (!c) return c.error();
         ir::AttrValue tv;
         tv.kind = ir::AttrValue::Kind::Strings;
         bool bad = false;
         for (int64_t i = X; i < X + N; ++i) {
-          tv.strings.push_back(model_.intern(f_.types[static_cast<size_t>(i)]));
+          tv.strings.push_back(type_id(static_cast<size_t>(i)));
           bad = bad || !f_.type_ok[static_cast<size_t>(i)];
         }
         std::vector<ir::Attribute> pre;
@@ -1409,6 +1594,9 @@ Result<bool> Executor::exec_block(GraphBuilder& b, int64_t lo, int64_t hi, size_
         if (X < 0 || static_cast<uint64_t>(X) >= f_.constants.size() ||
             !is(f_.constants[static_cast<size_t>(X)], Value::Kind::Str))
           return fail(pc, "INTERFACE_CALL method name is not a string constant");
+        if (f_.constants[static_cast<size_t>(X)]->s.size() > lim_.max_string)
+          return fail(pc, "INTERFACE_CALL method name longer than " +
+                              std::to_string(lim_.max_string) + " bytes");
         auto popped = pop_n(N, base, pc);
         if (!popped) return popped.error();
         std::vector<ir::Attribute> pre;

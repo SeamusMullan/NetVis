@@ -22,6 +22,7 @@
 
 #include "core/ByteReader.h"
 #include "core/MappedFile.h"
+#include "engine/CostModel.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
 #include "parsers/pytorch/MobileBytecode.h"
@@ -29,6 +30,7 @@
 #include "parsers/pytorch/TorchScriptIR.h"
 
 #include "miniz.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 using netvis::pytorch::Value;
@@ -1473,5 +1475,544 @@ TEST_CASE("T-M8 archive without data.pkl still graphs, self unbound") {
   REQUIRE(self);
   CHECK(self->find("no data.pkl") != std::string::npos);
   CHECK(m.flat_tensors.empty());
+  CHECK(ByteReader::payload_read_counter() == 0);
+}
+
+// ============================================================================
+// T-R: review hardening (#179) — whole-module and whole-method budgets,
+// constant folding cost, packed-object weights, initializer identity, loop
+// layout, container-held tensors, nested control flow, parse_zip routing
+// ============================================================================
+namespace {
+std::string decode_err(const ValuePtr& root, const mb::BytecodeLimits& lim) {
+  auto r = mb::decode_bytecode(root, lim);
+  return r ? std::string() : r.error().message;
+}
+}  // namespace
+
+TEST_CASE("T-R1 decode: memoized tables are charged against a whole-module budget") {
+  // One method tuple referenced twice (BINGET): each reference decodes a full
+  // copy, so the second is charged again.
+  std::vector<ValuePtr> code(600, ins("LOAD", 1, 0));  // one shared instruction
+  ValuePtr m = fn("__torch__.M.forward", code, {}, {}, {}, 1, {arg("x", "Tensor")},
+                  {arg("", "Tensor")});
+  mb::BytecodeLimits lim;
+  CHECK(decode_err(T({I(8), m, m}), lim).empty());
+  lim.max_total_entries = 1000;
+  CHECK(decode_err(T({I(8), m}), lim).empty());
+  CHECK(decode_err(T({I(8), m, m}), lim).find("total budget of 1000 entries") !=
+        std::string::npos);
+
+  // One 4000-byte operator name referenced by every operator entry.
+  ValuePtr op = T({S(std::string(4000, 'o')), S(""), I(1)});
+  ValuePtr m2 = fn("__torch__.M.forward", {}, std::vector<ValuePtr>(100, op), {}, {}, 0, {},
+                   {});
+  mb::BytecodeLimits lim2;
+  CHECK(decode_err(T({I(8), m2}), lim2).empty());
+  lim2.max_total_string_bytes = 100000;
+  CHECK(decode_err(T({I(8), m2}), lim2).find("decoded strings exceed the total budget") !=
+        std::string::npos);
+  // The defaults do bound the product of the per-function caps.
+  const mb::BytecodeLimits d;
+  CHECK(d.max_total_entries < static_cast<uint64_t>(d.max_functions) * d.max_instructions);
+}
+
+TEST_CASE("T-R2 executor: fan-out instructions are charged against a work budget") {
+  const std::vector<mb::BcArg> xa = {Arg("x", "Tensor")};
+  const std::vector<mb::BcArg> r1 = {Arg("", "Tensor")};
+  // ISINSTANCE with 65535 types per node, default limits.
+  std::vector<std::string> types(65535, "Tensor");
+  auto isinstance_fn = [&](int reps) {
+    std::vector<mb::BcInstruction> code = {In(BcOp::STORE, 1)};
+    for (int i = 0; i < reps; ++i) {
+      code.push_back(In(BcOp::LOAD, 1));
+      code.push_back(In(BcOp::ISINSTANCE, 0, 65535));
+      code.push_back(In(BcOp::DROP));
+    }
+    code.push_back(In(BcOp::MOVE, 1));
+    code.push_back(In(BcOp::RET));
+    return mod(make_fn(code, {}, {}, 1, xa, r1, types));
+  };
+  {
+    Run ok;
+    build_into(ok, isinstance_fn(4));
+    REQUIRE_MESSAGE(ok.ok(), ok.error());
+    CHECK(ok.model.graphs[0].nodes.size() == 4);
+  }
+  {
+    Run r;
+    build_into(r, isinstance_fn(1000));
+    REQUIRE_FALSE(r.ok());
+    CHECK(r.error().find("method too large") != std::string::npos);
+    CHECK(r.error().find("work budget") != std::string::npos);
+    CHECK(r.model.graphs.empty());
+  }
+  // LIST_UNPACK 65535 then STOREN 65535: values plus register writes.
+  {
+    mb::BytecodeLimits lim;
+    lim.max_exec_work = 100000;
+    Run r;
+    build_into(r,
+               mod(make_fn({In(BcOp::STORE, 1), In(BcOp::LOAD, 1), In(BcOp::LIST_UNPACK, 65535),
+                            In(BcOp::STOREN, 2, 65535), In(BcOp::MOVE, 1), In(BcOp::RET)},
+                           {}, {}, 65536, xa, r1)),
+               empty_env(), no_names(), lim);
+    REQUIRE_FALSE(r.ok());
+    CHECK(r.error().find("work budget of 100000") != std::string::npos);
+    CHECK(r.model.graphs.empty());
+  }
+  // A fan-out larger than what is left is refused before any output exists.
+  {
+    mb::BytecodeLimits lim;
+    lim.max_exec_work = 1000;
+    Run r;
+    build_into(r,
+               mod(make_fn({In(BcOp::STORE, 1), In(BcOp::LOAD, 1), In(BcOp::LIST_UNPACK, 5000),
+                            In(BcOp::RET)},
+                           {}, {}, 1, xa, r1)),
+               empty_env(), no_names(), lim);
+    REQUIRE_FALSE(r.ok());
+    CHECK(r.error().find("pc 2: method too large") != std::string::npos);
+  }
+}
+
+TEST_CASE("T-R3 constant folding: caps apply before O(size) work, folds are memoized") {
+  // An 8 MB string and a 1M-element list, each folded into 2000 nodes. Without
+  // the caps and the memo this is ~16 GB of copying plus 2e9 element scans.
+  ValuePtr big_s = S(std::string(8u << 20, 'a'));
+  ValuePtr big_l = L(std::vector<ValuePtr>(1u << 20, I(1)));
+  std::vector<mb::BcInstruction> code = {In(BcOp::STORE, 1)};
+  for (int i = 0; i < 2000; ++i) {
+    code.push_back(In(BcOp::LOADC, i % 2));
+    code.push_back(In(BcOp::OP, 0));
+    code.push_back(In(BcOp::DROP));
+  }
+  code.push_back(In(BcOp::MOVE, 1));
+  code.push_back(In(BcOp::RET));
+  Run r;
+  build_into(r, mod(make_fn(code, {Op("custom::g", "", 1)}, {big_s, big_l}, 1,
+                            {Arg("x", "Tensor")}, {Arg("", "Tensor")})));
+  REQUIRE_MESSAGE(r.ok(), r.error());
+  const ir::Graph& g = r.model.graphs[0];
+  REQUIRE(g.nodes.size() == 2000);
+  const std::string s0 = attr_s(r.model, g, 0, "arg0");
+  CHECK(s0.size() <= ts::ConstLimits{}.max_repr + 3);
+  CHECK(s0.rfind("'aaa", 0) == 0);
+  CHECK(attr_s(r.model, g, 1, "arg0") == "[\xE2\x80\xA6 1048576 items]");
+  CHECK(attr_s(r.model, g, 1999, "arg0") == attr_s(r.model, g, 1, "arg0"));
+
+  // constant_repr alone stops copying at the cap.
+  ValuePtr huge = S(std::string(50u << 20, '\''));
+  CHECK(ts::constant_repr(*huge).size() <= ts::ConstLimits{}.max_repr + 3);
+
+  // INTERFACE_CALL's method name is capped like every other decoded name.
+  Run ic;
+  build_into(ic, mod(make_fn({In(BcOp::STORE, 1), In(BcOp::LOAD, 1),
+                              In(BcOp::INTERFACE_CALL, 0, 1), In(BcOp::MOVE, 1), In(BcOp::RET)},
+                             {}, {S(std::string(5000, 'm'))}, 1, {Arg("x", "Tensor")},
+                             {Arg("", "Tensor")})));
+  REQUIRE_FALSE(ic.ok());
+  CHECK(ic.error().find("INTERFACE_CALL method name longer than 4096 bytes") !=
+        std::string::npos);
+}
+
+TEST_CASE("T-R4 packed objects: weights in their state are located and counted") {
+  ValuePtr W = tensor_v(64, 32, {2, 4});
+  ValuePtr Bt = tensor_v(96, 8, {2});
+  ValuePtr ctxv = mk(Value::Kind::Opaque);
+  ctxv->module = "__torch__.torch.classes.xnnpack";
+  ctxv->name = "Conv2dOpContext";
+  ctxv->inner = T({W, Bt, L({I(1), I(1)}), N()});
+  ValuePtr root = obj("__torch__", "M",
+                      {{"training", B(false)}, {"conv", obj("__torch__", "Conv", {{"packed", ctxv}})}});
+  ts::ModuleEnv env(root);
+  CHECK(env.packed().objects == 1);
+  CHECK(env.packed().tensors == 2);
+  CHECK(env.packed().unlocated == 0);
+  CHECK(env.module_tensor_count() == 2);
+  CHECK(env.tensor_path(W.get(), "") == "conv.packed.0");
+  // The tensor table walk sees them too.
+  VS paths;
+  ts::for_each_tensor(root, [&](const std::string& p, const Value&) { paths.push_back(p); });
+  CHECK(paths == VS{"conv.packed.0", "conv.packed.1"});
+
+  // forward(self, x) = prepacked::conv2d_clamp_run(x, self.conv.packed)
+  Run r;
+  build_into(r,
+             mod(make_fn({In(BcOp::STOREN, 1, 2), In(BcOp::MOVE, 2), In(BcOp::MOVE, 1),
+                          In(BcOp::GET_ATTR, 1), In(BcOp::GET_ATTR, 0), In(BcOp::OP, 0),
+                          In(BcOp::RET)},
+                         {Op("prepacked::conv2d_clamp_run", "", 2)}, {}, 2,
+                         {Arg("self", "__torch__.M"), Arg("x", "Tensor")}, {Arg("", "Tensor")})),
+             env);
+  REQUIRE_MESSAGE(r.ok(), r.error());
+  const ir::Graph& g = r.model.graphs[0];
+  CHECK(ops_of(r.model, g) ==
+        VS{"prim::GetAttr", "prim::GetAttr", "prepacked::conv2d_clamp_run"});
+  CHECK(attr_s(r.model, g, 1, "name") == "conv.packed");
+  CHECK(ins_of(r.model, g, 1) == VS{"conv", "conv.packed.0", "conv.packed.1"});
+  CHECK(init_names(r.model, g) == VS{"conv.packed.0", "conv.packed.1"});
+  CHECK(g.initializers[0].file_offset == 64);
+  const auto& bound = (*r.res)->bound_module_tensors;
+  REQUIRE(bound.size() == 2);
+  CHECK(bound[0] == W.get());
+  CHECK(bound[1] == Bt.get());
+
+  // A quantized packed context: its tensor cannot be decoded, so it is counted
+  // as unlocated (never guessed) and the parameter totals become a lower bound.
+  ValuePtr q = mk(Value::Kind::Opaque);
+  q->module = "torch._utils";
+  q->name = "_rebuild_qtensor";
+  ValuePtr qp = mk(Value::Kind::Opaque);
+  qp->module = "__torch__.torch.classes.quantized";
+  qp->name = "LinearPackedParamsBase";
+  qp->inner = T({S("3"), L({q, N()}), L({N()})});
+  ts::ModuleEnv qenv(
+      obj("__torch__", "M", {{"fc", obj("__torch__", "L", {{"_packed_params", qp}})}}));
+  CHECK(qenv.packed().objects == 1);
+  CHECK(qenv.packed().tensors == 0);
+  CHECK(qenv.packed().unlocated == 1);
+
+  ir::Model table;
+  table.has_graph = false;
+  table.unlocated_weights = 1;
+  CHECK(compute_cost(table, 0).unlocated_weights == 1);
+  CHECK(compute_cost(r.model, 0).unlocated_weights == 0);
+  r.model.unlocated_weights = 2;
+  CHECK(compute_cost(r.model, 0).unlocated_weights == 2);
+}
+
+TEST_CASE("T-R5 initializers: identity decides, unlocated refs never merge by name") {
+  ir::Model m;
+  ts::NameCounter names;
+  ts::GraphBuilder gb(m, names, "g", 0, nullptr);
+  ir::TensorRef t;
+  t.dtype = ir::DType::F32;
+  t.file_offset = UINT64_MAX;  // storage key did not resolve
+  t.byte_len = 8;
+  int a = 0, b = 0;
+  const uint32_t va = gb.initializer("w", t, &a);
+  const uint32_t vb = gb.initializer("w", t, &b);
+  CHECK(va != vb);
+  CHECK(gb.value_name(vb) == "w#2");
+  CHECK(gb.initializer("w", t, &a) == va);
+  CHECK(gb.initializer("w", t) != va);  // no identity, unlocated: a new value
+  // Suffixes continue from the last one instead of re-probing from #2.
+  uint32_t last = 0;
+  for (int i = 0; i < 20000; ++i) last = gb.initializer("x", t);
+  CHECK(gb.value_name(last) == "x#20000");
+  ir::Graph g = gb.finish();
+  CHECK(g.initializers.size() == 3 + 20000);
+}
+
+TEST_CASE("T-R6 LOOP: the iteration-counter slot must be the emitter's constant 0") {
+  const std::vector<mb::BcOperator> relu = {Op("aten::relu", "", 1)};
+  auto loop_fn = [&](std::vector<mb::BcInstruction> prefix, std::vector<ValuePtr> consts) {
+    std::vector<mb::BcInstruction> code = std::move(prefix);
+    for (const auto& in :
+         {In(BcOp::LOADC, 1), In(BcOp::LOADC, 2), In(BcOp::LOAD, 1), In(BcOp::LOOP, 6, 3),
+          In(BcOp::STOREN, 2, 2), In(BcOp::LOADC, 2), In(BcOp::MOVE, 3), In(BcOp::OP, 0),
+          In(BcOp::JMP, -5), In(BcOp::STORE, 4), In(BcOp::DROPR, 1), In(BcOp::MOVE, 4),
+          In(BcOp::RET)})
+      code.push_back(in);
+    return mod(make_fn(code, relu, std::move(consts), 4, {Arg("x", "Tensor")},
+                       {Arg("", "Tensor")}));
+  };
+  {
+    Run ok;
+    build_into(ok, loop_fn({In(BcOp::STORE, 1), In(BcOp::LOADC, 0)}, {I(0), I(10), B(true)}));
+    REQUIRE_MESSAGE(ok.ok(), ok.error());
+  }
+  {
+    Run r;
+    build_into(r, loop_fn({In(BcOp::STORE, 1), In(BcOp::LOADC, 0)}, {I(1), I(10), B(true)}));
+    REQUIRE_FALSE(r.ok());
+    CHECK(r.error().find("pc 5: malformed loop (iteration counter") != std::string::npos);
+  }
+  {
+    // A pending op where iter0 belongs: an error, not a phantom output.
+    Run r;
+    build_into(r, loop_fn({In(BcOp::STORE, 1), In(BcOp::LOAD, 1), In(BcOp::OP, 0)},
+                          {I(0), I(10), B(true)}));
+    REQUIRE_FALSE(r.ok());
+    CHECK(r.error().find("malformed loop (iteration counter") != std::string::npos);
+    CHECK(r.model.graphs.empty());
+  }
+}
+
+TEST_CASE("T-R7 tensors inside a folded constant attribute count as referenced") {
+  ValuePtr W = tensor_v(64, 32, {2, 4});
+  ValuePtr Bt = tensor_v(96, 8, {2});
+  ts::ModuleEnv env(obj("__torch__", "M", {{"training", B(false)}, {"bufs", L({W, Bt})}}));
+  CHECK(env.module_tensor_count() == 2);
+  Run r;
+  build_into(r,
+             mod(make_fn({In(BcOp::STOREN, 1, 2), In(BcOp::MOVE, 2), In(BcOp::MOVE, 1),
+                          In(BcOp::GET_ATTR, 1), In(BcOp::OP, 0), In(BcOp::RET)},
+                         {Op("custom::h", "", 2)}, {}, 2,
+                         {Arg("self", "__torch__.M"), Arg("x", "Tensor")}, {Arg("", "Tensor")})),
+             env);
+  REQUIRE_MESSAGE(r.ok(), r.error());
+  const ir::Graph& g = r.model.graphs[0];
+  CHECK(ops_of(r.model, g) == VS{"custom::h"});
+  CHECK(attr_s(r.model, g, 0, "arg1") == "[<tensor f32[2,4]>, <tensor f32[2]>]");
+  const auto& bound = (*r.res)->bound_module_tensors;
+  REQUIRE(bound.size() == 2);
+  CHECK(bound[0] == W.get());
+  CHECK(bound[1] == Bt.get());
+}
+
+TEST_CASE("T-R8 nested control flow: If in Loop, Loop in If, pending If chains") {
+  const std::vector<mb::BcArg> xc = {Arg("x", "Tensor"), Arg("c", "bool")};
+  const std::vector<mb::BcArg> r1 = {Arg("", "Tensor")};
+  SUBCASE("If inside a loop body captures through the body") {
+    Run r;
+    build_into(r, mod(make_fn({In(BcOp::STOREN, 1, 2), In(BcOp::LOADC, 0), In(BcOp::LOADC, 1),
+                               In(BcOp::LOADC, 2), In(BcOp::LOAD, 1), In(BcOp::LOOP, 12, 3),
+                               In(BcOp::STOREN, 3, 2), In(BcOp::LOAD, 2), In(BcOp::JF, 4),
+                               In(BcOp::LOAD, 4), In(BcOp::OP, 0), In(BcOp::JMP, 2),
+                               In(BcOp::LOAD, 4), In(BcOp::STORE, 5), In(BcOp::LOADC, 2),
+                               In(BcOp::MOVE, 5), In(BcOp::JMP, -11), In(BcOp::STORE, 6),
+                               In(BcOp::MOVE, 6), In(BcOp::RET)},
+                              {Op("aten::relu", "", 1)}, {I(0), I(10), B(true)}, 6, xc, r1)));
+    REQUIRE_MESSAGE(r.ok(), r.error());
+    const ir::Model& m = r.model;
+    REQUIRE(m.graphs.size() == 4);
+    CHECK(str(m, m.graphs[1].name) == "__torch__.M.forward/loop0.body");
+    CHECK(str(m, m.graphs[2].name) == "__torch__.M.forward/loop0.body/if1.then");
+    const ir::Graph& g = m.graphs[0];
+    CHECK(ops_of(m, g) == VS{"prim::Constant", "prim::Constant", "prim::Loop"});
+    CHECK(attr_i(m, g, 2, "captures") == 1);
+    CHECK(ins_of(m, g, 2).back() == "c");
+    const ir::Graph& body = m.graphs[1];
+    CHECK(ops_of(m, body) == VS{"prim::If", "prim::Constant"});
+    CHECK(attr_i(m, body, 0, "captures") == 1);
+    CHECK(outs_of(m, body, 0).size() == 1);
+    CHECK(ops_of(m, m.graphs[2]) == VS{"aten::relu"});
+    CHECK(m.graphs[2].graph_outputs.size() == 1);
+    CHECK(m.graphs[3].nodes.empty());
+    CHECK(m.graphs[3].graph_outputs.size() == 1);
+    CHECK(names_of(m, g, g.graph_outputs) == outs_of(m, g, 2));
+  }
+  SUBCASE("Loop inside a then-branch") {
+    Run r;
+    build_into(r, mod(make_fn({In(BcOp::STOREN, 1, 2), In(BcOp::LOAD, 2), In(BcOp::JF, 12),
+                               In(BcOp::LOADC, 0), In(BcOp::LOADC, 1), In(BcOp::LOADC, 2),
+                               In(BcOp::LOAD, 1), In(BcOp::LOOP, 6, 3), In(BcOp::STOREN, 3, 2),
+                               In(BcOp::LOADC, 2), In(BcOp::MOVE, 4), In(BcOp::OP, 0),
+                               In(BcOp::JMP, -5), In(BcOp::JMP, 2), In(BcOp::LOAD, 1),
+                               In(BcOp::STORE, 5), In(BcOp::MOVE, 5), In(BcOp::RET)},
+                              {Op("aten::relu", "", 1)}, {I(0), I(10), B(true)}, 5, xc, r1)));
+    REQUIRE_MESSAGE(r.ok(), r.error());
+    const ir::Model& m = r.model;
+    REQUIRE(m.graphs.size() == 4);
+    CHECK(str(m, m.graphs[3].name) == "__torch__.M.forward/if0.then/loop1.body");
+    const ir::Graph& g = m.graphs[0];
+    CHECK(ops_of(m, g) == VS{"prim::If"});
+    CHECK(attr_i(m, g, 0, "captures") == 1);
+    CHECK(outs_of(m, g, 0).size() == 1);
+    const ir::Graph& t = m.graphs[1];
+    CHECK(names_of(m, t, t.graph_inputs) == VS{"x"});
+    CHECK(ops_of(m, t) == VS{"prim::Constant", "prim::Constant", "prim::Loop"});
+    CHECK(names_of(m, t, t.graph_outputs) == outs_of(m, t, 2));
+    CHECK(ops_of(m, m.graphs[3]) == VS{"aten::relu", "prim::Constant"});
+    CHECK(m.graphs[2].nodes.empty());
+    CHECK(names_of(m, m.graphs[2], m.graphs[2].graph_inputs) == VS{"x"});
+  }
+  // `if c: (if c: f(x) else: f(x)) else: f(x)` as a bare statement: both Ifs
+  // stay pending until something decides their output count.
+  auto chain = [&](std::vector<mb::BcInstruction> tail) {
+    std::vector<mb::BcInstruction> code = {
+        In(BcOp::STOREN, 1, 2), In(BcOp::LOAD, 2), In(BcOp::JF, 9),  In(BcOp::LOAD, 2),
+        In(BcOp::JF, 4),        In(BcOp::LOAD, 1), In(BcOp::OP, 0),  In(BcOp::JMP, 3),
+        In(BcOp::LOAD, 1),      In(BcOp::OP, 0),   In(BcOp::JMP, 3), In(BcOp::LOAD, 1),
+        In(BcOp::OP, 0)};
+    for (const auto& in : tail) code.push_back(in);
+    return mod(make_fn(code, {Op("custom::f", "", 1)}, {}, 2, xc, r1));
+  };
+  auto check_outputs = [](const ir::Model& m, size_t want) {
+    REQUIRE(m.graphs.size() == 5);
+    CHECK(ops_of(m, m.graphs[0]) == VS{"prim::If"});
+    CHECK(outs_of(m, m.graphs[0], 0).size() == want);
+    CHECK(ops_of(m, m.graphs[1]) == VS{"prim::If"});
+    CHECK(outs_of(m, m.graphs[1], 0).size() == want);
+    for (size_t gi : {size_t{2}, size_t{3}, size_t{4}}) {
+      INFO("graph " << gi);
+      CHECK(ops_of(m, m.graphs[gi]) == VS{"custom::f"});
+      CHECK(outs_of(m, m.graphs[gi], 0).size() == want);
+      CHECK(m.graphs[gi].graph_outputs.size() == want);
+    }
+  };
+  SUBCASE("a pending If inside a pending If is retracted as a chain") {
+    Run r;
+    build_into(r, chain({In(BcOp::LOAD, 1), In(BcOp::RET)}));
+    REQUIRE_MESSAGE(r.ok(), r.error());
+    check_outputs(r.model, 0);
+  }
+  SUBCASE("a pending If inside a pending If is confirmed as a chain") {
+    Run r;
+    build_into(r, chain({In(BcOp::DROP), In(BcOp::LOAD, 1), In(BcOp::RET)}));
+    REQUIRE_MESSAGE(r.ok(), r.error());
+    check_outputs(r.model, 1);
+  }
+}
+
+// ---- parse_zip error routing on rewritten copies of the v8 fixture ------------
+namespace {
+struct ZipEntry {
+  std::string name;
+  std::vector<uint8_t> data;
+  bool deflate = false;
+};
+std::vector<ZipEntry> fixture_entries(const char* path) {
+  std::vector<uint8_t> file = read_file(path);
+  mz_zip_archive zip;
+  std::memset(&zip, 0, sizeof(zip));
+  REQUIRE(mz_zip_reader_init_mem(&zip, file.data(), file.size(), 0));
+  std::vector<ZipEntry> out;
+  for (mz_uint i = 0; i < mz_zip_reader_get_num_files(&zip); ++i) {
+    mz_zip_archive_file_stat st;
+    REQUIRE(mz_zip_reader_file_stat(&zip, i, &st));
+    size_t n = 0;
+    void* p = mz_zip_reader_extract_to_heap(&zip, i, &n, 0);
+    ZipEntry e;
+    e.name = st.m_filename;
+    if (p) e.data.assign(static_cast<uint8_t*>(p), static_cast<uint8_t*>(p) + n);
+    mz_free(p);
+    out.push_back(std::move(e));
+  }
+  mz_zip_reader_end(&zip);
+  return out;
+}
+std::vector<uint8_t> write_zip(const std::vector<ZipEntry>& es) {
+  mz_zip_archive zw;
+  std::memset(&zw, 0, sizeof(zw));
+  REQUIRE(mz_zip_writer_init_heap(&zw, 0, 0));
+  for (const ZipEntry& e : es)
+    REQUIRE(mz_zip_writer_add_mem(&zw, e.name.c_str(), e.data.data(), e.data.size(),
+                                  e.deflate ? MZ_BEST_SPEED : MZ_NO_COMPRESSION));
+  void* buf = nullptr;
+  size_t n = 0;
+  REQUIRE(mz_zip_writer_finalize_heap_archive(&zw, &buf, &n));
+  std::vector<uint8_t> out(static_cast<uint8_t*>(buf), static_cast<uint8_t*>(buf) + n);
+  mz_free(buf);
+  mz_zip_writer_end(&zw);
+  return out;
+}
+// Overwrite the central-directory uncompressed size of entry `name`.
+void patch_uncomp_size(std::vector<uint8_t>& z, const std::string& name, uint32_t v) {
+  for (size_t i = 0; i + 46 <= z.size(); ++i) {
+    if (z[i] != 0x50 || z[i + 1] != 0x4b || z[i + 2] != 0x01 || z[i + 3] != 0x02) continue;
+    const size_t nlen = z[i + 28] | (z[i + 29] << 8);
+    if (i + 46 + nlen > z.size() ||
+        std::string(reinterpret_cast<const char*>(&z[i + 46]), nlen) != name)
+      continue;
+    for (int k = 0; k < 4; ++k) z[i + 24 + k] = static_cast<uint8_t>(v >> (8 * k));
+    return;
+  }
+  FAIL("central directory entry not found: " << name);
+}
+Result<ir::Model> parse_bytes(const std::string& stem, const std::vector<uint8_t>& bytes) {
+  std::string path =
+      (std::filesystem::temp_directory_path() / ("netvis_r9_" + stem + ".ptl")).string();
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+  }
+  auto mf = MappedFile::open(path);
+  REQUIRE(mf);
+  ProgressSink progress;
+  return pytorch::parse_zip(*mf, progress);
+}
+// The fixture with bytecode.pkl cut in half, optionally deflated, optionally
+// without data.pkl.
+std::vector<uint8_t> broken_bytecode(bool deflate, bool keep_data) {
+  std::vector<ZipEntry> es;
+  for (ZipEntry& e : fixture_entries(kMobile)) {
+    if (!keep_data && e.name == "model/data.pkl") continue;
+    if (e.name == "model/bytecode.pkl") {
+      e.data.resize(e.data.size() / 2);
+      e.deflate = deflate;
+    }
+    es.push_back(std::move(e));
+  }
+  return write_zip(es);
+}
+}  // namespace
+
+TEST_CASE("T-R9 parse_zip: bytecode.pkl failures are routed and located honestly") {
+  if (!have(kMobile)) return;
+  ByteReader::payload_read_counter() = 0;
+  SUBCASE("stored, with data.pkl: parameter table plus a located note") {
+    auto res = parse_bytes("stored_data", broken_bytecode(false, true));
+    REQUIRE_MESSAGE(res, (res ? std::string() : res.error().message));
+    const ir::Model& m = *res;
+    CHECK_FALSE(m.has_graph);
+    check_parameter_table(m);
+    auto note = meta(m, "torchscript.bytecode");
+    REQUIRE(note);
+    CHECK(note->rfind("not decoded: ", 0) == 0);
+    CHECK(note->find("(byte ") != std::string::npos);
+    CHECK(meta(m, "tensors") == std::string("2"));
+  }
+  SUBCASE("stored, without data.pkl: an error at an absolute offset") {
+    std::vector<uint8_t> z = broken_bytecode(false, false);
+    auto res = parse_bytes("stored_nodata", z);
+    REQUIRE_FALSE(res);
+    CHECK_FALSE(res.error().message.empty());
+    CHECK(res.error().offset < z.size());
+    CHECK(res.error().message.find("compressed") == std::string::npos);
+  }
+  SUBCASE("deflated, with data.pkl: the note gives the in-entry offset") {
+    auto res = parse_bytes("deflate_data", broken_bytecode(true, true));
+    REQUIRE_MESSAGE(res, (res ? std::string() : res.error().message));
+    auto note = meta(*res, "torchscript.bytecode");
+    REQUIRE(note);
+    CHECK(note->find("(in compressed bytecode.pkl at +") != std::string::npos);
+  }
+  SUBCASE("deflated, without data.pkl: the error says where, no file offset") {
+    auto res = parse_bytes("deflate_nodata", broken_bytecode(true, false));
+    REQUIRE_FALSE(res);
+    CHECK(res.error().message.find("(in compressed bytecode.pkl at +") != std::string::npos);
+    CHECK(res.error().offset == UINT64_MAX);
+  }
+  SUBCASE("a declared bytecode.pkl size over the cap is refused before extraction") {
+    std::vector<ZipEntry> es = fixture_entries(kMobile);
+    for (ZipEntry& e : es)
+      if (e.name == "model/bytecode.pkl") e.deflate = true;
+    std::vector<uint8_t> z = write_zip(es);
+    patch_uncomp_size(z, "model/bytecode.pkl", 0x7FFFFFFFu);
+    auto res = parse_bytes("bc_cap", z);
+    REQUIRE_MESSAGE(res, (res ? std::string() : res.error().message));
+    auto note = meta(*res, "torchscript.bytecode");
+    REQUIRE(note);
+    CHECK(note->find("bytecode.pkl too large") != std::string::npos);
+    check_parameter_table(*res);
+  }
+  SUBCASE("a broken or oversized constants.pkl falls back to <method>.c<k> names") {
+    for (bool oversize : {false, true}) {
+      INFO("oversize: " << oversize);
+      std::vector<ZipEntry> es = fixture_entries(kMobile);
+      for (ZipEntry& e : es) {
+        if (e.name != "model/constants.pkl") continue;
+        if (oversize)
+          e.deflate = true;
+        else
+          e.data.resize(3);
+      }
+      std::vector<uint8_t> z = write_zip(es);
+      if (oversize) patch_uncomp_size(z, "model/constants.pkl", 0x7FFFFFFFu);
+      auto res = parse_bytes(oversize ? "const_cap" : "const_broken", z);
+      REQUIRE_MESSAGE(res, (res ? std::string() : res.error().message));
+      const ir::Model& m = *res;
+      REQUIRE(m.has_graph);
+      REQUIRE(m.graphs.size() == 3);
+      const VS inits = init_names(m, m.graphs[1]);
+      REQUIRE(inits.size() == 1);
+      CHECK(inits[0].rfind("forward.c", 0) == 0);
+    }
+  }
   CHECK(ByteReader::payload_read_counter() == 0);
 }

@@ -94,14 +94,22 @@ std::string arg_attr_name(uint32_t position);
 // "__torch__", and a recorded BUILD state (Value::inner) that is a Dict whose
 // pairs are the attributes in class slot order.
 bool is_torch_object(const Value& v);
+// A TorchScript object whose recorded state is NOT a dict: a custom
+// __getstate__, e.g. a torchbind packed context
+// (__torch__.torch.classes.xnnpack.Conv2dOpContext / LinearOpContext, quantized
+// *PackedParamsBase). Opaque, module starting with "__torch__", non-null state
+// (Value::inner) of any other kind. Its state is data, not attributes: the
+// tensor traversal descends it (weights live there) but nothing binds by slot.
+bool is_packed_object(const Value& v);
 
 // The deterministic traversal of a data.pkl value tree that both the parameter
 // table (PytorchParser collect_tensors) and ModuleEnv's canonical tensor names
 // use: dict and object-state insertion order, List/Tuple index order, keys
 // joined with '.', containers and objects visited at most once (cycles and
-// shared subtrees via the memo), depth <= kMaxTraversalDepth. `fn` is called for
-// every tensor leaf with its path; a tensor reachable from two containers is
-// reported at each path.
+// shared subtrees via the memo), depth <= kMaxTraversalDepth. Packed objects
+// (is_packed_object) are descended through their state, so "conv.packed.0" is
+// a prepacked weight. `fn` is called for every tensor leaf with its path; a
+// tensor reachable from two containers is reported at each path.
 inline constexpr int kMaxTraversalDepth = 256;
 void for_each_tensor(
     const ValuePtr& root,
@@ -151,6 +159,17 @@ class ModuleEnv {
   std::string tensor_path(const Value* tensor, std::string_view fallback) const;
   // Number of distinct tensor Values reachable from the root.
   size_t module_tensor_count() const { return paths_.size(); }
+  // What the traversal found inside packed-object state (is_packed_object).
+  struct PackedStats {
+    size_t objects = 0;    // packed objects reached
+    size_t tensors = 0;    // tensor leaves located inside their state
+    // Leaves inside their state that hold data NetVis cannot locate: tensors
+    // rebuilt by an unsupported torch._utils._rebuild_* (e.g. quantized),
+    // bare persistent storages, and byte blobs. Weights may hide here, so
+    // parameter totals are a lower bound when this is non-zero.
+    size_t unlocated = 0;
+  };
+  const PackedStats& packed() const { return packed_; }
 
  private:
   ValuePtr keep_;
@@ -158,6 +177,7 @@ class ModuleEnv {
   std::string root_class_;
   bool loaded_ = false;
   std::unordered_map<const Value*, std::string> paths_;  // lookup only
+  PackedStats packed_;
 };
 
 // Names bytecode tensor constants after the constants.pkl entry they share a
@@ -202,10 +222,14 @@ class GraphBuilder {
 
   // New graph input (appended to graph_inputs). Empty name -> NameCounter.
   uint32_t add_input(std::string_view name);
-  // Initializer value (spec §4.6.3): an existing initializer with this name and
-  // the same (file_offset, byte_len) is reused; any other clash takes the first
-  // free "#2", "#3", ... suffix. dtype/shape come from `t`.
-  uint32_t initializer(std::string_view name, const ir::TensorRef& t);
+  // Initializer value (spec §4.6.3). The same `identity` (the tensor's pickled
+  // Value) always maps to one initializer. Otherwise an earlier request with
+  // the same name and the same LOCATED (file_offset, byte_len) is reused;
+  // unlocated refs (file_offset == UINT64_MAX) never merge by name. Any other
+  // clash takes the next free "#2", "#3", ... suffix (O(1) amortised, no
+  // re-probing). dtype/shape come from `t`.
+  uint32_t initializer(std::string_view name, const ir::TensorRef& t,
+                       const void* identity = nullptr);
   // Graph input standing for parent value `parent_value_idx` (cached per parent
   // value), named `name`.
   uint32_t capture(uint32_t parent_value_idx, std::string_view name);
@@ -254,6 +278,8 @@ class GraphBuilder {
   std::unordered_map<std::string, uint32_t> by_name_;      // name -> value
   std::unordered_map<std::string, uint32_t> next_suffix_;  // base -> next #k
   std::unordered_map<uint32_t, uint32_t> init_of_value_;   // value -> init idx
+  std::unordered_map<const void*, uint32_t> init_by_identity_;  // identity -> value
+  std::unordered_map<std::string, uint32_t> init_by_record_;     // name+record -> value
   std::unordered_map<uint32_t, uint32_t> capture_of_;      // parent value -> value
 };
 

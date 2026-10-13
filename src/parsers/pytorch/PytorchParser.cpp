@@ -17,8 +17,11 @@
 // absolute file offset of the uncompressed blob from its local file header
 // (torch stores tensor data with the ZIP "stored" method, i.e. uncompressed)
 // and record offset+length in the TensorRef. We never call
-// mz_zip_reader_extract on payload entries — only on the small structural
-// entries (data.pkl, constants.pkl, bytecode.pkl, code/), each size-capped.
+// mz_zip_reader_extract on payload entries — only on the structural entries
+// (data.pkl, constants.pkl, bytecode.pkl, code/). bytecode.pkl and
+// constants.pkl are size-capped before extraction (BytecodeLimits); data.pkl
+// and code/ entries are NOT yet capped and are extracted at their declared
+// size.
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -444,6 +447,28 @@ void run_mobile(mz_zip_archive& zip, const uint8_t* base, uint64_t size,
   out.built = built.take();
 }
 
+// Weights kept in packed-object state (torchbind contexts such as prepacked
+// conv/linear, quantized packed params). Located ones are listed/graphed like
+// any parameter; ones NetVis cannot decode are counted, never guessed, and make
+// the parameter totals a lower bound (ir::Model::unlocated_weights).
+void emit_packed_metadata(const ts::ModuleEnv& env, ir::Model& model) {
+  const ts::ModuleEnv::PackedStats& p = env.packed();
+  model.unlocated_weights = p.unlocated;
+  if (p.objects == 0) return;
+  model.metadata.emplace_back(
+      model.intern("torchscript.packed_objects"),
+      model.intern(std::to_string(p.objects) +
+                   " object(s) with custom state (e.g. prepacked conv/linear "
+                   "contexts); " +
+                   std::to_string(p.tensors) + " tensor(s) located in it"));
+  if (p.unlocated > 0)
+    model.metadata.emplace_back(
+        model.intern("torchscript.packed_unlocated"),
+        model.intern(std::to_string(p.unlocated) +
+                     " value(s) in packed state not decoded (e.g. quantized "
+                     "tensors); parameter totals exclude them"));
+}
+
 // Metadata for Graph and Inventory modes (spec #137 §4.8), in table order.
 void emit_mobile_metadata(const MobileOutcome& mob, const ts::ModuleEnv& env,
                           ir::Model& model) {
@@ -625,6 +650,7 @@ Result<ir::Model> parse_zip(const MappedFile& file, ProgressSink& progress) {
   if (mob.status == MobileStatus::Graph || mob.status == MobileStatus::Inventory) {
     // Exact inventory from bytecode.pkl: the #40 heuristic code/ scan is skipped.
     emit_mobile_metadata(mob, env, model);
+    emit_packed_metadata(env, model);
   } else {
     if (has_constants || has_code) emit_code_inventory(zip, has_code, model);
     if (mob.status == MobileStatus::TablesFailed)
@@ -633,6 +659,7 @@ Result<ir::Model> parse_zip(const MappedFile& file, ProgressSink& progress) {
           model.intern("not decoded: " + mob.reason + mob.where.note_suffix));
     model.metadata.emplace_back(model.intern("tensors"),
                                 model.intern(std::to_string(model.flat_tensors.size())));
+    emit_packed_metadata(env, model);
   }
   if (!has_data_pkl && mob.status == MobileStatus::TablesFailed)
     return err(mob.reason + mob.where.error_suffix, mob.where.abs);

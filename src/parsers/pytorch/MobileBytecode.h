@@ -72,6 +72,18 @@ struct BytecodeLimits {
   uint32_t max_cf_depth = 64;                 // nested If/Loop
   uint32_t max_subgraphs = 4096;              // per method
   uint32_t max_attr_path = 1024;              // module attribute path, bytes
+  // Whole-module totals. The per-function caps above do not bound a file whose
+  // pickle memo (BINGET) re-references one large table from many methods: every
+  // decoded entry and every copied string byte is charged here BEFORE it is
+  // allocated, so a few-MB pickle cannot decode into GBs.
+  uint64_t max_total_entries = 2'000'000;       // instructions+operators+constants+types+schema args
+  uint64_t max_total_string_bytes = 64ull << 20;  // names, overloads, types, schema strings
+  // Symbolic-execution work for one method: stack pushes (values), register
+  // writes, new subgraph captures, isinstance type lists and packed-state
+  // weight edges. Bounds fan-out instructions (LIST_UNPACK/STOREN/ISINSTANCE
+  // with N up to 65535) repeated up to max_instructions times. A real method
+  // spends about 2 units per instruction; each unit is ~200 bytes of graph.
+  uint64_t max_exec_work = 1'000'000;
 };
 
 struct BcInstruction {
