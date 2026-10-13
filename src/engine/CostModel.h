@@ -127,6 +127,9 @@ struct CostReport {
   // shared weights by design — that is the node view, this is the model view.)
   uint64_t total_params = 0;
   uint64_t total_weight_bytes = 0;
+  // Copied from ir::Model::unlocated_weights. Non-zero => total_params and
+  // total_weight_bytes are lower bounds (weights exist that were not located).
+  uint64_t unlocated_weights = 0;
   uint64_t peak_activation_bytes = 0;// see peak-liveness algorithm below
 
   uint32_t nodes_total = 0;          // == per_node.size()

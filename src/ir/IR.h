@@ -152,6 +152,12 @@ struct Model {
   bool has_graph = true;
   std::vector<TensorRef> flat_tensors;
 
+  // Weight-like values the parser knows exist but could not locate as
+  // TensorRefs (e.g. quantized tensors inside a TorchScript packed context).
+  // Non-zero => parameter/weight totals over initializers or flat_tensors are
+  // a LOWER BOUND, and every view that shows them says so.
+  uint64_t unlocated_weights = 0;
+
   StringArena strings;         // all StringIds above resolve here
 
   // Convenience: intern into this model's arena.

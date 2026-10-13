@@ -36,6 +36,7 @@
 //      "total_flops": 28901376,
 //      "total_params": 18432,
 //      "total_weight_bytes": 73728,
+//      "unlocated_weights": 0,      // >0 => params/bytes are lower bounds
 //      "peak_activation_bytes": 1024,
 //      "nodes_total": 3,
 //      "nodes_flops_known": 2,      // (nodes_total - this) have unknown FLOPs
