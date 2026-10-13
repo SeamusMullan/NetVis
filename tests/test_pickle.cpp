@@ -398,6 +398,7 @@ std::vector<uint8_t> object_with_tensor(const std::string& module) {
 
 TEST_CASE("pickle VM #137: __torch__ object state lists its parameters") {
   std::string path = write_temp("ts_obj", object_with_tensor("__torch__"));
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
   ProgressSink progress;
@@ -412,18 +413,17 @@ TEST_CASE("pickle VM #137: __torch__ object state lists its parameters") {
     }
   }
   CHECK(found);
-  std::filesystem::remove(path);
 }
 
 TEST_CASE("pickle VM #137: non-TorchScript objects are still not descended") {
   // A Python full-module pickle (module "mymod") stays an inert placeholder:
   // unchanged behavior, no tensors are claimed from it.
   std::string path = write_temp("py_obj", object_with_tensor("mymod"));
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
   ProgressSink progress;
   auto res = pytorch::parse_legacy(*mf, progress);
   REQUIRE(res);
   CHECK(res->flat_tensors.empty());
-  std::filesystem::remove(path);
 }

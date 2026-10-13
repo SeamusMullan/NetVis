@@ -693,6 +693,7 @@ TEST_CASE("detect #137 T-D9: a PTMF flatbuffer is routed to an honest error") {
     CHECK(r == DetectReason::Magic);
   }
   std::string path = write_temp("d9_parse", b);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
   ProgressSink progress;
@@ -700,16 +701,15 @@ TEST_CASE("detect #137 T-D9: a PTMF flatbuffer is routed to an honest error") {
   REQUIRE_FALSE(res);
   CHECK(res.error().message.find("flatbuffer") != std::string::npos);
   CHECK(res.error().offset == 4);
-  std::filesystem::remove(path);
 }
 
 TEST_CASE("detect #137: a zip with neither pickle keeps the no-data.pkl error") {
   std::string path = write_temp("nopkl", make_zip({"foo.txt"}));
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
   ProgressSink progress;
   auto res = pytorch::parse_zip(*mf, progress);
   REQUIRE_FALSE(res);
   CHECK(res.error().message == "no data.pkl in archive");
-  std::filesystem::remove(path);
 }
