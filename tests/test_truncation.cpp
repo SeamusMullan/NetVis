@@ -193,3 +193,26 @@ TEST_CASE("truncation: mlPackage weight.bin stays safe at every 1/8th") {
     }
   }
 }
+
+// #138/#109: both Caffe front-ends. The prototxt prefixes land in the temp dir;
+// whatever sibling pairing finds there, the sweep only asserts "returned safely,
+// payload counter 0".
+TEST_CASE("truncation: Caffe prototxt (modern) stays safe at every 1/8th") {
+  truncation_sweep("caffe_prototxt", fixture("model_caffe.prototxt"),
+                   [](const MappedFile& f, ProgressSink& p) { return caffe::parse(f, p); });
+}
+
+TEST_CASE("truncation: Caffe caffemodel (modern) stays safe at every 1/8th") {
+  truncation_sweep("caffe_caffemodel", fixture("model_caffe.caffemodel"),
+                   [](const MappedFile& f, ProgressSink& p) { return caffe::parse(f, p); });
+}
+
+TEST_CASE("truncation: Caffe prototxt (V1) stays safe at every 1/8th") {
+  truncation_sweep("caffe_v1_prototxt", fixture("model_caffe_v1_deploy.prototxt"),
+                   [](const MappedFile& f, ProgressSink& p) { return caffe::parse(f, p); });
+}
+
+TEST_CASE("truncation: Caffe caffemodel (V1) stays safe at every 1/8th") {
+  truncation_sweep("caffe_v1_caffemodel", fixture("model_caffe_v1.caffemodel"),
+                   [](const MappedFile& f, ProgressSink& p) { return caffe::parse(f, p); });
+}

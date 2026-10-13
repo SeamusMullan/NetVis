@@ -206,6 +206,41 @@ const std::unordered_map<std::string_view, OpCategory>& table() {
       {"qlinearmul", OpCategory::Elementwise},
       {"qlinearaveragepool", OpCategory::Pool},
       {"qlinearglobalaveragepool", OpCategory::Pool},
+      // Caffe display names (#138/#109). Caffe layers whose semantics match an
+      // ONNX op exactly are renamed to it by the parser; these keys colour the
+      // rest. None lands in a category whose CostModel rule could produce FLOPs
+      // without an output shape (Reduce counts |input|, so `reduction` and
+      // `caffeargmax` are deliberately absent). Side effect: CoreML
+      // neuralNetwork layers with these names (Convolution, Pooling, Scale, ...)
+      // gain colours too; their FLOPs stay shape-gated.
+      {"convolution", OpCategory::Conv},
+      {"deconvolution", OpCategory::Conv},
+      {"innerproduct", OpCategory::MatMul},
+      {"pooling", OpCategory::Pool},
+      {"spp", OpCategory::Pool},
+      {"lrn", OpCategory::Norm},
+      {"meanvariancenormalization", OpCategory::Norm},
+      {"scale", OpCategory::Elementwise},
+      {"bias", OpCategory::Elementwise},
+      {"power", OpCategory::Elementwise},
+      {"eltwise", OpCategory::Elementwise},
+      {"threshold", OpCategory::Activation},
+      {"crop", OpCategory::Shape},
+      {"caffesplit", OpCategory::Shape},
+      {"caffeslice", OpCategory::Shape},
+      {"caffeflatten", OpCategory::Shape},
+      {"caffereshape", OpCategory::Shape},
+      {"caffetile", OpCategory::Shape},
+      {"caffelstm", OpCategory::Recurrent},
+      {"caffernn", OpCategory::Recurrent},
+      {"caffeparameter", OpCategory::Tensor},
+      {"input", OpCategory::IO},
+      {"data", OpCategory::IO},
+      {"imagedata", OpCategory::IO},
+      {"memorydata", OpCategory::IO},
+      {"hdf5data", OpCategory::IO},
+      {"windowdata", OpCategory::IO},
+      {"dummydata", OpCategory::IO},
   };
   return t;
 }
