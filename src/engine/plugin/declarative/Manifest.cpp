@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/JsonNesting.h"           // json_nesting_ok (#170: shared with .netvis-view)
 #include "engine/LayoutCache.h"        // layout_cache_dir (for the sibling config dir)
 #include "engine/OpCategory.h"
 #include "engine/plugin/OpHandler.h"
@@ -145,25 +146,6 @@ bool parse_color(const std::string& s, Rgba8& out) {
     rgb[k] = static_cast<uint8_t>(hi * 16 + lo);
   }
   out.r = rgb[0]; out.g = rgb[1]; out.b = rgb[2]; out.a = 255;
-  return true;
-}
-
-// Pre-scan brace/bracket nesting depth BEFORE nlohmann::parse (it has no built-in
-// limit; a deep-nesting file could stack-overflow the recursive parser). [critique-fix]
-bool nesting_ok(const std::string& text, int max_depth) {
-  int depth = 0;
-  bool in_str = false, esc = false;
-  for (char c : text) {
-    if (in_str) {
-      if (esc) esc = false;
-      else if (c == '\\') esc = true;
-      else if (c == '"') in_str = false;
-      continue;
-    }
-    if (c == '"') in_str = true;
-    else if (c == '{' || c == '[') { if (++depth > max_depth) return false; }
-    else if (c == '}' || c == ']') { if (depth > 0) --depth; }
-  }
   return true;
 }
 
@@ -309,7 +291,14 @@ LoadedManifest load_manifest_file(const std::string& path, bool register_into) {
     lm.error = probe ? "manifest too large (>4MiB)" : "cannot open file";
     return lm;
   }
-  if (!nesting_ok(text, 64)) { lm.error = "manifest nesting too deep"; return lm; }
+  // Pre-scan nesting BEFORE nlohmann::parse (it has no built-in limit; a deep file
+  // could stack-overflow the recursive parser). [critique-fix]
+  // The parse below ignores comments, so the scan must skip them too: a quote inside a
+  // comment would otherwise hide the brackets after it from the depth count.
+  if (!json_nesting_ok(text, 64, /*allow_comments=*/true)) {
+    lm.error = "manifest nesting too deep";
+    return lm;
+  }
 
   json j = json::parse(text, nullptr, /*allow_exceptions=*/false, /*ignore_comments=*/true);
   if (j.is_discarded()) { lm.error = "JSON parse error"; return lm; }
