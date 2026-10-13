@@ -59,6 +59,7 @@
 #include "engine/plugin/wasm/WasmParser.h"
 #include "engine/plugin/wasm/WasmRuntime.h"
 #include "ir/IR.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 using namespace netvis::plugin;
@@ -1091,6 +1092,8 @@ TEST_CASE("ABI v1: a WASM parser plugin that is not ABI v1 never claims a file")
   // it could ever be parsed.
   const std::string path =
       (fs::temp_directory_path() / "nv_abi_freeze_input.bin").string();
+  // Declared before the mapping so it outlives it: Windows cannot delete a mapped file.
+  netvis_test::TempFileGuard guard(path);
   { std::ofstream f(path, std::ios::binary); f << std::string(64, '\0'); }
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
@@ -1144,7 +1147,6 @@ TEST_CASE("ABI v1: a WASM parser plugin that is not ABI v1 never claims a file")
   }
 
   reg.reset_to_builtins();
-  fs::remove(path);
 }
 
 // ===========================================================================
