@@ -10,19 +10,22 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/MappedFile.h"
 #include "engine/OpCategory.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
 namespace {
 
 // Write bytes to a uniquely-named temp file; returns the path. RAII cleanup is
-// handled by the caller via std::filesystem::remove at scope end.
+// handled by the caller with a TempFileGuard declared before the mapping.
 std::string write_temp(const std::string& stem, const std::vector<uint8_t>& bytes) {
   std::filesystem::path p =
       std::filesystem::temp_directory_path() / ("nv_detect_" + stem);
@@ -37,10 +40,10 @@ std::string write_temp(const std::string& stem, const std::vector<uint8_t>& byte
 Format detect_bytes(const std::string& stem, const std::vector<uint8_t>& bytes,
                     const std::string& ext_hint) {
   std::string path = write_temp(stem, bytes);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);  // mapping a freshly-written file must succeed
   Format f = detect_format(*mf, ext_hint);
-  std::filesystem::remove(path);
   return f;
 }
 
@@ -50,11 +53,11 @@ Format detect_bytes_reason(const std::string& stem,
                            const std::vector<uint8_t>& bytes,
                            const std::string& ext_hint, DetectReason& reason) {
   std::string path = write_temp(stem, bytes);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);  // mapping a freshly-written file must succeed
   Format f = detect_format(*mf, ext_hint, reason);
   CHECK(detect_format(*mf, ext_hint) == f);  // wrapper delegates identically
-  std::filesystem::remove(path);
   return f;
 }
 
@@ -126,6 +129,109 @@ TEST_CASE("detect CoreML by .mlmodel extension tiebreaker") {
   CHECK(detect_bytes("coreml", b, "mlmodel") == Format::CoreML);
 }
 
+TEST_CASE("detect CoreML wins over the SavedModel sniff on a real .mlmodel (#114)") {
+  // REGRESSION. The hand-built buffer above kept passing while every REAL
+  // .mlmodel broke, because it carries no `description` (field 2):
+  // looks_like_saved_model rejects it at its second tag (field 500, not field 2)
+  // and so never got as far as being mistaken for a SavedModel. A real CoreML
+  // Model always has one:
+  //   field 1 specificationVersion (varint)  ->  SavedModel's schema_version
+  //   field 2 description (len-delimited)    ->  SavedModel's meta_graphs[0]
+  //   ... whose own first field is len-delimited (input) -> MetaGraphDef's
+  // which satisfies the SavedModel prefix check exactly. #107 placed the
+  // TensorFlow sniff ahead of the .mlmodel guard, so those files were handed to
+  // the TensorFlow parser and died with "SavedModel meta_graph carries no
+  // graph_def". Assert against the shipped fixture, not a synthetic buffer: the
+  // whole point is that the synthetic one was not representative.
+  auto mf = MappedFile::open("tests/fixtures/model.mlmodel");
+  REQUIRE_MESSAGE(mf, "fixture missing; run tools/gen_fixtures.py");
+  CHECK(detect_format(*mf, "mlmodel") == Format::CoreML);
+
+  DetectReason reason = DetectReason::None;
+  CHECK(detect_format(*mf, "mlmodel", reason) == Format::CoreML);
+  CHECK(reason == DetectReason::Extension);
+}
+
+TEST_CASE("detect CoreML from content alone, without the .mlmodel suffix (#114)") {
+  // The extension is a tiebreaker, not the signal. A CoreML Model carries its
+  // `oneof Type` at a field number >= 200 that no SavedModel / GraphDef / ONNX
+  // ModelProto ever uses, so a renamed file is still recognised. Before the
+  // content check, every one of these hints sent the shipped fixture to the
+  // TensorFlow parser ("SavedModel meta_graph carries no graph_def").
+  auto mf = MappedFile::open("tests/fixtures/model.mlmodel");
+  REQUIRE_MESSAGE(mf, "fixture missing; run tools/gen_fixtures.py");
+  for (const char* ext : {"", "bin", "pb", "onnx", "txt"}) {
+    CAPTURE(ext);
+    DetectReason reason = DetectReason::None;
+    CHECK(detect_format(*mf, ext, reason) == Format::CoreML);
+    CHECK(reason == DetectReason::Structure);
+  }
+}
+
+TEST_CASE("detect CoreML mlProgram spec without the suffix is CoreML, not ONNX (#114)") {
+  // The .mlpackage's inner spec has no `description` at all - (1,varint) then the
+  // mlProgram at field 502 - so it matched the ONNX sniff (field 1 varint) when
+  // the extension was absent. A Manifest.json may name its inner spec anything.
+  auto mf = MappedFile::open(
+      "tests/fixtures/model.mlpackage/Data/com.apple.CoreML/model.mlmodel");
+  REQUIRE_MESSAGE(mf, "fixture missing; run tools/gen_fixtures.py");
+  DetectReason reason = DetectReason::None;
+  CHECK(detect_format(*mf, "", reason) == Format::CoreML);
+  CHECK(reason == DetectReason::Structure);
+}
+
+TEST_CASE("detect CoreML with a description field, synthetic (#114)") {
+  // The smallest buffer with the shape of a real .mlmodel: a version, a
+  // non-empty description whose first field is length-delimited (the shape the
+  // SavedModel prefix check accepts), then the neuralNetwork at field 500.
+  std::vector<uint8_t> b = {0x08, 0x04,                   // specificationVersion = 4
+                            0x12, 0x03, 0x0a, 0x01, 'x',  // description{ input: "x" }
+                            0xa2, 0x1f, 0x00};            // neuralNetwork (500), empty
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("coreml_desc_ext", b, "mlmodel", r) == Format::CoreML);
+  CHECK(r == DetectReason::Extension);
+  CHECK(detect_bytes_reason("coreml_desc_noext", b, "", r) == Format::CoreML);
+  CHECK(r == DetectReason::Structure);
+}
+
+TEST_CASE("detect frozen GraphDef is TensorFlow even when named .mlmodel") {
+  // GraphDef's field 1 is a length-delimited NodeDef and CoreML's is a varint, so
+  // the GraphDef sniff cannot collide with CoreML and keeps winning over the
+  // extension: the content is unambiguous.
+  auto mf = MappedFile::open("tests/fixtures/model_frozen.pb");
+  REQUIRE_MESSAGE(mf, "fixture missing");
+  DetectReason reason = DetectReason::None;
+  CHECK(detect_format(*mf, "mlmodel", reason) == Format::TensorFlow);
+  CHECK(reason == DetectReason::Structure);
+}
+
+TEST_CASE("detect: a SavedModel-shaped prefix with another top-level field is not TensorFlow") {
+  // SavedModel's top level is only fields 1 and 2. A buffer that opens like one
+  // but then carries an ONNX ModelProto's graph (field 7) is ONNX.
+  std::vector<uint8_t> b = {0x08, 0x01,                   // schema_version / ir_version = 1
+                            0x12, 0x03, 0x0a, 0x01, 'x',  // field 2: looks like meta_graphs[0]
+                            0x3a, 0x02, 0x00, 0x00};      // field 7 (graph), 2 bytes
+  CHECK(detect_bytes("saved_model_shaped_onnx", b, "") == Format::ONNX);
+}
+
+TEST_CASE("detect: hostile length varints do not wrap past the bounds check") {
+  // A length of 2^64-1 makes `offset + length` wrap to a small number, which the
+  // naive `offset + length > size` check lets through. The NodeDef sniff would
+  // then run with a "size" of 2^64-1 and trust the next length it finds.
+  // Detection must reject these instead of guessing a format.
+  const std::vector<uint8_t> huge = {0xff, 0xff, 0xff, 0xff, 0xff,
+                                     0xff, 0xff, 0xff, 0xff, 0x01};  // 2^64-1
+  std::vector<uint8_t> graph_def = {0x0a};  // field 1, length-delimited
+  graph_def.insert(graph_def.end(), huge.begin(), huge.end());
+  graph_def.insert(graph_def.end(), {0x0a, 0x01, 'a', 0x12, 0x01, 'b'});
+  CHECK(detect_bytes("huge_len_graphdef", graph_def, "") == Format::Unknown);
+
+  std::vector<uint8_t> onnx_like = {0x12};  // field 2 (producer_name), length-delimited
+  onnx_like.insert(onnx_like.end(), huge.begin(), huge.end());
+  onnx_like.insert(onnx_like.end(), {0x3a, 0x02, 0x00, 0x00});
+  CHECK(detect_bytes("huge_len_onnx", onnx_like, "") == Format::Unknown);
+}
+
 TEST_CASE("detect Unknown on random bytes") {
   std::vector<uint8_t> b = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
   b.resize(32, 0);
@@ -137,6 +243,179 @@ TEST_CASE("detect Keras HDF5 by superblock signature") {
   std::vector<uint8_t> b = {0x89, 'H', 'D', 'F', '\r', '\n', 0x1a, '\n'};
   b.resize(64, 0);
   CHECK(detect_bytes("h5", b, "h5") == Format::Keras);
+}
+
+// #135: kExtensionFormats (parsers/Parser.h) is the single source for the
+// detector's extension knowledge, and the file chooser's openable list is built
+// from it. That is only a real guard if the table is the whole truth, so check
+// each entry actually routes the way it says on content no sniffer claims, and
+// that the two other places detect_format() consults an extension (the .mlmodel
+// guard and the zip tiebreak) go through names the table knows about.
+TEST_CASE("detect: every kExtensionFormats entry routes ambiguous content") {
+  std::vector<uint8_t> junk = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
+  junk.resize(32, 0);
+  for (const ExtensionFormat& e : kExtensionFormats) {
+    INFO("extension: " << e.ext);
+    // The reason matters too: the status bar's confidence signal (#45) must say
+    // the extension decided this, not "none" or a content signal.
+    DetectReason r = DetectReason::None;
+    CHECK(detect_bytes_reason("extmap", junk, std::string(e.ext), r) == e.format);
+    CHECK(r == DetectReason::Extension);
+  }
+  // An extension outside the table must not claim anything, and the hint is the
+  // lowercased extension: an uppercase spelling is not in the contract.
+  DetectReason r = DetectReason::Extension;
+  CHECK(detect_bytes_reason("extmap_none", junk, "txt", r) == Format::Unknown);
+  CHECK(r == DetectReason::None);
+  CHECK(detect_bytes("extmap_upper", junk, "ONNX") == Format::Unknown);
+}
+
+TEST_CASE("detect: kExtensionFormats has no dead (duplicate) entries") {
+  // First match wins, so a repeated extension would silently never apply.
+  const size_t n = std::size(kExtensionFormats);
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = i + 1; j < n; ++j) {
+      INFO("duplicate extension: " << kExtensionFormats[i].ext);
+      CHECK(kExtensionFormats[i].ext != kExtensionFormats[j].ext);
+    }
+  }
+  const size_t z = std::size(kZipExtensionFormats);
+  for (size_t i = 0; i < z; ++i) {
+    for (size_t j = i + 1; j < z; ++j) {
+      INFO("duplicate zip extension: " << kZipExtensionFormats[i].ext);
+      CHECK(kZipExtensionFormats[i].ext != kZipExtensionFormats[j].ext);
+    }
+  }
+}
+
+namespace {
+// Format the main table assigns an extension, or Unknown when it is absent.
+Format table_format(std::string_view ext) {
+  for (const ExtensionFormat& e : kExtensionFormats) {
+    if (e.ext == ext) return e.format;
+  }
+  return Format::Unknown;
+}
+
+// A zip that starts with the local-file-header magic and, when `with_directory`,
+// carries a real central directory with one entry called `name`. The default
+// "notes.txt" is not data.pkl, config.json or a .npy, so scan_zip_names finds no
+// content signal and only the extension can break the tie.
+std::vector<uint8_t> ambiguous_zip(bool with_directory,
+                                   const std::string& name = "notes.txt") {
+  std::vector<uint8_t> b = {'P', 'K', 0x03, 0x04};
+  b.resize(30, 0);  // a (bogus but unread) local file header
+  if (!with_directory) {
+    b.resize(64, 0);
+    return b;
+  }
+  auto u16 = [&b](uint16_t v) {
+    b.push_back(static_cast<uint8_t>(v & 0xff));
+    b.push_back(static_cast<uint8_t>(v >> 8));
+  };
+  auto u32 = [&b](uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>(v >> (8 * i)));
+  };
+  const uint32_t cd_off = static_cast<uint32_t>(b.size());
+  u32(0x02014b50);                               // central directory header
+  b.resize(b.size() + 24, 0);                    // version .. uncompressed size
+  u16(static_cast<uint16_t>(name.size()));       // file name length (@28)
+  u16(0);                                        // extra length
+  u16(0);                                        // comment length
+  b.resize(b.size() + 12, 0);                    // disk, attrs, local offset
+  b.insert(b.end(), name.begin(), name.end());
+  const uint32_t cd_size = static_cast<uint32_t>(b.size()) - cd_off;
+  u32(0x06054b50);                               // end of central directory
+  u16(0);
+  u16(0);
+  u16(1);                                        // entries on this disk
+  u16(1);                                        // total entries (@10)
+  u32(cd_size);
+  u32(cd_off);                                   // central directory offset (@16)
+  u16(0);                                        // comment length
+  return b;
+}
+}  // namespace
+
+TEST_CASE("detect: the CoreML guard's extension is kCoreMLExtension, not a literal") {
+  // The guard must compare against the shared name, so renaming it cannot leave
+  // the detector and the chooser list (built from kExtensionFormats) disagreeing.
+  // Behavioural, because the table entry is literally {kCoreMLExtension, CoreML}:
+  // a check on the table alone would pass whatever the guard compares against.
+  //
+  // {field 1 varint, field 7 (graph) empty} is a bare ModelProto that
+  // looks_like_onnx_proto accepts and that carries no CoreML content signal (no
+  // field >= 200), so the extension alone has to decide.
+  const std::vector<uint8_t> bare = {0x08, 0x04, 0x3a, 0x00};
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("coreml_guard_none", bare, "", r) == Format::ONNX);
+  CHECK(r == DetectReason::Structure);
+  CHECK(detect_bytes_reason("coreml_guard_ext", bare,
+                            std::string(kCoreMLExtension), r) == Format::CoreML);
+  CHECK(r == DetectReason::Extension);
+  // The table agrees with the guard on the Format, and the guard only fires for
+  // exactly this extension (not for another table entry that merely looks alike).
+  bool in_table = false;
+  for (const ExtensionFormat& e : kExtensionFormats) {
+    if (e.ext == kCoreMLExtension) {
+      in_table = true;
+      CHECK(e.format == Format::CoreML);
+    }
+  }
+  CHECK(in_table);
+  CHECK(detect_bytes("coreml_guard_other", bare, "onnx") == Format::ONNX);
+}
+
+TEST_CASE("detect: every kZipExtensionFormats entry is in kExtensionFormats") {
+  // A zip-only extension that the main table lacks would be detectable but
+  // missing from the Open dialog's "All supported models" filter (and, on macOS,
+  // from the dialog altogether, since its chooser has no "All files" entry).
+  for (const ExtensionFormat& e : kZipExtensionFormats) {
+    INFO("zip extension: " << e.ext);
+    CHECK(table_format(e.ext) == e.format);
+  }
+}
+
+TEST_CASE("detect: the synthetic zip's central directory really is scanned") {
+  // Guards the two zip tests below: the same builder with an entry the scan DOES
+  // recognise must be claimed by content, so "notes.txt" proves the tiebreak
+  // (not a malformed directory) is what decides them.
+  DetectReason r = DetectReason::None;
+  CHECK(detect_bytes_reason("zip_cd_npy", ambiguous_zip(true, "arr_0.npy"), "",
+                            r) == Format::Npz);
+  CHECK(r == DetectReason::Magic);
+  CHECK(detect_bytes_reason("zip_cd_pkl", ambiguous_zip(true, "m/data.pkl"),
+                            "npz", r) == Format::PyTorchZip);
+  CHECK(r == DetectReason::Magic);
+}
+
+TEST_CASE("detect: each zip tiebreak extension routes an ambiguous zip") {
+  for (const bool with_directory : {false, true}) {
+    const std::vector<uint8_t> zip = ambiguous_zip(with_directory);
+    for (const ExtensionFormat& e : kZipExtensionFormats) {
+      INFO("zip extension: " << e.ext << ", central directory: "
+                             << with_directory);
+      DetectReason r = DetectReason::None;
+      CHECK(detect_bytes_reason("zip_tie", zip, std::string(e.ext), r) ==
+            e.format);
+      CHECK(r == DetectReason::Extension);
+    }
+  }
+}
+
+TEST_CASE("detect: only kZipExtensionFormats break an ambiguous zip's tie") {
+  // `.h5` / `.onnx` on a zip is not evidence of Keras / ONNX: such a zip falls to
+  // the content default (PyTorch zip) rather than being claimed by the main table.
+  for (const bool with_directory : {false, true}) {
+    const std::vector<uint8_t> zip = ambiguous_zip(with_directory);
+    for (const char* ext : {"h5", "hdf5", "onnx", "gguf", "txt", ""}) {
+      INFO("extension: " << ext << ", central directory: " << with_directory);
+      DetectReason r = DetectReason::None;
+      CHECK(detect_bytes_reason("zip_default", zip, ext, r) ==
+            Format::PyTorchZip);
+      CHECK(r == DetectReason::ContentDefault);
+    }
+  }
 }
 
 // --- #45: format-detection reason (confidence signal) -------------------------

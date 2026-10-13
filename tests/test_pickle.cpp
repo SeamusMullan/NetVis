@@ -20,6 +20,7 @@
 #include "core/MappedFile.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -42,6 +43,7 @@ std::string write_temp(const std::string& stem, const std::vector<uint8_t>& b) {
 bool drive_legacy(const std::string& stem, const std::vector<uint8_t>& bytes,
                   bool* out_ok) {
   std::string path = write_temp(stem, bytes);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
   ProgressSink progress;
@@ -51,7 +53,6 @@ bool drive_legacy(const std::string& stem, const std::vector<uint8_t>& bytes,
   ByteReader::payload_read_counter() = 0;
   auto res = pytorch::parse_legacy(*mf, progress);
   if (out_ok) *out_ok = static_cast<bool>(res);
-  std::filesystem::remove(path);
   return true;  // reaching here means no crash / no OOB read
 }
 

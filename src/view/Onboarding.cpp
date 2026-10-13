@@ -49,6 +49,23 @@ constexpr Binding kNavBindings[] = {
     // #106, new in this release.
     {"Ctrl+Z", "Undo the last view change"},
     {"Ctrl+Y", "Redo the change you just undid"},
+    // #158.
+    {"Shift+Up / Ctrl+=", "Zoom in (about the centre)"},
+    {"Shift+Down / Ctrl+-", "Zoom out"},
+    {"Shift+Backspace / Ctrl+0", "Actual size (100%)"},
+    {"Arrow keys", "Pan the graph"},
+};
+
+// #158: what the pointer does on the canvas. Same rule as the keyboard tables:
+// each row mirrors what GraphCanvas.cpp actually does.
+constexpr Binding kPointerBindings[] = {
+    {"Scroll / two-finger swipe", "Pan (or zoom, with View > Scroll wheel > Zoom)"},
+    {"Shift+Scroll", "Pan sideways"},
+    {"Ctrl+Scroll", "Zoom at the pointer (Cmd or Control on macOS)"},
+    {"Pinch", "Zoom at the pointer (macOS trackpad)"},
+    {"Drag", "Pan (left or middle button; Space+drag too)"},
+    {"Click", "Select a node; empty space clears"},
+    {"Double-click", "Expand or collapse a repeated block"},
 };
 
 constexpr Binding kOverlayBindings[] = {
@@ -121,7 +138,8 @@ void draw_binding_table(const char* id, const Binding* rows, size_t count) {
                                 ImGuiTableFlags_RowBg |
                                 ImGuiTableFlags_SizingStretchProp;
   if (!ImGui::BeginTable(id, 2, flags)) return;
-  ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+  // Wide enough for the longest chord ("Shift+Backspace / Ctrl+0", #158).
+  ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed, 200.0f);
   ImGui::TableSetupColumn("does");
   for (size_t i = 0; i < count; ++i) {
     ImGui::TableNextRow();
@@ -447,7 +465,7 @@ void draw_shortcuts_window(App& app) {
   ViewState& vs = app.view();
   if (!vs.show_shortcuts) return;
 
-  ImGui::SetNextWindowSize(ImVec2(430.0f, 480.0f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(600.0f, 640.0f), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Keyboard shortcuts", &vs.show_shortcuts)) {
     ImGui::End();
     return;
@@ -455,6 +473,8 @@ void draw_shortcuts_window(App& app) {
 
   ImGui::SeparatorText("Files");
   draw_binding_table("sc_file", kFileBindings, IM_ARRAYSIZE(kFileBindings));
+  ImGui::SeparatorText("Mouse and trackpad");
+  draw_binding_table("sc_pointer", kPointerBindings, IM_ARRAYSIZE(kPointerBindings));
   ImGui::SeparatorText("Graph");
   draw_binding_table("sc_nav", kNavBindings, IM_ARRAYSIZE(kNavBindings));
   ImGui::SeparatorText("Overlays");
@@ -468,9 +488,11 @@ void draw_shortcuts_window(App& app) {
   ImGui::TextWrapped(
       "Single keys and the Alt chords are ignored while you are typing in a "
       "text field, so a search query never triggers them.");
-  // Ctrl on every platform, including macOS: the handlers test ImGui's KeyCtrl,
-  // which is the physical Control key there, not Command.
-  ImGui::TextDisabled("Ctrl is the Control key on macOS too, not Command.");
+  // On macOS the handlers' KeyCtrl is the COMMAND key, not Control: ImGui swaps
+  // the two there (AddKeyEvent under ConfigMacOSXBehaviors, which defaults to true
+  // on __APPLE__ and App::init never clears). The earlier note here said the
+  // opposite, which is why a Mac user pressing Control+F found nothing (#158).
+  ImGui::TextDisabled("On macOS, Ctrl in this table is the Command key.");
 
   ImGui::End();
 }

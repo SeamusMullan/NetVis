@@ -23,6 +23,7 @@
 #include "engine/ModelPath.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -213,6 +214,9 @@ TEST_CASE("TensorFlow: truncated GraphDef -> clean error, no crash") {
   ByteReader::payload_read_counter() = 0;
   const std::filesystem::path p =
       std::filesystem::temp_directory_path() / "nv_tf_trunc.pb";
+  // Before the loop's mappings, so each is released first; also removes the file
+  // if a REQUIRE below aborts the test.
+  netvis_test::TempFileGuard cleanup(p.string());
   // Cut MID-MESSAGE at a few points; every one must be an error, never a crash.
   // (Protobuf has no terminator, so a cut that lands exactly on a top-level
   // record boundary is a legitimately shorter GraphDef, not a truncation — these
@@ -228,6 +232,5 @@ TEST_CASE("TensorFlow: truncated GraphDef -> clean error, no crash") {
     auto res = tensorflow::parse(*mf, progress);
     CHECK_FALSE(res);  // a truncated protobuf must not parse "successfully"
   }
-  std::filesystem::remove(p);
   CHECK(ByteReader::payload_read_counter() == 0);
 }

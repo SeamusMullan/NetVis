@@ -17,6 +17,7 @@
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -36,6 +37,7 @@ TEST_CASE("TensorStats: overflowing shape*dtype clamps to payload, no OOB") {
   // never return the huge count and stream past the buffer.
   std::vector<uint8_t> payload(16, 0);
   std::string path = write_temp("ovf.bin", payload);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
 
@@ -48,7 +50,6 @@ TEST_CASE("TensorStats: overflowing shape*dtype clamps to payload, no OOB") {
   auto stats = compute_tensor_stats(t, *mf, "");
   // Either an error or a clamped result — but it must return, not crash/OOB.
   if (stats) CHECK(stats->count <= 2);  // 16 bytes / 8 = at most 2 F64
-  std::filesystem::remove(path);
 }
 
 TEST_CASE("ShapeInference: zero stride does not divide-by-zero (Conv)") {
@@ -98,10 +99,10 @@ TEST_CASE("SafeTensors: near-2^64 data_offset end is rejected, not wrapped") {
   bytes.push_back(0);  // one payload byte so file isn't just the header
 
   std::string path = write_temp("st_ovf.safetensors", bytes);
+  netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
   auto mf = MappedFile::open(path);
   REQUIRE(mf);
   ProgressSink ps;
   auto r = safetensors::parse(*mf, ps);
   CHECK_FALSE(r);  // must be an error, not an accepted out-of-range tensor
-  std::filesystem::remove(path);
 }

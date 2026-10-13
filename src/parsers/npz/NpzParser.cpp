@@ -5,9 +5,11 @@
 // version, dict length, dict with descr/fortran_order/shape) followed by the
 // array payload. We read ONLY the header (structural) to extract dtype+shape,
 // then record offset+len of the payload WITHOUT touching it (spec §2.1, the
-// zero-payload thesis). Compressed entries (np.savez_compressed) set
-// file_offset=UINT64_MAX (honest fallback: we know shape/dtype but cannot
-// mmap-address a DEFLATE stream). Result: tensor-table mode (has_graph=false).
+// zero-payload thesis). Compressed entries (np.savez_compressed) are DEFLATE
+// streams: their .npy header is inside the stream too, so reading it would mean
+// inflating (a payload read). Such an entry is listed by name with dtype=Unknown,
+// no shape and file_offset=UINT64_MAX - unknown, never guessed. Result:
+// tensor-table mode (has_graph=false).
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -256,10 +258,11 @@ Result<ir::Model> parse(const MappedFile& file, ProgressSink& progress) {
     // Check if the entry is compressed (DEFLATE).
     bool compressed = (st.m_method != 0);  // 0 = ZIP_STORED (uncompressed)
     if (compressed) {
-      // Compressed entries: we cannot mmap-address the payload (it's DEFLATE).
-      // Record shape/dtype from the header if reachable, set file_offset=UINT64_MAX.
+      // Compressed entries: we cannot mmap-address the payload (it's DEFLATE),
+      // and the .npy header that holds dtype+shape is inside the same stream.
       // SECURITY: we do NOT extract/decompress to read the header — that would
-      // be a payload read. Instead we mark this tensor as unaddressable (honest).
+      // be a payload read. So dtype stays Unknown, the shape stays empty, and the
+      // tensor is marked unaddressable (file_offset=UINT64_MAX): all honest-unknown.
       ++compressed_count;
       ir::TensorRef t;
       t.name = model.intern(tensor_name);

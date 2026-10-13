@@ -15,10 +15,12 @@
 // number) become a compute graph: each NeuralNetworkLayer is one ir::Node, edges
 // wired from its input/output name lists (same name->ValueInfo scheme as ONNX),
 // and every WeightParams sub-message found inside the layer-kind body is recorded
-// as an initializer TensorRef (offset+len only). Exotic model types (mlProgram,
-// pipeline, tree/GLM/SVM, ...) fall back to has_graph=false + a metadata note —
-// never an error. `.mlpackage` directory bundles are out of scope (single-file
-// `.mlmodel` only, per the milestone non-goals).
+// as an initializer TensorRef (offset+len only). A top-level `mlProgram` (MIL)
+// also builds a real graph, in a bare .mlmodel or as the inner spec of an
+// .mlpackage (resolve_model_path maps the bundle to that inner file). Model types
+// with no graph here (pipeline, tree/GLM/SVM, ...), and an mlProgram whose MIL
+// fails a structural limit, fall back to has_graph=false + a metadata note —
+// never an error.
 #include <cstdint>
 #include <string>
 #include <unordered_map>

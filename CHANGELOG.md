@@ -4,6 +4,9 @@ This file starts at the relicensing; earlier history is in the git tags and GitH
 
 ## Unreleased
 
+- **Changed default: the scroll wheel now pans the graph instead of zooming (#158).** The canvas now follows Netron: scrolling, or a two-finger swipe on a trackpad, pans up/down and left/right, and Shift+scroll pans sideways with a mouse. Ctrl+scroll zooms at the pointer (Cmd+scroll or Control+scroll on macOS). On macOS the app also reads trackpad pinch (zoom) and precise scroll deltas (1:1 finger tracking) through a small native bridge; that bridge has not yet been tried on real trackpad hardware, so treat both as expected rather than confirmed. Dragging with the left mouse button anywhere on the canvas pans (middle-drag and Space+drag still work). A node is now selected when you release a click, so starting a drag on a node no longer selects it. New keyboard zoom: Shift+Up / Shift+Down zoom in and out about the centre of the view, Shift+Backspace returns to 100% (Ctrl+= / Ctrl+- / Ctrl+0 also work, Cmd on macOS), and the arrow keys pan. **To get the old scroll-to-zoom back, choose View > Scroll wheel > Zoom** (also in Preferences and the command palette). The choice is remembered. Anyone who has used NetVis before (a saved preferences file, recent files, a saved session or a cached layout) sees a one-time notice on the first launch after upgrading; a fresh install does not. That first launch writes only `wheel_mode` to `view_prefs.json` (merged into an existing file, never replacing it), so no other setting is pinned to today's default. Two differences from Netron are deliberate: Shift+scroll pans sideways rather than zooming, and Cmd+scroll zooms on macOS. See `docs/canvas-controls.md`.
+- The shortcut reference no longer claims Ctrl means the Control key on macOS: Dear ImGui maps Ctrl shortcuts to Cmd there.
+- The Open dialog and the diff panel's "Add comparison..." picker now list every extension the format detector recognises: `.xml` (OpenVINO), `.npz`, `.keras`, `.h5` / `.hdf5`, `.mlmodel` and `.mlpackage`, `.pkl` / `.pickle`, on top of the previous `.onnx`, `.tflite`, `.safetensors`, `.gguf`, `.pt` / `.pth` / `.bin` and `.pb`. Those formats always parsed; they just could not be picked from the GUI. The first filter is now "All supported models", followed by "All files" on Linux (zenity-family choosers and kdialog) and Windows; the macOS chooser takes a list of types only, so it shows the model types without an "All files" entry. A file with another or no extension (which content detection would still accept) or a WASM-plugin format is therefore opened with "All files", or by drag-and-drop or the command line on macOS. Both dialogs build their filter from the detector's own extension table (plus `.mlpackage`), and a test fails if the detector, including its zip and `.mlmodel` tiebreaks, learns an extension that table lacks. On Linux the Open filter now also matches upper-case extensions such as `Model.ONNX`; Save dialogs keep their plain, single filter, so KDE's save dialog still appends the extension and asks before overwriting. A `.mlpackage` directory can be picked only where the system chooser treats packages as files (macOS); elsewhere drag it onto the window or pass it on the command line. A bundle picked on macOS comes back with a trailing slash; it is now normalised, so its tab and the diff panel show its name and it does not appear twice in Recent. Part of #135.
 - Relicensed from PolyForm Noncommercial 1.0.0 to Apache-2.0. All releases up to and including v0.9.5 remain under PolyForm-NC; this tag onward is Apache-2.0.
 - **Plugin ABI frozen at v1** (#113). `plugins/sdk/abi-v1-surface.txt` inventories
   everything a plugin binds to: every macro, enumerator, typedef and wire-struct
@@ -58,3 +61,22 @@ This file starts at the relicensing; earlier history is in the git tags and GitH
   the template's own PATH edit gets a turn, and the installer names the folder to
   add by hand. Not fixed: a drive-letter install that fails outright on a virtual
   or mapped drive; that needs its own repro (#149 stays open).
+- **Fixed: CoreML `.mlmodel` files failed to open** (#114). v0.9.5 added a TensorFlow
+  structural sniff ahead of the `.mlmodel` extension guard in format detection. A
+  CoreML `Model` protobuf satisfies that sniff exactly — field 1 varint, field 2
+  length-delimited, whose own first field is length-delimited — so ordinary
+  `.mlmodel` files were handed to the TensorFlow parser and died with "SavedModel
+  meta_graph carries no graph_def". The extension guard now runs first, and CoreML is
+  also recognised from content (its model type sits at a field number of 200 or
+  more, which no TensorFlow or ONNX protobuf uses), so a CoreML file renamed without
+  the `.mlmodel` suffix no longer falls through to TensorFlow or ONNX.
+- Format detection: length checks in the protobuf sniffs are now overflow-safe. A
+  hostile length varint near 2^64 could wrap the bounds check and be accepted.
+- Added [`docs/format-support.md`](docs/format-support.md): what every supported
+  format yields (graph, shapes, addressable weights) and the known gaps per format.
+  `tests/test_format_matrix.cpp` re-derives the table from the shipped fixtures on
+  every test run, so a stale row cannot go unnoticed. Only the table is checked, not
+  the prose around it, and the cost and shape-inference code has not yet been audited
+  for fabricated values (still open under #114).
+- CI builds the GUI app and runs `ctest` on Linux (both the `ubuntu-22.04` release image and `ubuntu-latest`), macOS and Windows for every pull request and push to master (#169), so a platform break shows up on the PR instead of when a release tag is built. The test suite was made portable to MSVC with test-only changes; no library or app behaviour changes.
+- Added a `.gitattributes` rule (`CHANGELOG.md merge=union`, #169) so the append-only changelog merges without conflicts when two branches each add entries; check the merged text afterwards, since a union merge keeps both sides' lines as they are.

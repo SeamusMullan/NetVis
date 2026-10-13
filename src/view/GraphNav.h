@@ -165,6 +165,13 @@ void nav_toggle_pin(App& app, uint32_t ir_node);
 // Called from draw_graph_canvas inside the canvas child. Clicking a chip flies to
 // that node; an "x" removes the pin. No-op when the pin set is empty.
 void draw_pinned_strip(App& app, ImVec2 canvas_origin, ImVec2 canvas_size);
+// Whether screen point `p` lies on a chip of the pinned strip: the same rectangles
+// draw_pinned_strip draws and clicks (both walk view/CanvasInput.h's
+// PinnedStripLayout). The strip acts on the left PRESS, so the canvas asks this to
+// know that a press which began on a chip is the strip's and not its own: the
+// canvas selects on RELEASE (#158) and would otherwise overwrite the selection the
+// chip just made. False when nothing is pinned.
+bool pinned_strip_hit(App& app, ImVec2 canvas_origin, ImVec2 canvas_size, ImVec2 p);
 
 // #16 bookmarks: draw the bookmark panel (save current view as a named bookmark;
 // list saved bookmarks with jump / delete). A small window toggled from the View

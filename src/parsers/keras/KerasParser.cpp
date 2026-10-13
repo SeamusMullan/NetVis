@@ -5,8 +5,10 @@
 //   - raw HDF5 (.h5, legacy .keras): run the minimal Hdf5Reader over the whole
 //     mmap and surface every discovered dataset as a flat tensor.
 //   - Keras v3 zip (.keras): a ZIP containing config.json + metadata.json +
-//     model.weights.h5. We read config.json (small, structural) for metadata and
-//     locate the embedded model.weights.h5; when it is STORED (uncompressed) we
+//     model.weights.h5. config.json is only noted as present (metadata
+//     "keras = v3 archive"); it is NOT parsed, so no topology or class name is
+//     extracted. We locate the embedded model.weights.h5; when it is STORED
+//     (uncompressed) we
 //     resolve its payload offset from the local file header and run Hdf5Reader
 //     over that sub-range, rebasing dataset offsets to absolute mmap positions.
 //     A DEFLATE-compressed inner .h5 is not linearly addressable -> metadata note.

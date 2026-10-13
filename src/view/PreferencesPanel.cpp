@@ -164,11 +164,27 @@ void draw_preferences_panel(App& app) {
   if (ImGui::Combo("Edge routing", &vs.edge_routing,
                    "Bezier\0Orthogonal\0Straight\0"))
     dirty = true;
+  // #158: bridged through an int because Combo cannot produce a value outside its
+  // item list, so the enum can never leave {Pan, Zoom}.
+  {
+    int wheel_mode_i = static_cast<int>(vs.wheel_mode);
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::Combo("Scroll wheel", &wheel_mode_i, "Pan (Netron)\0Zoom\0")) {
+      vs.wheel_mode = wheel_mode_i == 1 ? WheelMode::Zoom : WheelMode::Pan;
+      dirty = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "Pan: scrolling moves the graph, Ctrl+scroll (Cmd+scroll on macOS) "
+          "zooms.\nZoom: scrolling zooms at the pointer (earlier NetVis "
+          "releases; Netron's 'Mouse Wheel: Zoom').");
+  }
   if (reset_button("Reset graph")) {
     vs.show_minimap = def.show_minimap;
     vs.show_layer_bands = def.show_layer_bands;
     vs.edge_tooltips = def.edge_tooltips;
     vs.edge_routing = def.edge_routing;
+    vs.wheel_mode = def.wheel_mode;  // #158
     dirty = true;
   }
 

@@ -21,6 +21,7 @@
 #include "engine/TensorStats.h"
 #include "ir/IR.h"
 #include "parsers/Parser.h"
+#include "temp_file_guard.h"
 
 using namespace netvis;
 
@@ -64,6 +65,7 @@ void truncation_sweep(const std::string& stem, const std::string& full_path,
   for (int k = 0; k <= 7; ++k) {
     size_t n = (bytes.size() * static_cast<size_t>(k)) / 8;
     std::string path = write_prefix(stem, bytes, n);
+    netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
 
     ByteReader::payload_read_counter() = 0;
     auto mf = MappedFile::open(path);
@@ -77,7 +79,6 @@ void truncation_sweep(const std::string& stem, const std::string& full_path,
       (void)res;
       CHECK(ByteReader::payload_read_counter() == 0);
     }
-    std::filesystem::remove(path);
   }
 }
 
@@ -172,6 +173,7 @@ TEST_CASE("truncation: mlPackage weight.bin stays safe at every 1/8th") {
   for (int k = 0; k <= 8; ++k) {
     size_t n = (bytes.size() * static_cast<size_t>(k)) / 8;
     std::string path = write_prefix("weight_bin", bytes, n);
+    netvis_test::TempFileGuard cleanup(path);  // before mf: unmap first, then delete
 
     auto mf = MappedFile::open(path);
     if (mf) {
@@ -189,6 +191,5 @@ TEST_CASE("truncation: mlPackage weight.bin stays safe at every 1/8th") {
       // The invariant under test is "no crash / no UB", not a specific verdict.
       (void)stats;
     }
-    std::filesystem::remove(path);
   }
 }
